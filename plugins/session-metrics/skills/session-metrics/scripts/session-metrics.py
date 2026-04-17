@@ -36,7 +36,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -784,7 +784,8 @@ def _env_session_id() -> str | None:
 # Data model — build structured report from raw turns
 # ---------------------------------------------------------------------------
 
-def _build_turn_record(global_index: int, entry: dict) -> dict:
+def _build_turn_record(global_index: int, entry: dict,
+                       tz_offset_hours: float = 0.0) -> dict:
     msg = entry["message"]
     u = msg["usage"]
     model = msg.get("model", "unknown")
@@ -797,7 +798,7 @@ def _build_turn_record(global_index: int, entry: dict) -> dict:
     return {
         "index":              global_index,
         "timestamp":          entry.get("timestamp", ""),
-        "timestamp_fmt":      _fmt_ts(entry.get("timestamp", "")),
+        "timestamp_fmt":      _fmt_ts(entry.get("timestamp", ""), tz_offset_hours),
         "model":              model,
         "input_tokens":       inp,
         "output_tokens":      out,
@@ -861,12 +862,13 @@ def _build_report(
     global_idx = 1
 
     for session_id, raw_turns, user_ts in sessions_raw:
-        turn_records = [_build_turn_record(global_idx + i, t) for i, t in enumerate(raw_turns)]
+        turn_records = [_build_turn_record(global_idx + i, t, tz_offset_hours)
+                        for i, t in enumerate(raw_turns)]
         global_idx += len(turn_records)
         sessions_out.append({
             "session_id":  session_id,
-            "first_ts":    _fmt_ts(raw_turns[0].get("timestamp", "")) if raw_turns else "",
-            "last_ts":     _fmt_ts(raw_turns[-1].get("timestamp", "")) if raw_turns else "",
+            "first_ts":    _fmt_ts(raw_turns[0].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
+            "last_ts":     _fmt_ts(raw_turns[-1].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
             "turns":       turn_records,
             "subtotal":    _totals_from_turns(turn_records),
             "models":      _model_counts(turn_records),
@@ -898,15 +900,21 @@ def _build_report(
 # ---------------------------------------------------------------------------
 
 COL  = "{:<4} {:<19} {:>11} {:>7} {:>9} {:>9} {:>10} {:>9}"
-HDR  = COL.format("#", "Time (UTC)", "Input (new)", "Output", "CacheRd", "CacheWr", "Total", "Cost $")
-SEP  = "-" * len(HDR)
-WIDE = "=" * len(HDR)
-
 # Mode (speed) column — appended when any turn in the report used fast mode
 COL_M  = COL + "  {:<4}"
-HDR_M  = COL_M.format("#", "Time (UTC)", "Input (new)", "Output", "CacheRd", "CacheWr", "Total", "Cost $", "Mode")
-SEP_M  = "-" * len(HDR_M)
-WIDE_M = "=" * len(HDR_M)
+
+
+def _text_table_headers(tz_offset_hours: float = 0.0,
+                         show_mode: bool = False) -> tuple[str, str, str]:
+    """Return (hdr, sep, wide) for the text timeline table in the given tz."""
+    time_col = f"Time ({_short_tz_label(tz_offset_hours)})"
+    if show_mode:
+        hdr = COL_M.format("#", time_col, "Input (new)", "Output",
+                           "CacheRd", "CacheWr", "Total", "Cost $", "Mode")
+    else:
+        hdr = COL.format("#", time_col, "Input (new)", "Output",
+                         "CacheRd", "CacheWr", "Total", "Cost $")
+    return hdr, "-" * len(hdr), "=" * len(hdr)
 
 
 def _has_fast(report: dict) -> bool:
@@ -918,12 +926,30 @@ def _has_fast(report: dict) -> bool:
     return False
 
 
-def _fmt_ts(ts: str) -> str:
+def _fmt_ts(ts: str, offset_hours: float = 0.0) -> str:
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if offset_hours:
+            dt = dt.astimezone(timezone(timedelta(hours=offset_hours)))
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return ts[:19] if len(ts) >= 19 else ts
+
+
+def _short_tz_label(offset_hours: float) -> str:
+    if offset_hours == 0:
+        return "UTC"
+    sign = "+" if offset_hours > 0 else "-"
+    return f"UTC{sign}{abs(offset_hours):g}"
+
+
+def _fmt_epoch_local(epoch: int, offset_hours: float = 0.0,
+                     fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """Format an integer epoch in the given UTC offset."""
+    offset_sec = int(offset_hours * 3600)
+    return datetime.fromtimestamp(
+        epoch + offset_sec, tz=timezone.utc,
+    ).strftime(fmt)
 
 
 def _row_text(t: dict, show_mode: bool = False) -> str:
@@ -1046,7 +1072,8 @@ def render_text(report: dict) -> str:
     sessions = report["sessions"]
 
     m = _has_fast(report)
-    hdr, sep, wide = (HDR_M, SEP_M, WIDE_M) if m else (HDR, SEP, WIDE)
+    tz_offset = report.get("tz_offset_hours", 0.0)
+    hdr, sep, wide = _text_table_headers(tz_offset, show_mode=m)
 
     if report["mode"] == "project":
         p(f"Project: {report['slug']}")
@@ -1223,7 +1250,14 @@ def render_md(report: dict) -> str:
     slug = report["slug"]
     totals = report["totals"]
     mode = report["mode"]
-    generated = report["generated_at"][:19].replace("T", " ") + " UTC"
+    tz_offset = report.get("tz_offset_hours", 0.0)
+    try:
+        _gen_dt = datetime.fromisoformat(
+            report["generated_at"].replace("Z", "+00:00")
+        ).astimezone(timezone(timedelta(hours=tz_offset)))
+        generated = _gen_dt.strftime("%Y-%m-%d %H:%M:%S") + f" {_short_tz_label(tz_offset)}"
+    except Exception:
+        generated = report["generated_at"][:19].replace("T", " ") + " UTC"
 
     p(f"# Session Metrics — {slug}")
     p()
@@ -1299,10 +1333,11 @@ def render_md(report: dict) -> str:
         p(f"- Trailing 30 days: **{summary.get('trailing_30', 0)}** blocks")
         p(f"- All time: **{summary.get('total', len(blocks))}** blocks")
         p()
-        p("| Anchor (UTC) | Duration | Turns | Prompts | Cost | Sessions |")
+        p(f"| Anchor ({tz_label}) | Duration | Turns | Prompts | Cost | Sessions |")
         p("|-------------|---------:|------:|--------:|-----:|---------:|")
         for b in reversed(blocks[-12:]):
-            p(f"| {b['anchor_iso']} | {b['elapsed_min']:.0f}m "
+            anchor_local = _fmt_epoch_local(b["anchor_epoch"], tz_offset, "%Y-%m-%d %H:%M")
+            p(f"| {anchor_local} | {b['elapsed_min']:.0f}m "
               f"| {b['turn_count']:,} | {b['user_msg_count']:,} "
               f"| ${b['cost_usd']:.3f} | {len(b['sessions_touched'])} |")
         p()
@@ -1325,7 +1360,7 @@ def render_md(report: dict) -> str:
             p(f"{s['first_ts']} → {s['last_ts']} &nbsp;·&nbsp; {len(s['turns'])} turns &nbsp;·&nbsp; **${st['cost']:.4f}**")
             p()
 
-        p("| # | Time (UTC) | Input (new) | Output | CacheRd | CacheWr | Total | Cost $ |")
+        p(f"| # | Time ({tz_label}) | Input (new) | Output | CacheRd | CacheWr | Total | Cost $ |")
         p("|--:|-----------|------------:|------:|--------:|--------:|------:|-------:|")
         for t in s["turns"]:
             p(f"| {t['index']} | {t['timestamp_fmt']} "
@@ -1821,12 +1856,13 @@ def _tz_dropdown_options(default_offset_hours: float, tz_label: str) -> str:
     )
 
 
-def _build_tod_heatmap_html(tod: dict) -> str:
+def _build_tod_heatmap_html(tod: dict, tz_label: str = "UTC",
+                            default_offset_hours: float = 0.0) -> str:
     """Build the Time-of-Day heatmap as self-contained HTML + CSS + JS.
 
     Renders a horizontal bar chart with four period rows (Night, Morning,
-    Afternoon, Evening), a timezone dropdown with PT (UTC-8) and Brisbane
-    (UTC+10), and client-side re-bucketing via JavaScript.
+    Afternoon, Evening), a timezone dropdown pre-selected to the report's
+    resolved display tz, and client-side re-bucketing via JavaScript.
 
     No Highcharts dependency — uses pure HTML/CSS bars with JS-driven width
     updates.  The epoch-seconds array is embedded as a compact integer list;
@@ -1846,6 +1882,7 @@ def _build_tod_heatmap_html(tod: dict) -> str:
     if not epoch_secs:
         return ""
     ts_json = json.dumps(epoch_secs, separators=(",", ":"))
+    tz_options = _tz_dropdown_options(default_offset_hours, tz_label)
 
     return f"""\
 <div id="tod-container" style="background:#161b22;border:1px solid #30363d;
@@ -1854,10 +1891,7 @@ def _build_tod_heatmap_html(tod: dict) -> str:
     <span style="color:#f0f6fc;font-size:13px;font-weight:600;text-transform:uppercase;
           letter-spacing:0.05em">User Messages by Time of Day</span>
     <select id="tod-tz" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;
-            border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer">
-      <option value="-8">PT (UTC\u22128)</option>
-      <option value="10" selected>Brisbane (UTC+10)</option>
-    </select>
+            border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer">{tz_options}</select>
     <span style="color:#8b949e;font-size:11px">Total:
       <strong id="tod-total" style="color:#e6edf3">0</strong></span>
   </div>
@@ -2588,7 +2622,14 @@ def render_html(report: dict, variant: str = "single",
     slug = report["slug"]
     totals = report["totals"]
     mode = report["mode"]
-    generated = report["generated_at"][:19].replace("T", " ") + " UTC"
+    _tz_off_for_gen = report.get("tz_offset_hours", 0.0)
+    try:
+        _gen_dt = datetime.fromisoformat(
+            report["generated_at"].replace("Z", "+00:00")
+        ).astimezone(timezone(timedelta(hours=_tz_off_for_gen)))
+        generated = _gen_dt.strftime("%Y-%m-%d %H:%M:%S") + f" {_short_tz_label(_tz_off_for_gen)}"
+    except Exception:
+        generated = report["generated_at"][:19].replace("T", " ") + " UTC"
     sessions = report["sessions"]
 
     # ---- Chart data --------------------------------------------------------
@@ -2607,9 +2648,13 @@ def render_html(report: dict, variant: str = "single",
         renderer = CHART_RENDERERS.get(chart_lib) or _render_chart_none
         chart_html, chart_head_html = renderer(all_turns)
 
-    # ---- Insights sections (positioned above charts) ---------------------
+    # Always resolved for the timeline header (and anywhere else the HTML
+    # renders timestamps) — the "detail" variant has no insights block
+    # but still needs tz_label for the Timeline table.
     tz_label  = report.get("tz_label", "UTC")
     tz_offset = report.get("tz_offset_hours", 0.0)
+
+    # ---- Insights sections (positioned above charts) ---------------------
     tod_html  = ""
     if include_insights:
         tod_section    = report.get("time_of_day", {})
@@ -2623,7 +2668,7 @@ def render_html(report: dict, variant: str = "single",
         hod_html       = _build_hour_of_day_html(tod_section, tz_label, tz_offset,
                                                   peak=report.get("peak"))
         punchcard_html = _build_punchcard_html(tod_section, tz_label, tz_offset)
-        heatmap_html   = _build_tod_heatmap_html(tod_section)
+        heatmap_html   = _build_tod_heatmap_html(tod_section, tz_label, tz_offset)
         tod_html       = (rollup_html + blocks_html + duration_html
                           + hod_html + punchcard_html + heatmap_html)
 
@@ -2739,7 +2784,7 @@ def render_html(report: dict, variant: str = "single",
             '<b>CacheWr</b> = <code>cache_creation_input_tokens</code>. '
             'Total input sent to the model = sum of all three.'
             '</span></h2>\n<table>\n<thead><tr>\n'
-            '  <th class="num">#</th><th>Time (UTC)</th><th>Model</th>\n'
+            f'  <th class="num">#</th><th>Time ({tz_label})</th><th>Model</th>\n'
             f'  {"<th>Mode</th>" if show_mode else ""}\n'
             '  <th class="num">Input (new)</th><th class="num">Output</th>\n'
             '  <th class="num">CacheRd</th><th class="num">CacheWr</th>\n'

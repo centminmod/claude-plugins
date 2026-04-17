@@ -68,8 +68,10 @@ project root, named `session_<id8>_<YYYYMMDD_HHMMSS>.<ext>` (single) or
 
 | Flag | Purpose |
 |------|---------|
-| `--tz <IANA>`                | IANA timezone for time-of-day bucketing. Defaults to system local tz. |
+| `--tz <IANA>`                | IANA timezone for time-of-day bucketing **and timeline/export timestamps**. Defaults to the system local tz (auto-detected via `TZ` env var or the OS setting). |
 | `--utc-offset <H>`           | Fixed UTC offset, DST-naive. Use `--tz` for DST-aware. |
+
+> **Invocation note for the AI.** Don't pass `--tz` or `--utc-offset` unless the user explicitly asks for a specific timezone. The script auto-detects the user's system tz and renders all human-facing timestamps (timeline, session headers, generated-at banner, block anchors) in that tz. JSON/CSV raw `timestamp` fields stay UTC ISO-8601 as a machine-readable audit trail.
 | `--no-cache`                 | Skip `~/.cache/session-metrics/parse/` and always re-parse from scratch. |
 | `--include-subagents`        | Also tally spawned subagent JSONL files. |
 
@@ -78,7 +80,7 @@ project root, named `session_<id8>_<YYYYMMDD_HHMMSS>.<ext>` (single) or
 | Column   | Meaning                                      |
 |----------|----------------------------------------------|
 | `#`      | Deduplicated turn index                      |
-| `Time`   | UTC timestamp of the turn                    |
+| `Time`   | Timestamp of the turn in the user's local timezone (auto-detected from system; override with `--tz` or `--utc-offset`). The header shows the active tz label, e.g. `Time (UTC+10)` or `Time (Australia/Brisbane)`. Raw `timestamp` fields in JSON/CSV exports remain UTC ISO-8601 (`...Z`) for machine-readability. |
 | `Input`  | Net new input tokens (uncached portion only — cache reads/writes are shown separately) |
 | `Output` | Output tokens generated                      |
 | `CacheRd`| Tokens served from prompt cache (cheap)      |
