@@ -1,0 +1,64 @@
+{
+  "_note": "Per-library vendor manifest. SHA-256 is verified before inlining.",
+  "libraries": {
+    "highcharts": {
+      "version": "12",
+      "source": "https://cdn.jsdelivr.net/npm/highcharts@12/",
+      "license": "non-commercial-free",
+      "license_url": "https://www.highcharts.com/license",
+      "files": [
+        {
+          "name": "highcharts.js",
+          "path": "highcharts/v12/highcharts.js",
+          "sha256": "892b57c41d27a9d30537f9c9887ff2d098f9319f7f0ea2a002a9422981298a1c"
+        },
+        {
+          "name": "highcharts-3d.js",
+          "path": "highcharts/v12/highcharts-3d.js",
+          "sha256": "d894e1a3819b9ef4756c732ac49ef76fbb8d1c29c5e0029507ca27eaee4eae75"
+        },
+        {
+          "name": "exporting.js",
+          "path": "highcharts/v12/exporting.js",
+          "sha256": "5dc63388bd0d8b8a9fc598e53c690e249fd6119c812b115ac9e5b8c68dde8d6d"
+        },
+        {
+          "name": "export-data.js",
+          "path": "highcharts/v12/export-data.js",
+          "sha256": "ef86f5cfefca5bd7af44b912dfc949ba9e687d6d2d4cd8af6cb82070e2ac2401"
+        }
+      ]
+    },
+    "uplot": {
+      "version": "1",
+      "source": "https://cdn.jsdelivr.net/npm/uplot@1/",
+      "license": "MIT",
+      "license_url": "https://github.com/leeoniya/uPlot/blob/master/LICENSE",
+      "files": [
+        {
+          "name": "uPlot.iife.min.js",
+          "path": "uplot/v1/uPlot.iife.min.js",
+          "sha256": "19c8d4c6ad88929a79f4ae49d6f7161566dfd0ba3d15cc495e974f787eb78f1f"
+        },
+        {
+          "name": "uPlot.min.css",
+          "path": "uplot/v1/uPlot.min.css",
+          "sha256": "df630c6a8d6f8eeaff264b50f73ce5b114f646ffd9a0bb74f049b0a00135fa04"
+        }
+      ]
+    },
+    "chartjs": {
+      "version": "4",
+      "source": "https://cdn.jsdelivr.net/npm/chart.js@4/",
+      "license": "MIT",
+      "license_url": "https://github.com/chartjs/Chart.js/blob/master/LICENSE.md",
+      "files": [
+        {
+          "name": "chart.umd.js",
+          "path": "chartjs/v4/chart.umd.js",
+          "sha256": "ecc3cd1eeb8c34d2178e3f59fd63ec5a3d84358c11730af0b9958dc886d7652a"
+        }
+      ]
+    }
+  }
+}

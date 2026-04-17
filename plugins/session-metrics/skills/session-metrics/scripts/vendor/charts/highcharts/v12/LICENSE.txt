@@ -1,0 +1,22 @@
+Highcharts — Non-Commercial License
+=====================================
+
+The vendored Highcharts files in this directory are redistributed under
+Highcharts' Non-Commercial License. Free for personal, school, and
+non-profit use. Commercial use requires a paid license from Highsoft AS.
+
+Upstream: https://www.highcharts.com/license
+Version:  12 (fetched from https://cdn.jsdelivr.net/npm/highcharts@12/)
+
+If you intend to ship `session-metrics` as part of a commercial product,
+or redistribute reports generated with the Highcharts renderer within a
+commercial offering, either (a) obtain a Highcharts commercial license,
+or (b) pass `--chart-lib none` (or switch to an MIT-licensed renderer
+once we add uPlot / Chart.js vendoring) so no Highcharts code is emitted.
+
+For personal, educational, or non-commercial internal tooling use:
+this is the default licensing and you do not need any additional
+permission from Highsoft AS.
+
+None of the above is legal advice; consult the upstream license if you
+are unsure whether your use case qualifies.

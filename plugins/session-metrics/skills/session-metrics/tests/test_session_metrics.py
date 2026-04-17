@@ -1,0 +1,705 @@
+"""Unit + integration tests for session-metrics.py.
+
+Run with: uv run python -m pytest tests/ -v
+"""
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+
+_HERE       = Path(__file__).parent
+_SCRIPT     = _HERE.parent / "scripts" / "session-metrics.py"
+_FIXTURE    = _HERE / "fixtures" / "mini.jsonl"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("session_metrics", _SCRIPT)
+    mod  = importlib.util.module_from_spec(spec)
+    sys.modules["session_metrics"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+sm = _load_module()
+
+
+# --- Pricing -----------------------------------------------------------------
+
+def test_pricing_opus_4_7_explicit():
+    # Opus 4.5-generation uses the new cheaper tier: $5 input / $25 output.
+    r = sm._pricing_for("claude-opus-4-7")
+    assert r["input"] == 5.00
+    assert r["output"] == 25.00
+    assert r["cache_read"] == 0.50
+    assert r["cache_write"] == 6.25
+
+
+def test_pricing_sonnet_4_7_explicit():
+    r = sm._pricing_for("claude-sonnet-4-7")
+    assert r["input"] == 3.00
+
+
+def test_pricing_opus_4_old_tier_retained():
+    # Opus 4 / 4.1 stayed on the original $15 / $75 tier.
+    r = sm._pricing_for("claude-opus-4")
+    assert r["input"] == 15.00
+    assert r["output"] == 75.00
+
+
+def test_pricing_haiku_4_5_new_tier():
+    # Haiku 4.5 has its own tier: $1 input / $5 output.
+    r = sm._pricing_for("claude-haiku-4-5-20251001")
+    assert r["input"] == 1.00
+    assert r["output"] == 5.00
+
+
+def test_pricing_prefix_fallback():
+    """Unknown future model falls through to nearest known prefix."""
+    # "claude-opus-4-99-future" doesn't start with 4-5/4-6/4-7/4-1, so it
+    # matches "claude-opus-4" (old-tier). Safer to over- than under-estimate.
+    r = sm._pricing_for("claude-opus-4-99-future")
+    assert r["input"] == 15.00
+
+
+# --- Cost math ---------------------------------------------------------------
+
+def test_cost_opus_all_buckets():
+    usage = {
+        "input_tokens": 120,
+        "output_tokens": 80,
+        "cache_read_input_tokens": 500,
+        "cache_creation_input_tokens": 1000,
+    }
+    # Opus 4.7 new tier: 120*5 + 80*25 + 500*0.5 + 1000*6.25
+    #                  = 600 + 2000 + 250 + 6250 = 9100 per M
+    assert sm._cost(usage, "claude-opus-4-7") == pytest.approx(0.00910, abs=1e-7)
+
+
+def test_no_cache_cost_folds_cache_tokens():
+    usage = {
+        "input_tokens": 10, "output_tokens": 5,
+        "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 500,
+    }
+    # hypothetical: (10 + 1000 + 500) * 5/M + 5 * 25/M  (Opus 4.7 new tier)
+    expected = (1510 * 5 + 5 * 25) / 1_000_000
+    assert sm._no_cache_cost(usage, "claude-opus-4-7") == pytest.approx(expected)
+
+
+# --- User-prompt filter ------------------------------------------------------
+
+def test_is_user_prompt_text_list():
+    assert sm._is_user_prompt({"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}})
+
+
+def test_is_user_prompt_image_list():
+    assert sm._is_user_prompt({"type": "user", "message": {"content": [{"type": "image"}]}})
+
+
+def test_is_user_prompt_plain_string():
+    assert sm._is_user_prompt({"type": "user", "message": {"content": "hello"}})
+
+
+def test_is_user_prompt_excludes_tool_result():
+    assert not sm._is_user_prompt({"type": "user", "message": {"content": [{"type": "tool_result"}]}})
+
+
+def test_is_user_prompt_excludes_meta():
+    assert not sm._is_user_prompt({"type": "user", "isMeta": True,
+                                    "message": {"content": [{"type": "text", "text": "x"}]}})
+
+
+def test_is_user_prompt_excludes_empty_string():
+    assert not sm._is_user_prompt({"type": "user", "message": {"content": ""}})
+
+
+def test_is_user_prompt_excludes_assistant_type():
+    assert not sm._is_user_prompt({"type": "assistant", "message": {"content": "hi"}})
+
+
+# --- Dedup + timestamp extraction on the fixture ----------------------------
+
+def test_fixture_dedup_keeps_last_write():
+    entries = sm._parse_jsonl(_FIXTURE)
+    turns = sm._extract_turns(entries)
+    assert len(turns) == 4
+    by_id = {t["message"]["id"]: t["message"]["usage"] for t in turns}
+    # msg_A appears twice; the last write (120/80/500/1000) must win
+    assert by_id["msg_A"]["input_tokens"] == 120
+    assert by_id["msg_A"]["cache_read_input_tokens"] == 500
+
+
+def test_fixture_user_timestamps_default_excludes_sidechain_and_tool_results():
+    entries = sm._parse_jsonl(_FIXTURE)
+    ts = sm._extract_user_timestamps(entries)
+    # u2 (text list) + u6 (plain string) = 2.  u1 meta, u3/u4/u7 tool_result,
+    # u5 sidechain — all excluded.
+    assert len(ts) == 2
+
+
+def test_fixture_user_timestamps_include_sidechain_adds_one():
+    entries = sm._parse_jsonl(_FIXTURE)
+    ts = sm._extract_user_timestamps(entries, include_sidechain=True)
+    # adds u5 sidechain text
+    assert len(ts) == 3
+
+
+# --- End-to-end totals on the fixture ---------------------------------------
+
+def _build_fixture_report():
+    sid, turns, user_ts = sm._load_session(_FIXTURE, include_subagents=False)
+    return sm._build_report("session", "test-slug", [(sid, turns, user_ts)])
+
+
+def test_fixture_total_cost_exact():
+    r = _build_fixture_report()
+    # New Opus 4.7 tier ($5/$25/$0.50/$6.25), Sonnet 4.7 unchanged ($3/$15/$0.30/$3.75).
+    # msg_A (opus, deduped, last write wins):  120*5 + 80*25 + 500*0.5 + 1000*6.25 = 9100/M  = 0.00910
+    # msg_B (sonnet): 10*3 + 20*15 + 2000*0.3 + 0*3.75                              = 930/M   = 0.00093
+    # msg_C (opus):    5*5 + 15*25 + 3000*0.5 + 0*6.25                              = 1900/M  = 0.00190
+    # msg_D (sonnet): 200*3 + 300*15 + 1500*0.3 + 0*3.75                            = 5550/M  = 0.00555
+    # Total = 0.01748
+    assert r["totals"]["cost"] == pytest.approx(0.01748, abs=1e-7)
+
+
+def test_fixture_turns_count_and_models():
+    r = _build_fixture_report()
+    assert r["totals"]["turns"] == 4
+    assert r["models"]["claude-opus-4-7"] == 2
+    assert r["models"]["claude-sonnet-4-7"] == 2
+
+
+def test_fixture_time_of_day_total_is_user_prompt_count():
+    r = _build_fixture_report()
+    # 2 real user prompts — must NOT equal the 7 user-type entries in the file
+    assert r["time_of_day"]["message_count"] == 2
+
+
+# --- Input validation --------------------------------------------------------
+
+def test_validate_session_id_accepts_uuid_and_hex():
+    assert sm._validate_session_id("ca4ecd6c-93c2-4b60-9fc3-37d20120e306")
+    assert sm._validate_session_id("abc123")
+
+
+def test_validate_session_id_rejects_traversal():
+    import argparse
+    with pytest.raises(argparse.ArgumentTypeError):
+        sm._validate_session_id("../etc/passwd")
+    with pytest.raises(argparse.ArgumentTypeError):
+        sm._validate_session_id("a/b")
+
+
+def test_validate_slug_preserves_leading_dash():
+    assert sm._validate_slug("-Volumes-foo-bar")
+
+
+def test_validate_slug_rejects_slashes_and_traversal():
+    import argparse
+    with pytest.raises(argparse.ArgumentTypeError):
+        sm._validate_slug("foo/bar")
+    with pytest.raises(argparse.ArgumentTypeError):
+        sm._validate_slug("foo/../bar")
+
+
+# --- Time-of-day bucketing ---------------------------------------------------
+
+def _epoch(y, mo, d, h=0, m=0):
+    from datetime import datetime, timezone
+    return int(datetime(y, mo, d, h, m, tzinfo=timezone.utc).timestamp())
+
+
+def test_bucket_utc_midnight_is_night():
+    counts = sm._bucket_time_of_day([_epoch(2026, 4, 15, 0, 0)], offset_hours=0)
+    assert counts["night"] == 1
+    assert counts["total"] == 1
+
+
+def test_bucket_offset_shifts_hour():
+    # 22:00 UTC on a given day = 08:00 next day in Brisbane (UTC+10)
+    ts = [_epoch(2026, 4, 15, 22, 0)]
+    assert sm._bucket_time_of_day(ts, offset_hours=0)["evening"] == 1
+    assert sm._bucket_time_of_day(ts, offset_hours=10)["morning"] == 1
+
+
+# --- Hour-of-day (24-bucket) -------------------------------------------------
+
+def test_hour_of_day_length_and_total():
+    ts = [_epoch(2026, 4, 15, 9, 0), _epoch(2026, 4, 15, 9, 30),
+          _epoch(2026, 4, 15, 22, 0)]
+    hod = sm._build_hour_of_day(ts, offset_hours=0)
+    assert len(hod["hours"]) == 24
+    assert hod["total"] == 3
+    assert hod["hours"][9] == 2
+    assert hod["hours"][22] == 1
+
+
+def test_hour_of_day_offset_shifts_bucket():
+    ts = [_epoch(2026, 4, 15, 22, 0)]  # 22:00 UTC
+    hod_utc = sm._build_hour_of_day(ts, offset_hours=0)
+    hod_bne = sm._build_hour_of_day(ts, offset_hours=10)  # 08:00 Brisbane next day
+    assert hod_utc["hours"][22] == 1
+    assert hod_bne["hours"][8] == 1
+
+
+def test_hour_of_day_empty():
+    hod = sm._build_hour_of_day([])
+    assert hod["hours"] == [0] * 24
+    assert hod["total"] == 0
+
+
+# --- Weekday x hour matrix --------------------------------------------------
+
+def test_weekday_hour_matrix_shape():
+    wh = sm._build_weekday_hour_matrix([_epoch(2026, 4, 15, 9, 0)])
+    assert len(wh["matrix"]) == 7
+    assert all(len(row) == 24 for row in wh["matrix"])
+    assert wh["total"] == 1
+
+
+def test_weekday_hour_matrix_mon_is_row_zero():
+    # 2026-04-13 is a Monday (verify via Python's weekday())
+    from datetime import datetime, timezone
+    d = datetime(2026, 4, 13, 9, 0, tzinfo=timezone.utc)
+    assert d.weekday() == 0
+    wh = sm._build_weekday_hour_matrix([int(d.timestamp())])
+    assert wh["matrix"][0][9] == 1
+    assert wh["row_totals"][0] == 1
+    assert wh["col_totals"][9] == 1
+
+
+def test_weekday_hour_matrix_offset_crosses_day_boundary():
+    # 2026-04-15 22:00 UTC -> 2026-04-16 08:00 Brisbane (weekday shifts Wed->Thu)
+    from datetime import datetime, timezone
+    e = _epoch(2026, 4, 15, 22, 0)
+    utc_wd = datetime(2026, 4, 15, 22, 0, tzinfo=timezone.utc).weekday()
+    bne_wd = datetime(2026, 4, 16,  8, 0, tzinfo=timezone.utc).weekday()
+    wh_utc = sm._build_weekday_hour_matrix([e], offset_hours=0)
+    wh_bne = sm._build_weekday_hour_matrix([e], offset_hours=10)
+    assert wh_utc["matrix"][utc_wd][22] == 1
+    assert wh_bne["matrix"][bne_wd][8] == 1
+
+
+def test_fixture_hour_of_day_from_real_prompts():
+    r = _build_fixture_report()
+    hod = r["time_of_day"]["hour_of_day"]
+    # u2 at 22:31 UTC + u6 at 03:45 UTC = one each at h=22 and h=3
+    assert hod["hours"][22] == 1
+    assert hod["hours"][3] == 1
+    assert hod["total"] == 2
+
+
+# --- 5-hour session blocks ---------------------------------------------------
+
+def test_session_blocks_fixture_splits_on_5h_gap():
+    """Fixture has events at 22:31 (Apr 15) and 03:45 (Apr 16) — ~5h 14m gap.
+
+    The 5h window from 22:31 ends at 03:31 the next day, so 03:45 must
+    anchor a second block.
+    """
+    r = _build_fixture_report()
+    blocks = r["session_blocks"]
+    assert len(blocks) == 2
+    # First block anchors at u2 (22:31 UTC) — the earliest event
+    assert blocks[0]["anchor_iso"].startswith("2026-04-15T22:31:")
+    # Second block anchors at u6 (03:45 UTC next day)
+    assert blocks[1]["anchor_iso"].startswith("2026-04-16T03:45:")
+
+
+def test_session_blocks_counts():
+    r = _build_fixture_report()
+    blocks = r["session_blocks"]
+    # Block 0: u2 (user) + 3 assistant turns (a1_dedup, a2, a3) = 1 user, 3 turns
+    # Note: a1 appears twice in the JSONL under same msg_id "msg_A" but
+    # assistant timestamps aren't deduped in block building — both are events.
+    # What matters: user_msg_count is from filtered prompts.
+    assert blocks[0]["user_msg_count"] == 1
+    # Block 1: u6 + a4 = 1 user, 1 turn
+    assert blocks[1]["user_msg_count"] == 1
+
+
+def test_session_blocks_cost_sums_match_report_total():
+    r = _build_fixture_report()
+    # The sum of block costs should NOT equal totals["cost"] because blocks
+    # include every raw turn (duplicates included), while totals dedups on
+    # message.id.  Verify blocks include at least one duplicate (block cost
+    # > per-turn-dedup total would indicate duplicates counted).  The point
+    # of this test: blocks are computed from raw events and expose the
+    # rate-limit picture correctly, not the deduped picture.
+    blocks = r["session_blocks"]
+    assert len(blocks) >= 1
+    total_block_cost = sum(b["cost_usd"] for b in blocks)
+    # At least the full deduped total is present in the blocks.
+    assert total_block_cost >= r["totals"]["cost"] - 1e-6
+
+
+def test_parse_peak_hours_valid():
+    assert sm._parse_peak_hours("5-11") == (5, 11)
+    assert sm._parse_peak_hours("0-24") == (0, 24)
+    assert sm._parse_peak_hours(" 9 - 17 ") == (9, 17)
+
+
+def test_parse_peak_hours_rejects_wrap_or_invalid():
+    import argparse
+    for bad in ["5", "11-5", "24-25", "-1-5", "abc", ""]:
+        with pytest.raises(argparse.ArgumentTypeError):
+            sm._parse_peak_hours(bad)
+
+
+def test_build_peak_none_when_no_hours():
+    assert sm._build_peak(None, None) is None
+
+
+def test_build_peak_defaults_to_los_angeles():
+    p = sm._build_peak((5, 11), None)
+    assert p is not None
+    assert p["start"] == 5
+    assert p["end"] == 11
+    assert p["tz_label"] == "America/Los_Angeles"
+    # LA is either UTC-8 (PST) or UTC-7 (PDT); either is acceptable.
+    assert p["tz_offset_hours"] in (-7.0, -8.0)
+    assert "community" in p["note"].lower()
+
+
+def test_weekly_rollup_has_data_flag():
+    r = _build_fixture_report()
+    # Fixture has 4 turns; fixture dates are in 2026-04, so whether the
+    # trailing/prior windows catch them depends on "now". We only assert
+    # structure here: the keys and shapes are stable.
+    ro = r["weekly_rollup"]
+    assert "trailing_7d" in ro and "prior_7d" in ro
+    for w in (ro["trailing_7d"], ro["prior_7d"]):
+        assert set(w.keys()) >= {"turns", "user_prompts", "cost", "blocks",
+                                  "input", "output", "cache_read", "cache_write",
+                                  "cache_hit_pct"}
+
+
+def test_weekly_rollup_uses_deduped_cost():
+    """Trailing-7d cost (when fixture dates are in-window) should equal the
+    report total — confirms rollup uses the deduped turn records, not raw."""
+    now = _epoch(2026, 4, 17, 0, 0)   # just after both fixture events
+    sid, turns, user_ts = sm._load_session(_FIXTURE, include_subagents=False)
+    r = sm._build_report("session", "test", [(sid, turns, user_ts)])
+    ro = sm._build_weekly_rollup(
+        r["sessions"], [(sid, turns, user_ts)], r["session_blocks"],
+        now_epoch=now,
+    )
+    assert ro["trailing_7d"]["cost"] == pytest.approx(0.01748, abs=1e-7)
+    assert ro["prior_7d"]["cost"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_fmt_delta_pct_prior_zero_returns_new():
+    d, _ = sm._fmt_delta_pct(5, 0)
+    assert d == "new"
+    d, _ = sm._fmt_delta_pct(0, 0)
+    assert d in ("new", "\u2013")
+
+
+def test_fmt_delta_pct_positive_and_negative():
+    d, _ = sm._fmt_delta_pct(120, 100)
+    assert d == "+20.0%"
+    d, _ = sm._fmt_delta_pct(80, 100)
+    assert d == "-20.0%"
+
+
+def test_session_duration_stats_requires_two_turns():
+    assert sm._session_duration_stats({"turns": []}) is None
+    one_turn = {"turns": [{"timestamp": "2026-04-15T22:31:00Z"}],
+                "subtotal": {"total": 100, "cost": 0.1, "turns": 1}}
+    assert sm._session_duration_stats(one_turn) is None
+
+
+def test_cached_parse_matches_uncached(tmp_path, monkeypatch):
+    """The cache round-trip must produce exactly the same entries as direct parse."""
+    # Redirect the cache dir so we don't pollute ~/.cache.
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    direct = sm._parse_jsonl(_FIXTURE)
+    cached = sm._cached_parse_jsonl(_FIXTURE, use_cache=True)
+    assert direct == cached
+    # Second call should hit the cache — still equal.
+    cached2 = sm._cached_parse_jsonl(_FIXTURE, use_cache=True)
+    assert direct == cached2
+
+
+def test_cached_parse_writes_blob(tmp_path, monkeypatch):
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    sm._cached_parse_jsonl(_FIXTURE, use_cache=True)
+    blobs = list((tmp_path / "parse").glob("*.json.gz"))
+    assert len(blobs) == 1
+
+
+def test_cached_parse_no_cache_skips_disk(tmp_path, monkeypatch):
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    sm._cached_parse_jsonl(_FIXTURE, use_cache=False)
+    # Cache dir should not even exist (no writes).
+    assert not (tmp_path / "parse").exists()
+
+
+def test_cached_parse_invalidates_on_mtime(tmp_path, monkeypatch):
+    """A touched JSONL must generate a fresh cache key, not a stale one."""
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    # Copy fixture to a writable temp file so we can bump its mtime.
+    src = tmp_path / "mini.jsonl"
+    src.write_text(_FIXTURE.read_text(encoding="utf-8"))
+    sm._cached_parse_jsonl(src, use_cache=True)
+    before = {p.name for p in (tmp_path / "parse").iterdir()}
+    # Bump mtime by 2 seconds to force a distinct key.
+    import os
+    stat = src.stat()
+    os.utime(src, (stat.st_atime, stat.st_mtime + 2))
+    sm._cached_parse_jsonl(src, use_cache=True)
+    after = {p.name for p in (tmp_path / "parse").iterdir()}
+    # Two distinct cache files now.
+    assert len(after) == 2
+    assert before.issubset(after)
+
+
+def test_render_html_single_page_has_everything():
+    r = _build_fixture_report()
+    html = sm.render_html(r, variant="single")
+    assert 'id="session-blocks"' in html
+    assert 'id="hod-chart"'       in html
+    assert 'id="chart-container'  in html   # chart lives on the same page
+
+
+def test_render_html_dashboard_omits_chart_and_highcharts():
+    r = _build_fixture_report()
+    html = sm.render_html(r, variant="dashboard", nav_sibling="detail.html")
+    assert 'id="session-blocks"'   in html
+    assert 'id="hod-chart"'        in html
+    assert 'id="chart-container'   not in html
+    assert "Highcharts"            not in html
+    assert 'href="detail.html"'    in html
+
+
+def test_render_html_detail_omits_insights():
+    r = _build_fixture_report()
+    html = sm.render_html(r, variant="detail", nav_sibling="dashboard.html")
+    assert 'id="chart-container'   in html
+    assert "Highcharts"            in html
+    assert 'id="session-blocks"'   not in html
+    assert 'class="cards"'         not in html
+    assert 'href="dashboard.html"' in html
+
+
+def test_session_duration_stats_computes_burn_rate():
+    session = {
+        "turns": [
+            {"timestamp": "2026-04-15T22:00:00Z"},
+            {"timestamp": "2026-04-15T22:10:00Z"},
+        ],
+        "subtotal": {"total": 100_000, "cost": 5.00, "turns": 2},
+    }
+    st = sm._session_duration_stats(session)
+    assert st is not None
+    assert st["wall_sec"] == 600
+    assert st["wall_min"] == pytest.approx(10.0)
+    assert st["tokens_per_min"] == pytest.approx(10_000)
+    assert st["cost_per_min"] == pytest.approx(0.5)
+
+
+def test_weekly_block_counts_trailing_windows():
+    # Build a small block list at fixed epoch times, then count with a
+    # fixed "now" so the test is deterministic regardless of when run.
+    now = _epoch(2026, 4, 20, 0, 0)
+    blocks = [
+        {"last_epoch": now - 2 * 86400},   # 2 days ago — in 7d
+        {"last_epoch": now - 10 * 86400},  # 10 days ago — in 14d, not 7d
+        {"last_epoch": now - 45 * 86400},  # 45 days ago — in total only
+    ]
+    s = sm._weekly_block_counts(blocks, now_epoch=now)
+    assert s["trailing_7"]  == 1
+    assert s["trailing_14"] == 2
+    assert s["trailing_30"] == 2
+    assert s["total"]       == 3
+
+
+# --- Chart library dispatch / vendoring --------------------------------------
+
+def test_chart_renderers_registry_has_all_four_renderers():
+    for key in ("highcharts", "uplot", "chartjs", "none"):
+        assert key in sm.CHART_RENDERERS, f"{key} missing from CHART_RENDERERS"
+        assert callable(sm.CHART_RENDERERS[key]), f"{key} not callable"
+
+
+def test_render_chart_none_empty_payload():
+    body, head = sm._render_chart_none([])
+    assert body == ""
+    assert head == ""
+
+
+def test_render_chart_highcharts_empty_turns_is_empty():
+    # No turns -> no chart and no JS (the dashboard-only variant relies on
+    # this so it can skip inlining the entire vendored bundle).
+    body, head = sm._render_chart_highcharts([])
+    assert body == ""
+    assert head == ""
+
+
+def test_vendor_manifest_loads_with_expected_schema():
+    m = sm._load_chart_manifest()
+    libs = m.get("libraries", {})
+    assert "highcharts" in libs
+    hc = libs["highcharts"]
+    assert hc["license"].startswith("non-commercial")
+    assert len(hc["files"]) >= 4
+    for f in hc["files"]:
+        assert {"name", "path", "sha256"} <= f.keys()
+        assert len(f["sha256"]) == 64
+
+
+def test_read_vendor_js_returns_real_payload_and_hash_matches():
+    # Sanity check: the bundled Highcharts files exist and their SHA-256
+    # matches what the manifest claims. The function returns a non-empty
+    # JS blob when verification passes.
+    payload = sm._read_vendor_js("highcharts")
+    assert len(payload) > 100_000   # ~360 KB when all 4 files verify
+
+
+def test_read_vendor_js_unknown_library_returns_empty(capsys):
+    payload = sm._read_vendor_js("not-a-library")
+    assert payload == ""
+    err = capsys.readouterr().err
+    assert "not in vendor manifest" in err
+
+
+def _mini_report():
+    turns   = sm._extract_turns(sm._parse_jsonl(_FIXTURE))
+    user_ts = sm._extract_user_timestamps(sm._parse_jsonl(_FIXTURE))
+    return sm._build_report(
+        "session", "test-slug", [("mini", turns, user_ts)],
+        tz_offset_hours=0.0, tz_label="UTC",
+    )
+
+
+def test_render_html_chart_lib_none_omits_highcharts_bundle():
+    html = sm.render_html(_mini_report(), variant="single", chart_lib="none")
+    assert "Highcharts.chart" not in html
+    assert 'id="chart-container"' not in html
+
+
+def test_render_html_chart_lib_highcharts_inlines_bundle():
+    html = sm.render_html(_mini_report(), variant="single", chart_lib="highcharts")
+    # Inlined library + chart container both present; no CDN reference.
+    assert "Highcharts.chart" in html
+    assert 'id="chart-container"' in html
+    assert "cdn.jsdelivr.net" not in html
+
+
+def test_maybe_warn_chart_license_silent_for_none(capsys):
+    sm._maybe_warn_chart_license("none", ["html"])
+    err = capsys.readouterr().err
+    assert "license" not in err.lower()
+
+
+def test_maybe_warn_chart_license_warns_for_highcharts(capsys):
+    sm._maybe_warn_chart_license("highcharts", ["html"])
+    err = capsys.readouterr().err
+    assert "non-commercial" in err
+
+
+def test_maybe_warn_chart_license_silent_when_html_not_exported(capsys):
+    sm._maybe_warn_chart_license("highcharts", ["text", "json"])
+    err = capsys.readouterr().err
+    assert err == ""
+
+
+# --- uPlot + Chart.js renderers ----------------------------------------------
+
+def test_render_chart_uplot_empty_turns_is_empty():
+    body, head = sm._render_chart_uplot([])
+    assert body == ""
+    assert head == ""
+
+
+def test_render_chart_chartjs_empty_turns_is_empty():
+    body, head = sm._render_chart_chartjs([])
+    assert body == ""
+    assert head == ""
+
+
+def test_vendor_manifest_loads_uplot_and_chartjs():
+    libs = sm._load_chart_manifest().get("libraries", {})
+    for name in ("uplot", "chartjs"):
+        assert name in libs, f"{name} missing from manifest"
+        assert libs[name]["license"] == "MIT"
+        for f in libs[name]["files"]:
+            assert {"name", "path", "sha256"} <= f.keys()
+            assert len(f["sha256"]) == 64
+
+
+def test_read_vendor_js_returns_real_payload_uplot():
+    payload = sm._read_vendor_js("uplot")
+    assert len(payload) > 30_000   # ~50 KB minified IIFE bundle
+    assert "uPlot" in payload      # global namespace marker
+
+
+def test_read_vendor_css_returns_real_payload_uplot():
+    css = sm._read_vendor_css("uplot")
+    assert len(css) > 500          # ~1.8 KB stylesheet
+    assert ".uplot" in css         # uPlot's own class prefix
+
+
+def test_read_vendor_css_chartjs_is_empty():
+    # Chart.js ships no CSS — confirm the helper handles that cleanly.
+    assert sm._read_vendor_css("chartjs") == ""
+
+
+def test_read_vendor_js_returns_real_payload_chartjs():
+    payload = sm._read_vendor_js("chartjs")
+    assert len(payload) > 100_000  # ~204 KB UMD bundle
+    assert "Chart" in payload
+
+
+def _real_turns():
+    """Real enriched turns from the fixture (with ``timestamp_fmt`` and
+    other report-level keys the chart renderers rely on)."""
+    rep = _mini_report()
+    return [t for s in rep["sessions"] for t in s["turns"]]
+
+
+def test_render_chart_uplot_emits_canvas_and_data():
+    turns = _real_turns()
+    assert turns, "fixture must have at least one turn"
+    body, head = sm._render_chart_uplot(turns)
+    assert 'id="chart-container"' in body
+    assert 'class="chart-lazy"' in body
+    assert "new uPlot(" in body                # init call
+    assert "<style>" in head and "<script>" in head  # both blocks present
+    assert ".uplot" in head                    # uPlot CSS inlined
+    assert "uPlot" in head                     # uPlot JS inlined
+
+
+def test_render_chart_chartjs_emits_canvas_and_data():
+    turns = _real_turns()
+    body, head = sm._render_chart_chartjs(turns)
+    assert 'id="chart-container"' in body
+    assert 'class="chart-lazy"' in body
+    assert "new Chart(" in body                # init call
+    assert "createElement('canvas')" in body   # canvas-based renderer
+    assert "<script>" in head and "Chart" in head
+
+
+def test_render_html_chart_lib_uplot_inlines_bundle():
+    html = sm.render_html(_mini_report(), variant="single", chart_lib="uplot")
+    assert "new uPlot(" in html
+    assert ".uplot" in html
+    assert 'id="chart-container"' in html
+    assert "Highcharts.chart" not in html
+    assert "cdn.jsdelivr.net" not in html
+
+
+def test_render_html_chart_lib_chartjs_inlines_bundle():
+    html = sm.render_html(_mini_report(), variant="single", chart_lib="chartjs")
+    assert "new Chart(" in html
+    assert 'id="chart-container"' in html
+    assert "Highcharts.chart" not in html
+    assert "cdn.jsdelivr.net" not in html
+
+
+def test_maybe_warn_chart_license_silent_for_mit_libs(capsys):
+    for lib in ("uplot", "chartjs"):
+        sm._maybe_warn_chart_license(lib, ["html"])
+    err = capsys.readouterr().err
+    assert "non-commercial" not in err
+    assert "license" not in err.lower()

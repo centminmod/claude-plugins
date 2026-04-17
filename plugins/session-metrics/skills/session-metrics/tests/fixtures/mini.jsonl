@@ -1,0 +1,12 @@
+{"type":"user","uuid":"u1","timestamp":"2026-04-15T22:30:00.000Z","isMeta":true,"sessionId":"s1","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>"}]}}
+{"type":"user","uuid":"u2","timestamp":"2026-04-15T22:31:00.000Z","sessionId":"s1","message":{"role":"user","content":[{"type":"text","text":"hello as list"}]}}
+{"type":"assistant","uuid":"a1","timestamp":"2026-04-15T22:31:05.000Z","sessionId":"s1","message":{"id":"msg_A","model":"claude-opus-4-7","role":"assistant","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":1000}}}
+{"type":"assistant","uuid":"a1b","timestamp":"2026-04-15T22:31:06.000Z","sessionId":"s1","message":{"id":"msg_A","model":"claude-opus-4-7","role":"assistant","usage":{"input_tokens":120,"output_tokens":80,"cache_read_input_tokens":500,"cache_creation_input_tokens":1000}}}
+{"type":"user","uuid":"u3","timestamp":"2026-04-15T22:31:10.000Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}
+{"type":"assistant","uuid":"a2","timestamp":"2026-04-15T22:31:15.000Z","sessionId":"s1","message":{"id":"msg_B","model":"claude-sonnet-4-7","role":"assistant","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":2000,"cache_creation_input_tokens":0}}}
+{"type":"user","uuid":"u4","timestamp":"2026-04-15T22:31:20.000Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}
+{"type":"user","uuid":"u5","timestamp":"2026-04-15T22:31:25.000Z","isSidechain":true,"sessionId":"s1","message":{"role":"user","content":[{"type":"text","text":"subagent"}]}}
+{"type":"assistant","uuid":"a3","timestamp":"2026-04-15T22:31:30.000Z","sessionId":"s1","message":{"id":"msg_C","model":"claude-opus-4-7","role":"assistant","usage":{"input_tokens":5,"output_tokens":15,"cache_read_input_tokens":3000,"cache_creation_input_tokens":0}}}
+{"type":"user","uuid":"u6","timestamp":"2026-04-16T03:45:00.000Z","sessionId":"s1","message":{"role":"user","content":"second prompt as plain string"}}
+{"type":"user","uuid":"u7","timestamp":"2026-04-16T03:45:05.000Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t3","content":"ok"}]}}
+{"type":"assistant","uuid":"a4","timestamp":"2026-04-16T03:45:10.000Z","sessionId":"s1","message":{"id":"msg_D","model":"claude-sonnet-4-7","role":"assistant","usage":{"input_tokens":200,"output_tokens":300,"cache_read_input_tokens":1500,"cache_creation_input_tokens":0}}}
