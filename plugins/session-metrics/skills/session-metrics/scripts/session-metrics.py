@@ -29,6 +29,7 @@ Environment variables (all optional — CLI flags take precedence):
 
 import argparse
 import csv as csv_mod
+import functools
 import gzip
 import hashlib
 import io
@@ -193,13 +194,14 @@ def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
 
     cache_dir = _parse_cache_dir()
     cache_path = cache_dir / _parse_cache_key(path, mtime_ns)
-    if cache_path.exists():
-        try:
-            with gzip.open(cache_path, "rt", encoding="utf-8") as fh:
-                return json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            # Corrupt or unreadable — fall through to fresh parse.
-            pass
+    try:
+        with gzip.open(cache_path, "rt", encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError):
+        # Corrupt or unreadable — fall through to fresh parse.
+        pass
 
     entries = _parse_jsonl(path)
     try:
@@ -264,11 +266,9 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
         # the first streaming chunk.
         if msg_id not in preceding_user:
             preceding_user[msg_id] = last_user_content
-        # Union content blocks across every occurrence of this msg_id.
         content = msg.get("content")
         if isinstance(content, list):
             merged_content.setdefault(msg_id, []).extend(content)
-        # Last occurrence wins for usage / model / timestamp.
         last_entry[msg_id] = entry
     turns: list[dict] = []
     for msg_id, entry in last_entry.items():
@@ -330,6 +330,20 @@ _TOD_PERIODS = (
 )
 
 
+def _parse_iso_dt(ts: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp to a tz-aware ``datetime``; ``None`` on failure.
+
+    Catches the union of error types historically swallowed at every call
+    site so each caller's existing safety net is preserved unchanged.
+    """
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError, OSError):
+        return None
+
+
 def _is_user_prompt(entry: dict) -> bool:
     """Return True for genuine user-typed prompts only.
 
@@ -383,13 +397,12 @@ def _extract_user_timestamps(
             continue
         if entry.get("isSidechain") and not include_sidechain:
             continue
-        ts = entry.get("timestamp", "")
-        if not ts:
+        dt = _parse_iso_dt(entry.get("timestamp", ""))
+        if dt is None:
             continue
         try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             timestamps.append(int(dt.timestamp()))
-        except (ValueError, OSError):
+        except (OSError, OverflowError):
             continue
     timestamps.sort()
     return timestamps
@@ -612,11 +625,12 @@ _BLOCK_WINDOW_SEC = 5 * 3600
 
 def _parse_iso_epoch(ts: str) -> int:
     """Parse an ISO-8601 timestamp to UTC epoch seconds; 0 on failure."""
-    if not ts:
+    dt = _parse_iso_dt(ts)
+    if dt is None:
         return 0
     try:
-        return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
-    except (ValueError, AttributeError, OSError):
+        return int(dt.timestamp())
+    except (OSError, OverflowError):
         return 0
 
 
@@ -866,26 +880,28 @@ def _resolve_session(args) -> tuple[Path, str]:
     return files[0], slug
 
 
-def _env_slug() -> str | None:
-    v = os.environ.get("CLAUDE_PROJECT_SLUG")
+def _env_validated(env_key: str, validator) -> str | None:
+    """Read ``env_key`` and run it through ``validator``.
+
+    Returns the validated value, ``None`` if the env var is unset, or
+    exits 1 with an `[error] <KEY>: <msg>` line on validation failure.
+    """
+    v = os.environ.get(env_key)
     if v is None:
         return None
     try:
-        return _validate_slug(v)
+        return validator(v)
     except argparse.ArgumentTypeError as exc:
-        print(f"[error] CLAUDE_PROJECT_SLUG: {exc}", file=sys.stderr)
+        print(f"[error] {env_key}: {exc}", file=sys.stderr)
         sys.exit(1)
+
+
+def _env_slug() -> str | None:
+    return _env_validated("CLAUDE_PROJECT_SLUG", _validate_slug)
 
 
 def _env_session_id() -> str | None:
-    v = os.environ.get("CLAUDE_SESSION_ID")
-    if v is None:
-        return None
-    try:
-        return _validate_session_id(v)
-    except argparse.ArgumentTypeError as exc:
-        print(f"[error] CLAUDE_SESSION_ID: {exc}", file=sys.stderr)
-        sys.exit(1)
+    return _env_validated("CLAUDE_SESSION_ID", _validate_session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1099,40 +1115,33 @@ def _text_table_headers(tz_offset_hours: float = 0.0,
     return hdr, "-" * len(hdr), "=" * len(hdr)
 
 
+def _report_has_any(report: dict, predicate) -> bool:
+    """Return True if any turn across any session matches ``predicate``."""
+    return any(predicate(t) for s in report["sessions"] for t in s["turns"])
+
+
 def _has_fast(report: dict) -> bool:
     """Return True if any turn in the report used fast mode."""
-    for s in report["sessions"]:
-        for t in s["turns"]:
-            if t.get("speed") == "fast":
-                return True
-    return False
+    return _report_has_any(report, lambda t: t.get("speed") == "fast")
 
 
 def _has_1h_cache(report: dict) -> bool:
     """Return True if any turn used the 1-hour cache TTL tier."""
-    for s in report["sessions"]:
-        for t in s["turns"]:
-            if t.get("cache_write_1h_tokens", 0) > 0:
-                return True
-    return False
+    return _report_has_any(report, lambda t: t.get("cache_write_1h_tokens", 0) > 0)
 
 
 def _has_thinking(report: dict) -> bool:
     """Return True if any turn carried at least one thinking block."""
-    for s in report["sessions"]:
-        for t in s["turns"]:
-            if (t.get("content_blocks") or {}).get("thinking", 0) > 0:
-                return True
-    return False
+    return _report_has_any(
+        report, lambda t: (t.get("content_blocks") or {}).get("thinking", 0) > 0
+    )
 
 
 def _has_tool_use(report: dict) -> bool:
     """Return True if any turn carried at least one tool_use block."""
-    for s in report["sessions"]:
-        for t in s["turns"]:
-            if (t.get("content_blocks") or {}).get("tool_use", 0) > 0:
-                return True
-    return False
+    return _report_has_any(
+        report, lambda t: (t.get("content_blocks") or {}).get("tool_use", 0) > 0
+    )
 
 
 def _has_content_blocks(report: dict) -> bool:
@@ -1141,12 +1150,10 @@ def _has_content_blocks(report: dict) -> bool:
     Drives conditional rendering of the Content column so legacy reports
     (or empty fixtures) stay visually unchanged.
     """
-    for s in report["sessions"]:
-        for t in s["turns"]:
-            cb = t.get("content_blocks") or {}
-            if any(cb.get(k, 0) > 0 for k in cb):
-                return True
-    return False
+    def _any_nonzero(t):
+        cb = t.get("content_blocks") or {}
+        return any(v > 0 for v in cb.values())
+    return _report_has_any(report, _any_nonzero)
 
 
 def _fmt_content_cell(cb: dict) -> str:
@@ -1175,13 +1182,35 @@ def _fmt_content_title(cb: dict) -> str:
 
 
 def _fmt_ts(ts: str, offset_hours: float = 0.0) -> str:
+    dt = _parse_iso_dt(ts)
+    if dt is None:
+        return ts[:19] if len(ts) >= 19 else ts
     try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         if offset_hours:
             dt = dt.astimezone(timezone(timedelta(hours=offset_hours)))
         return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
+    except (ValueError, OverflowError, OSError):
         return ts[:19] if len(ts) >= 19 else ts
+
+
+def _fmt_generated_at(report: dict) -> str:
+    """Format ``report["generated_at"]`` in the report's display tz.
+
+    Falls back to a UTC-suffixed string when the timestamp can't be
+    parsed or shifted (preserves the prior bare-except behavior of the
+    two markdown/HTML render sites this consolidates).
+    """
+    raw = report.get("generated_at", "")
+    tz_offset = report.get("tz_offset_hours", 0.0)
+    fallback = raw[:19].replace("T", " ") + " UTC"
+    dt = _parse_iso_dt(raw)
+    if dt is None:
+        return fallback
+    try:
+        local = dt.astimezone(timezone(timedelta(hours=tz_offset)))
+        return local.strftime("%Y-%m-%d %H:%M:%S") + f" {_short_tz_label(tz_offset)}"
+    except (ValueError, OverflowError, OSError):
+        return fallback
 
 
 def _short_tz_label(offset_hours: float) -> str:
@@ -1597,13 +1626,7 @@ def render_md(report: dict) -> str:
     totals = report["totals"]
     mode = report["mode"]
     tz_offset = report.get("tz_offset_hours", 0.0)
-    try:
-        _gen_dt = datetime.fromisoformat(
-            report["generated_at"].replace("Z", "+00:00")
-        ).astimezone(timezone(timedelta(hours=tz_offset)))
-        generated = _gen_dt.strftime("%Y-%m-%d %H:%M:%S") + f" {_short_tz_label(tz_offset)}"
-    except Exception:
-        generated = report["generated_at"][:19].replace("T", " ") + " UTC"
+    generated = _fmt_generated_at(report)
 
     p(f"# Session Metrics — {slug}")
     p()
@@ -2587,9 +2610,14 @@ def _build_chart_html(
 _VENDOR_CHARTS_DIR = Path(__file__).parent / "vendor" / "charts"
 
 
+@functools.lru_cache(maxsize=1)
 def _load_chart_manifest() -> dict:
     """Parse ``vendor/charts/manifest.json``. Returns an empty libraries dict
-    if the manifest is missing (keeps the tool usable in degraded mode)."""
+    if the manifest is missing (keeps the tool usable in degraded mode).
+
+    Cached for the process lifetime — callers (``_read_vendor_files`` and
+    ``_maybe_warn_chart_license``) only read from the returned dict.
+    """
     mpath = _VENDOR_CHARTS_DIR / "manifest.json"
     if not mpath.exists():
         return {"libraries": {}}
@@ -3025,14 +3053,7 @@ def render_html(report: dict, variant: str = "single",
     slug = report["slug"]
     totals = report["totals"]
     mode = report["mode"]
-    _tz_off_for_gen = report.get("tz_offset_hours", 0.0)
-    try:
-        _gen_dt = datetime.fromisoformat(
-            report["generated_at"].replace("Z", "+00:00")
-        ).astimezone(timezone(timedelta(hours=_tz_off_for_gen)))
-        generated = _gen_dt.strftime("%Y-%m-%d %H:%M:%S") + f" {_short_tz_label(_tz_off_for_gen)}"
-    except Exception:
-        generated = report["generated_at"][:19].replace("T", " ") + " UTC"
+    generated = _fmt_generated_at(report)
     sessions = report["sessions"]
 
     # ---- Chart data --------------------------------------------------------
@@ -3191,12 +3212,16 @@ def render_html(report: dict, variant: str = "single",
                 table_rows.append('</tbody>')
         table_rows.append(subtotal_row("PROJECT TOTAL" if mode == "project" else "TOTAL", totals))
 
+        def _model_row_html(m: str, cnt: int) -> str:
+            r = _pricing_for(m)
+            return (f'<tr><td><code>{m}</code></td><td class="num">{cnt:,}</td>'
+                    f'<td class="num">${r["input"]:.2f}</td>'
+                    f'<td class="num">${r["output"]:.2f}</td>'
+                    f'<td class="num">${r["cache_read"]:.2f}</td>'
+                    f'<td class="num">${r["cache_write"]:.2f}</td></tr>')
+
         model_rows = "".join(
-            f'<tr><td><code>{m}</code></td><td class="num">{cnt:,}</td>'
-            f'<td class="num">${_pricing_for(m)["input"]:.2f}</td>'
-            f'<td class="num">${_pricing_for(m)["output"]:.2f}</td>'
-            f'<td class="num">${_pricing_for(m)["cache_read"]:.2f}</td>'
-            f'<td class="num">${_pricing_for(m)["cache_write"]:.2f}</td></tr>'
+            _model_row_html(m, cnt)
             for m, cnt in sorted(report["models"].items(), key=lambda x: -x[1])
         )
 
