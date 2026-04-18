@@ -216,20 +216,106 @@ def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
 
 
 def _extract_turns(entries: list[dict]) -> list[dict]:
-    """Deduplicate on message.id, keep last occurrence, sort by timestamp."""
-    seen: dict[str, dict] = {}
+    """Deduplicate on message.id and return one entry per assistant turn.
+
+    Claude Code writes a single assistant response across **multiple JSONL
+    entries** that all share the same ``message.id`` and an identical
+    ``usage`` dict, but each carries a **different single content block**
+    (one thinking block, one text block, one tool_use block, etc.).  This
+    is how Anthropic's streaming output is persisted.  Dedup strategy:
+
+    - ``usage``, ``model``, and timestamp come from the **last** occurrence
+      (canonical "message settled" snapshot; cost math was always correct
+      because ``usage`` is constant across occurrences).
+    - ``content`` is the **union** of content blocks across **every**
+      occurrence (so the turn record reflects the full thinking + text +
+      tool_use distribution the model actually emitted).  Empirically,
+      each occurrence contributes exactly one distinct block and they never
+      overlap; if Claude Code ever starts shipping cumulative snapshots
+      alongside incremental ones, we'd need to dedup block-by-block here.
+
+    Each returned entry has ``_preceding_user_content`` attached — the
+    ``message.content`` of the user entry immediately before this turn's
+    **first** occurrence in the raw stream (content-block counters use
+    this to attribute ``tool_result`` / ``image`` blocks to the turn that
+    consumed them).
+    """
+    last_entry: dict[str, dict] = {}
+    merged_content: dict[str, list] = {}
+    preceding_user: dict[str, object] = {}
+    last_user_content = None
     for entry in entries:
-        if entry.get("type") != "assistant":
+        t = entry.get("type")
+        if t == "user":
+            msg = entry.get("message") or {}
+            last_user_content = msg.get("content")
+            continue
+        if t != "assistant":
             continue
         msg = entry.get("message", {})
         if "usage" not in msg:
             continue
         msg_id = msg.get("id")
-        if msg_id:
-            seen[msg_id] = entry
-    turns = list(seen.values())
+        if not msg_id:
+            continue
+        # First-occurrence wins for the preceding user pointer — streaming
+        # echo entries of the same msg_id don't see a new user prompt in
+        # between, so the triggering user entry is the one we saw before
+        # the first streaming chunk.
+        if msg_id not in preceding_user:
+            preceding_user[msg_id] = last_user_content
+        # Union content blocks across every occurrence of this msg_id.
+        content = msg.get("content")
+        if isinstance(content, list):
+            merged_content.setdefault(msg_id, []).extend(content)
+        # Last occurrence wins for usage / model / timestamp.
+        last_entry[msg_id] = entry
+    turns: list[dict] = []
+    for msg_id, entry in last_entry.items():
+        merged_msg = {**entry["message"], "content": merged_content.get(msg_id, [])}
+        turns.append({
+            **entry,
+            "message": merged_msg,
+            "_preceding_user_content": preceding_user.get(msg_id),
+        })
     turns.sort(key=lambda e: e.get("timestamp", ""))
     return turns
+
+
+# Content-block letter codes used in the per-turn Content cell.
+_CONTENT_LETTERS = (
+    ("thinking",    "T"),
+    ("tool_use",    "u"),
+    ("text",        "x"),
+    ("tool_result", "r"),
+    ("image",       "i"),
+)
+
+
+def _count_content_blocks(content) -> tuple[dict[str, int], list[str]]:
+    """Count content blocks by type. Return (counts, tool_names).
+
+    ``content`` is the ``message.content`` field, which is either a list of
+    block dicts (normal case) or a plain string (rare: old-style user prompts)
+    or missing entirely.  Non-list content has no structured blocks, so the
+    returned counts are all zero.
+    """
+    counts = {"thinking": 0, "tool_use": 0, "text": 0,
+              "tool_result": 0, "image": 0}
+    names: list[str] = []
+    if not isinstance(content, list):
+        return counts, names
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        t = block.get("type", "")
+        if t in counts:
+            counts[t] += 1
+        if t == "tool_use":
+            name = block.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    return counts, names
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +912,18 @@ def _build_turn_record(global_index: int, entry: dict,
         ttl = "mix"
     c = _cost(u, model)
     nc = _no_cache_cost(u, model)
+    # Content-block distribution: assistant blocks come from this turn's own
+    # message.content; tool_result / image blocks are attributed from the user
+    # entry that immediately preceded this turn in the raw JSONL stream.
+    assist_counts, tool_names = _count_content_blocks(msg.get("content"))
+    user_counts, _ = _count_content_blocks(entry.get("_preceding_user_content"))
+    content_blocks = {
+        "thinking":    assist_counts["thinking"],
+        "tool_use":    assist_counts["tool_use"],
+        "text":        assist_counts["text"],
+        "tool_result": user_counts["tool_result"],
+        "image":       user_counts["image"],
+    }
     return {
         "index":                  global_index,
         "timestamp":              entry.get("timestamp", ""),
@@ -842,6 +940,8 @@ def _build_turn_record(global_index: int, entry: dict,
         "cost_usd":               c,
         "no_cache_cost_usd":      nc,
         "speed":                  u.get("speed", ""),
+        "content_blocks":         content_blocks,
+        "tool_use_names":         tool_names,
     }
 
 
@@ -849,6 +949,10 @@ def _totals_from_turns(turn_records: list[dict]) -> dict:
     t = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
          "cache_write_5m": 0, "cache_write_1h": 0, "extra_1h_cost": 0.0,
          "cost": 0.0, "no_cache_cost": 0.0, "turns": len(turn_records)}
+    content_block_totals = {"thinking": 0, "tool_use": 0, "text": 0,
+                            "tool_result": 0, "image": 0}
+    thinking_turn_count = 0
+    name_counts: dict[str, int] = {}
     for r in turn_records:
         t["input"]        += r["input_tokens"]
         t["output"]       += r["output_tokens"]
@@ -864,10 +968,30 @@ def _totals_from_turns(turn_records: list[dict]) -> dict:
         if tokens_1h:
             rates = _pricing_for(r["model"])
             t["extra_1h_cost"] += tokens_1h * (rates["cache_write_1h"] - rates["cache_write"]) / 1_000_000
+        cb = r.get("content_blocks") or {}
+        for k in content_block_totals:
+            content_block_totals[k] += cb.get(k, 0)
+        if cb.get("thinking", 0) > 0:
+            thinking_turn_count += 1
+        for name in r.get("tool_use_names", []) or []:
+            name_counts[name] = name_counts.get(name, 0) + 1
+    n_turns = len(turn_records)
     t["total"] = t["input"] + t["output"] + t["cache_read"] + t["cache_write"]
     t["total_input"] = t["input"] + t["cache_read"] + t["cache_write"]
     t["cache_savings"] = t["no_cache_cost"] - t["cost"]
     t["cache_hit_pct"] = 100 * t["cache_read"] / max(1, t["total_input"])
+    t["content_blocks"] = content_block_totals
+    t["thinking_turn_count"] = thinking_turn_count
+    t["thinking_turn_pct"] = (
+        100 * thinking_turn_count / n_turns if n_turns else 0.0
+    )
+    t["tool_call_total"] = content_block_totals["tool_use"]
+    t["tool_call_avg_per_turn"] = (
+        content_block_totals["tool_use"] / n_turns if n_turns else 0.0
+    )
+    # Stable ordering: count desc, then name asc so ties are deterministic.
+    ranked = sorted(name_counts.items(), key=lambda x: (-x[1], x[0]))
+    t["tool_names_top3"] = [name for name, _ in ranked[:3]]
     return t
 
 
@@ -943,20 +1067,35 @@ def _build_report(
 # ---------------------------------------------------------------------------
 
 COL  = "{:<4} {:<19} {:>11} {:>7} {:>9} {:>9} {:>10} {:>9}"
-# Mode (speed) column — appended when any turn in the report used fast mode
-COL_M  = COL + "  {:<4}"
+# Optional suffix columns: Mode (fast mode), Content (per-turn block distribution)
+_COL_MODE_SUFFIX    = "  {:<4}"
+_COL_CONTENT_SUFFIX = "  {:<15}"
+COL_M  = COL + _COL_MODE_SUFFIX  # retained for back-compat
+
+
+def _text_format(show_mode: bool, show_content: bool) -> str:
+    """Assemble the text-row format string with optional trailing columns."""
+    fmt = COL
+    if show_mode:
+        fmt += _COL_MODE_SUFFIX
+    if show_content:
+        fmt += _COL_CONTENT_SUFFIX
+    return fmt
 
 
 def _text_table_headers(tz_offset_hours: float = 0.0,
-                         show_mode: bool = False) -> tuple[str, str, str]:
+                         show_mode: bool = False,
+                         show_content: bool = False) -> tuple[str, str, str]:
     """Return (hdr, sep, wide) for the text timeline table in the given tz."""
     time_col = f"Time ({_short_tz_label(tz_offset_hours)})"
+    fmt = _text_format(show_mode, show_content)
+    args = ["#", time_col, "Input (new)", "Output",
+            "CacheRd", "CacheWr", "Total", "Cost $"]
     if show_mode:
-        hdr = COL_M.format("#", time_col, "Input (new)", "Output",
-                           "CacheRd", "CacheWr", "Total", "Cost $", "Mode")
-    else:
-        hdr = COL.format("#", time_col, "Input (new)", "Output",
-                         "CacheRd", "CacheWr", "Total", "Cost $")
+        args.append("Mode")
+    if show_content:
+        args.append("Content")
+    hdr = fmt.format(*args)
     return hdr, "-" * len(hdr), "=" * len(hdr)
 
 
@@ -976,6 +1115,63 @@ def _has_1h_cache(report: dict) -> bool:
             if t.get("cache_write_1h_tokens", 0) > 0:
                 return True
     return False
+
+
+def _has_thinking(report: dict) -> bool:
+    """Return True if any turn carried at least one thinking block."""
+    for s in report["sessions"]:
+        for t in s["turns"]:
+            if (t.get("content_blocks") or {}).get("thinking", 0) > 0:
+                return True
+    return False
+
+
+def _has_tool_use(report: dict) -> bool:
+    """Return True if any turn carried at least one tool_use block."""
+    for s in report["sessions"]:
+        for t in s["turns"]:
+            if (t.get("content_blocks") or {}).get("tool_use", 0) > 0:
+                return True
+    return False
+
+
+def _has_content_blocks(report: dict) -> bool:
+    """Return True if any turn carried any content block of any type.
+
+    Drives conditional rendering of the Content column so legacy reports
+    (or empty fixtures) stay visually unchanged.
+    """
+    for s in report["sessions"]:
+        for t in s["turns"]:
+            cb = t.get("content_blocks") or {}
+            if any(cb.get(k, 0) > 0 for k in cb):
+                return True
+    return False
+
+
+def _fmt_content_cell(cb: dict) -> str:
+    """Format the per-turn Content cell. Zeros are omitted.
+
+    Example: ``{thinking: 3, tool_use: 2, text: 1}`` → ``"T3 u2 x1"``.
+    Returns ``"-"`` when every count is zero so empty rows stay visible.
+    """
+    if not cb:
+        return "-"
+    parts: list[str] = []
+    for key, letter in _CONTENT_LETTERS:
+        n = cb.get(key, 0)
+        if n:
+            parts.append(f"{letter}{n}")
+    return " ".join(parts) if parts else "-"
+
+
+def _fmt_content_title(cb: dict) -> str:
+    """Human-readable tooltip text for the per-turn Content cell."""
+    if not cb:
+        return ""
+    parts = [f"{cb.get(key, 0)} {key}"
+             for key, _ in _CONTENT_LETTERS if cb.get(key, 0) > 0]
+    return ", ".join(parts)
 
 
 def _fmt_ts(ts: str, offset_hours: float = 0.0) -> str:
@@ -1020,8 +1216,9 @@ def _fmt_cwr_subtotal(s: dict) -> str:
     return f"{n:>9,}"
 
 
-def _row_text(t: dict, show_mode: bool = False) -> str:
-    base = COL_M if show_mode else COL
+def _row_text(t: dict, show_mode: bool = False,
+              show_content: bool = False) -> str:
+    fmt = _text_format(show_mode, show_content)
     args = [
         t["index"], t["timestamp_fmt"],
         f"{t['input_tokens']:>7,}", f"{t['output_tokens']:>7,}",
@@ -1032,11 +1229,14 @@ def _row_text(t: dict, show_mode: bool = False) -> str:
     if show_mode:
         spd = t.get("speed", "")
         args.append("fast" if spd == "fast" else "std")
-    return base.format(*args)
+    if show_content:
+        args.append(_fmt_content_cell(t.get("content_blocks") or {}))
+    return fmt.format(*args)
 
 
-def _subtotal_text(label: str, s: dict, show_mode: bool = False) -> str:
-    base = COL_M if show_mode else COL
+def _subtotal_text(label: str, s: dict, show_mode: bool = False,
+                   show_content: bool = False) -> str:
+    fmt = _text_format(show_mode, show_content)
     args = [
         label, "",
         f"{s['input']:>7,}", f"{s['output']:>7,}",
@@ -1046,10 +1246,13 @@ def _subtotal_text(label: str, s: dict, show_mode: bool = False) -> str:
     ]
     if show_mode:
         args.append("")
-    return base.format(*args)
+    if show_content:
+        args.append("")
+    return fmt.format(*args)
 
 
-def _text_legend(tz_label: str, show_mode: bool, show_ttl: bool) -> str:
+def _text_legend(tz_label: str, show_mode: bool, show_ttl: bool,
+                 show_content: bool = False) -> str:
     """Build the column legend emitted above the timeline table."""
     rows = [
         ("#",       "deduplicated turn index"),
@@ -1070,6 +1273,12 @@ def _text_legend(tz_label: str, show_mode: bool, show_ttl: bool) -> str:
         ("Total",   "sum of the four billable token buckets"),
         ("Cost $",  "estimated USD for this turn"),
     ])
+    if show_content:
+        rows.append((
+            "Content",
+            "content blocks per turn: T thinking, u tool_use, x text, "
+            "r tool_result, i image (zeros omitted)",
+        ))
     w = max(len(k) for k, _ in rows)
     lines = ["Columns:"] + [f"  {k:<{w}}  {v}" for k, v in rows]
     return "\n".join(lines)
@@ -1101,6 +1310,22 @@ def _footer_text(totals: dict, models: dict[str, int],
         lines.append(
             f"Cache TTL mix (1h share of writes) : {pct_1h:.1f}%  "
             f"[* in CacheWr column = includes 1h-tier cache write]"
+        )
+    if totals.get("thinking_turn_count", 0) > 0:
+        lines.append(
+            f"Extended thinking turns            : "
+            f"{totals['thinking_turn_count']} of {totals.get('turns', 0)} "
+            f"({totals.get('thinking_turn_pct', 0.0):.1f}%, "
+            f"{(totals.get('content_blocks') or {}).get('thinking', 0)} blocks)"
+        )
+    if totals.get("tool_call_total", 0) > 0:
+        top3 = totals.get("tool_names_top3") or []
+        top3_str = ", ".join(top3) if top3 else "none"
+        lines.append(
+            f"Tool calls                         : "
+            f"{totals['tool_call_total']} total, "
+            f"{totals.get('tool_call_avg_per_turn', 0.0):.1f}/turn  "
+            f"(top: {top3_str})"
         )
     if models:
         lines.append("")
@@ -1176,11 +1401,14 @@ def render_text(report: dict) -> str:
 
     m = _has_fast(report)
     has_1h = _has_1h_cache(report)
+    has_content = _has_content_blocks(report)
     tz_offset = report.get("tz_offset_hours", 0.0)
     tz_label = report.get("tz_label", "UTC")
-    hdr, sep, wide = _text_table_headers(tz_offset, show_mode=m)
+    hdr, sep, wide = _text_table_headers(tz_offset, show_mode=m,
+                                          show_content=has_content)
 
-    p(_text_legend(tz_label, show_mode=m, show_ttl=has_1h))
+    p(_text_legend(tz_label, show_mode=m, show_ttl=has_1h,
+                    show_content=has_content))
     p()
 
     if report["mode"] == "project":
@@ -1193,23 +1421,23 @@ def render_text(report: dict) -> str:
             p(wide)
             p(hdr)
             for t in s["turns"]:
-                p(_row_text(t, m))
+                p(_row_text(t, m, has_content))
             p(sep)
-            p(_subtotal_text(f"S{i:02}", s["subtotal"], m))
+            p(_subtotal_text(f"S{i:02}", s["subtotal"], m, has_content))
             p()
         p(wide)
         p(f"  PROJECT TOTAL — {len(sessions)} session{'s' if len(sessions) != 1 else ''}, {report['totals']['turns']} turns")
         p(wide)
         p(hdr)
         p(sep)
-        p(_subtotal_text("TOT", report["totals"], m))
+        p(_subtotal_text("TOT", report["totals"], m, has_content))
     else:
         s = sessions[0]
         p(hdr)
         for t in s["turns"]:
-            p(_row_text(t, m))
+            p(_row_text(t, m, has_content))
         p(sep)
-        p(_subtotal_text("TOT", s["subtotal"], m))
+        p(_subtotal_text("TOT", s["subtotal"], m, has_content))
 
     p(_footer_text(report["totals"], report["models"], report.get("time_of_day"),
                     tz_label=report.get("tz_label", "UTC"),
@@ -1271,9 +1499,12 @@ def render_csv(report: dict) -> str:
     w.writerow(["session_id", "turn", "timestamp", "model", "speed",
                 "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
                 "cache_write_5m_tokens", "cache_write_1h_tokens", "cache_write_ttl",
-                "total_tokens", "cost_usd", "no_cache_cost_usd"])
+                "total_tokens", "cost_usd", "no_cache_cost_usd",
+                "thinking_blocks", "tool_use_blocks", "text_blocks",
+                "tool_result_blocks", "image_blocks"])
     for s in report["sessions"]:
         for t in s["turns"]:
+            cb = t.get("content_blocks") or {}
             w.writerow([
                 s["session_id"], t["index"], t["timestamp"], t["model"],
                 t.get("speed", ""),
@@ -1284,6 +1515,9 @@ def render_csv(report: dict) -> str:
                 t.get("cache_write_ttl", ""),
                 t["total_tokens"],
                 f"{t['cost_usd']:.6f}", f"{t['no_cache_cost_usd']:.6f}",
+                cb.get("thinking", 0), cb.get("tool_use", 0),
+                cb.get("text", 0), cb.get("tool_result", 0),
+                cb.get("image", 0),
             ])
 
     # Time-of-day summary section
@@ -1395,6 +1629,22 @@ def render_md(report: dict) -> str:
         pct_1h = 100 * totals["cache_write_1h"] / max(1, totals["cache_write"])
         p(f"| Cache TTL mix (1h share of writes) | {pct_1h:.1f}% |")
         p(f"| Extra cost paid for 1h cache tier | ${totals.get('extra_1h_cost', 0.0):.4f} |")
+    if totals.get("thinking_turn_count", 0) > 0:
+        cb = totals.get("content_blocks") or {}
+        p(
+            f"| Extended thinking turns | "
+            f"{totals['thinking_turn_count']} of {totals['turns']} "
+            f"({totals.get('thinking_turn_pct', 0.0):.1f}%, "
+            f"{cb.get('thinking', 0)} blocks) |"
+        )
+    if totals.get("tool_call_total", 0) > 0:
+        top3 = totals.get("tool_names_top3") or []
+        top3_str = ", ".join(top3) if top3 else "none"
+        p(
+            f"| Tool calls | {totals['tool_call_total']} total, "
+            f"{totals.get('tool_call_avg_per_turn', 0.0):.1f}/turn "
+            f"(top: {top3_str}) |"
+        )
     p()
 
     # Time-of-day section
@@ -1469,6 +1719,7 @@ def render_md(report: dict) -> str:
         p()
 
     has_1h_cache = _has_1h_cache(report)
+    has_content  = _has_content_blocks(report)
     p("## Column legend")
     p()
     p("- **#** — deduplicated turn index")
@@ -1482,6 +1733,9 @@ def render_md(report: dict) -> str:
         p("- **CacheWr** — tokens written to cache (one-time)")
     p("- **Total** — sum of the four billable token buckets")
     p("- **Cost $** — estimated USD for this turn")
+    if has_content:
+        p("- **Content** — per-turn content blocks: `T` thinking, `u` tool_use, "
+          "`x` text, `r` tool_result, `i` image (zero counts omitted)")
     p()
 
     for i, s in enumerate(report["sessions"], 1):
@@ -1492,20 +1746,30 @@ def render_md(report: dict) -> str:
             p(f"{s['first_ts']} → {s['last_ts']} &nbsp;·&nbsp; {len(s['turns'])} turns &nbsp;·&nbsp; **${st['cost']:.4f}**")
             p()
 
-        p(f"| # | Time ({tz_label}) | Input (new) | Output | CacheRd | CacheWr | Total | Cost $ |")
-        p("|--:|-----------|------------:|------:|--------:|--------:|------:|-------:|")
+        if has_content:
+            p(f"| # | Time ({tz_label}) | Input (new) | Output | CacheRd | CacheWr | Total | Cost $ | Content |")
+            p("|--:|-----------|------------:|------:|--------:|--------:|------:|-------:|:--------|")
+        else:
+            p(f"| # | Time ({tz_label}) | Input (new) | Output | CacheRd | CacheWr | Total | Cost $ |")
+            p("|--:|-----------|------------:|------:|--------:|--------:|------:|-------:|")
         for t in s["turns"]:
             ttl = t.get("cache_write_ttl", "")
             cwr_cell = f"{t['cache_write_tokens']:,}" + ("*" if ttl in ("1h", "mix") else "")
-            p(f"| {t['index']} | {t['timestamp_fmt']} "
-              f"| {t['input_tokens']:,} | {t['output_tokens']:,} "
-              f"| {t['cache_read_tokens']:,} | {cwr_cell} "
-              f"| {t['total_tokens']:,} | ${t['cost_usd']:.4f} |")
+            row = (f"| {t['index']} | {t['timestamp_fmt']} "
+                   f"| {t['input_tokens']:,} | {t['output_tokens']:,} "
+                   f"| {t['cache_read_tokens']:,} | {cwr_cell} "
+                   f"| {t['total_tokens']:,} | ${t['cost_usd']:.4f} |")
+            if has_content:
+                row += f" {_fmt_content_cell(t.get('content_blocks') or {})} |"
+            p(row)
         st = s["subtotal"]
         st_cwr_cell = f"{st['cache_write']:,}" + ("*" if st.get("cache_write_1h", 0) > 0 else "")
-        p(f"| **TOT** | | **{st['input']:,}** | **{st['output']:,}** "
-          f"| **{st['cache_read']:,}** | **{st_cwr_cell}** "
-          f"| **{st['total']:,}** | **${st['cost']:.4f}** |")
+        trow = (f"| **TOT** | | **{st['input']:,}** | **{st['output']:,}** "
+                f"| **{st['cache_read']:,}** | **{st_cwr_cell}** "
+                f"| **{st['total']:,}** | **${st['cost']:.4f}** |")
+        if has_content:
+            trow += " |"
+        p(trow)
         if st.get("cache_write_1h", 0) > 0:
             p()
             p(f"_`*` = cache write includes the 1-hour TTL tier "
@@ -2812,11 +3076,13 @@ def render_html(report: dict, variant: str = "single",
                           + hod_html + punchcard_html + heatmap_html)
 
     # ---- Table rows --------------------------------------------------------
-    show_mode = _has_fast(report)
-    show_ttl  = _has_1h_cache(report)
+    show_mode    = _has_fast(report)
+    show_ttl     = _has_1h_cache(report)
+    show_content = _has_content_blocks(report)
 
-    # Total columns = #, Time, Model, [Mode], Input, Output, CacheRd, CacheWr, Total, Cost
-    _full_cols = 10 + (1 if show_mode else 0)
+    # Total columns = #, Time, Model, [Mode], Input, Output, CacheRd, CacheWr,
+    #                 [Content], Total, Cost
+    _full_cols = 10 + (1 if show_mode else 0) + (1 if show_content else 0)
     # Label cell in subtotal rows spans the non-numeric prefix: #, Time, Model, [Mode]
     _label_span = 4 if show_mode else 3
 
@@ -2830,6 +3096,14 @@ def render_html(report: dict, variant: str = "single",
             badge = f'<span class="badge-ttl {cls}" title="{title}">{ttl}</span>'
             return f'<td class="num" title="{title}">{inner}{badge}</td>'
         return f'<td class="num">{inner}</td>'
+
+    def _content_cell(cb: dict) -> str:
+        label = _fmt_content_cell(cb)
+        title = _fmt_content_title(cb)
+        if label == "-":
+            return '<td class="content-blocks muted">&ndash;</td>'
+        return (f'<td class="content-blocks" title="{title}">'
+                f'<span>{label}</span></td>')
 
     def turn_row(t: dict, session_id: str) -> str:
         bar_w = min(100, int(t["cost_usd"] * 2000))
@@ -2845,6 +3119,8 @@ def render_html(report: dict, variant: str = "single",
             t.get("cache_write_1h_tokens", 0),
             t.get("cache_write_ttl", ""),
         )
+        content_td = (_content_cell(t.get("content_blocks") or {})
+                      if show_content else "")
         return (
             f'<tr data-session="{session_id[:8]}">'
             f'<td class="num">{t["index"]}</td>'
@@ -2855,6 +3131,7 @@ def render_html(report: dict, variant: str = "single",
             f'<td class="num">{t["output_tokens"]:,}</td>'
             f'<td class="num">{t["cache_read_tokens"]:,}</td>'
             f'{cwr_td}'
+            f'{content_td}'
             f'<td class="num">{t["total_tokens"]:,}</td>'
             f'<td class="cost"><span class="bar" style="width:{bar_w}px"></span>'
             f'${t["cost_usd"]:.4f}</td>'
@@ -2885,6 +3162,8 @@ def render_html(report: dict, variant: str = "single",
             tokens_5m = st.get("cache_write_5m", 0)
             sub_ttl = ""
         cwr_td = _cwr_cell(st["cache_write"], tokens_5m, tokens_1h, sub_ttl, bold=True)
+        content_td = ('<td class="content-blocks muted">&nbsp;</td>'
+                      if show_content else "")
         return (
             f'<tr class="subtotal">'
             f'<td colspan="{_label_span}"><strong>{label}</strong></td>'
@@ -2892,6 +3171,7 @@ def render_html(report: dict, variant: str = "single",
             f'<td class="num"><strong>{st["output"]:,}</strong></td>'
             f'<td class="num"><strong>{st["cache_read"]:,}</strong></td>'
             f'{cwr_td}'
+            f'{content_td}'
             f'<td class="num"><strong>{st["total"]:,}</strong></td>'
             f'<td class="cost"><strong>${st["cost"]:.4f}</strong></td>'
             f'</tr>'
@@ -2960,11 +3240,20 @@ def render_html(report: dict, variant: str = "single",
             )
         else:
             legend_parts.append('<b>CacheWr</b> <code>cache_creation_input_tokens</code> · ')
+        if show_content:
+            legend_parts.append(
+                '<b>Content</b> per-turn content blocks: '
+                '<code>T</code> thinking, <code>u</code> tool_use, '
+                '<code>x</code> text, <code>r</code> tool_result, '
+                '<code>i</code> image (zero counts omitted) · '
+            )
         legend_parts.extend([
             '<b>Total</b> sum of the four billable token buckets · ',
             '<b>Cost $</b> estimated USD for this turn.',
         ])
         legend_html = '<p class="legend-block">' + ''.join(legend_parts) + '</p>'
+        content_th = ('<th class="content-blocks">Content</th>'
+                      if show_content else "")
         table_section_html = (
             '<h2>Timeline</h2>\n'
             + legend_html + '\n'
@@ -2973,6 +3262,7 @@ def render_html(report: dict, variant: str = "single",
             f'  {"<th>Mode</th>" if show_mode else ""}\n'
             '  <th class="num">Input (new)</th><th class="num">Output</th>\n'
             '  <th class="num">CacheRd</th><th class="num">CacheWr</th>\n'
+            f'  {content_th}\n'
             '  <th class="num">Total</th><th class="num">Cost $</th>\n'
             f'</tr></thead>\n<tbody>\n{"".join(table_rows)}\n</tbody>\n</table>\n'
         )
@@ -3000,6 +3290,32 @@ def render_html(report: dict, variant: str = "single",
                 f'<div class="val">{pct_1h:.0f}% 1h · ${extra:.4f}</div>'
                 f'<div class="lbl">Cache TTL mix (extra paid for 1h)</div></div>'
             )
+        thinking_card = ""
+        if totals.get("thinking_turn_count", 0) > 0:
+            tn = totals["thinking_turn_count"]
+            tp = totals.get("thinking_turn_pct", 0.0)
+            blocks = (totals.get("content_blocks") or {}).get("thinking", 0)
+            total_turns = totals.get("turns", 0)
+            thinking_card = (
+                f'\n  <div class="card" '
+                f'title="Claude Code stores thinking blocks signature-only — '
+                f'the count is real but per-block token counts aren\'t recoverable '
+                f'from the transcript (thinking tokens are rolled into output_tokens).">'
+                f'<div class="val">{tp:.0f}% · {blocks} blocks</div>'
+                f'<div class="lbl">Extended thinking engagement '
+                f'({tn} of {total_turns} turns)</div></div>'
+            )
+        tool_calls_card = ""
+        if totals.get("tool_call_total", 0) > 0:
+            tc = totals["tool_call_total"]
+            avg = totals.get("tool_call_avg_per_turn", 0.0)
+            top3 = totals.get("tool_names_top3") or []
+            top3_str = ", ".join(top3) if top3 else "none"
+            tool_calls_card = (
+                f'\n  <div class="card">'
+                f'<div class="val">{tc} · {avg:.1f}/turn</div>'
+                f'<div class="lbl">Tool calls &middot; top: {top3_str}</div></div>'
+            )
         summary_cards_html = f'''\
 <div class="cards">
   <div class="card amber"><div class="val">${totals['cost']:.4f}</div><div class="lbl">Total cost (USD)</div></div>
@@ -3009,7 +3325,7 @@ def render_html(report: dict, variant: str = "single",
   <div class="card"><div class="val">{totals['input']:,}</div><div class="lbl">Input tokens (new)</div></div>
   <div class="card"><div class="val">{totals['output']:,}</div><div class="lbl">Output tokens</div></div>
   <div class="card"><div class="val">{totals['cache_read']:,}</div><div class="lbl">Cache read tokens</div></div>
-  <div class="card"><div class="val">{totals['cache_write']:,}</div><div class="lbl">Cache write tokens</div></div>{ttl_mix_card}
+  <div class="card"><div class="val">{totals['cache_write']:,}</div><div class="lbl">Cache write tokens</div></div>{ttl_mix_card}{thinking_card}{tool_calls_card}
 </div>'''
 
     toggle_script_html = ""
@@ -3091,6 +3407,12 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                         border: 1px solid #d2992266; }}
   .badge-ttl.ttl-mix {{ background: #8957e533; color: #bc8cff;
                         border: 1px solid #8957e566; }}
+  td.content-blocks, th.content-blocks {{ font-variant-numeric: tabular-nums;
+                        font-family: "SF Mono", Menlo, Consolas, monospace;
+                        font-size: 11px; white-space: nowrap;
+                        color: #8b949e; cursor: help; }}
+  td.content-blocks span {{ color: #a5d6ff; }}
+  td.content-blocks.muted {{ color: #484f58; cursor: default; }}
   .legend-block {{ color: #8b949e; font-size: 11px; margin: -4px 0 12px;
                    padding: 8px 12px; background: #161b22;
                    border: 1px solid #30363d; border-radius: 6px;

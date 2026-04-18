@@ -330,6 +330,227 @@ def test_html_render_includes_legend_and_badge():
     assert "Cache TTL mix" in html
 
 
+# --- Content-block distribution (Proposal B) --------------------------------
+
+def test_count_content_blocks_mixed_list():
+    content = [
+        {"type": "thinking", "thinking": ""},
+        {"type": "tool_use", "id": "t", "name": "Bash", "input": {}},
+        {"type": "tool_use", "id": "u", "name": "Read", "input": {}},
+        {"type": "text", "text": "hi"},
+    ]
+    counts, names = sm._count_content_blocks(content)
+    assert counts["thinking"] == 1
+    assert counts["tool_use"] == 2
+    assert counts["text"] == 1
+    assert counts["tool_result"] == 0
+    assert counts["image"] == 0
+    assert names == ["Bash", "Read"]
+
+
+def test_count_content_blocks_non_list_returns_zeros():
+    # Plain string content (older user prompts) has no structured blocks.
+    counts, names = sm._count_content_blocks("hello")
+    assert sum(counts.values()) == 0
+    assert names == []
+    counts, names = sm._count_content_blocks(None)
+    assert sum(counts.values()) == 0
+    assert names == []
+
+
+def test_fixture_content_block_counts_per_turn():
+    r = _build_fixture_report()
+    turns = r["sessions"][0]["turns"]
+    # msg_A: thinking + tool_use Bash + text (u2 text → no tool_result/image)
+    assert turns[0]["content_blocks"] == {
+        "thinking": 1, "tool_use": 1, "text": 1, "tool_result": 0, "image": 0,
+    }
+    # msg_B: text only; preceded by u3 (tool_result)
+    assert turns[1]["content_blocks"] == {
+        "thinking": 0, "tool_use": 0, "text": 1, "tool_result": 1, "image": 0,
+    }
+    # msg_C: text only; preceded by u5 (sidechain text) — no attributable blocks
+    assert turns[2]["content_blocks"] == {
+        "thinking": 0, "tool_use": 0, "text": 1, "tool_result": 0, "image": 0,
+    }
+    # msg_D: tool_use WebFetch + text; preceded by u7 (tool_result)
+    assert turns[3]["content_blocks"] == {
+        "thinking": 0, "tool_use": 1, "text": 1, "tool_result": 1, "image": 0,
+    }
+    # msg_E: thinking + text (pure 1h turn, preceded by u8 text)
+    assert turns[4]["content_blocks"] == {
+        "thinking": 1, "tool_use": 0, "text": 1, "tool_result": 0, "image": 0,
+    }
+    # msg_F: 2 tool_use + text; preceded by u9 (text + image)
+    assert turns[5]["content_blocks"] == {
+        "thinking": 0, "tool_use": 2, "text": 1, "tool_result": 0, "image": 1,
+    }
+
+
+def test_fixture_tool_names_top3_ranked_by_count_then_name():
+    r = _build_fixture_report()
+    totals = r["totals"]
+    # Across the fixture: Bash=2 (msg_A + msg_F), Read=1, WebFetch=1.
+    # Ties by name ascending → Read < WebFetch.
+    assert totals["tool_names_top3"] == ["Bash", "Read", "WebFetch"]
+
+
+def test_fixture_thinking_turn_pct():
+    r = _build_fixture_report()
+    t = r["totals"]
+    # 2 turns carry thinking out of 6 → 33.33%
+    assert t["thinking_turn_count"] == 2
+    assert t["thinking_turn_pct"] == pytest.approx(200 / 6, abs=1e-6)
+
+
+def test_fixture_totals_content_blocks_aggregate():
+    r = _build_fixture_report()
+    cb = r["totals"]["content_blocks"]
+    assert cb == {"thinking": 2, "tool_use": 4, "text": 6,
+                  "tool_result": 2, "image": 1}
+    assert r["totals"]["tool_call_total"] == 4
+    assert r["totals"]["tool_call_avg_per_turn"] == pytest.approx(4 / 6, abs=1e-6)
+
+
+def test_has_content_blocks_helpers_detect_fixture():
+    r = _build_fixture_report()
+    assert sm._has_content_blocks(r) is True
+    assert sm._has_thinking(r) is True
+    assert sm._has_tool_use(r) is True
+
+
+def test_csv_has_content_block_columns():
+    r = _build_fixture_report()
+    csv_out = sm.render_csv(r)
+    header = csv_out.splitlines()[0]
+    for col in ("thinking_blocks", "tool_use_blocks", "text_blocks",
+                 "tool_result_blocks", "image_blocks"):
+        assert col in header
+
+
+def test_json_has_content_blocks_nested():
+    r = _build_fixture_report()
+    import json as _json
+    data = _json.loads(sm.render_json(r))
+    # Per-turn nested `content_blocks`
+    t = data["sessions"][0]["turns"][5]  # msg_F
+    assert t["content_blocks"]["tool_use"] == 2
+    assert t["content_blocks"]["image"] == 1
+    assert t["tool_use_names"] == ["Read", "Bash"]
+    # Totals nested `content_blocks` + scalar aggregates
+    assert data["totals"]["content_blocks"]["tool_use"] == 4
+    assert data["totals"]["thinking_turn_count"] == 2
+    assert data["totals"]["tool_names_top3"] == ["Bash", "Read", "WebFetch"]
+
+
+def test_text_render_includes_content_column_and_legend():
+    r = _build_fixture_report()
+    text = sm.render_text(r)
+    # Legend row for Content present (only emitted when any blocks exist)
+    assert "Content" in text
+    # Per-turn content cell uses letter encoding
+    assert "T1 u1 x1" in text  # msg_A pattern
+    # Tool calls footer summary visible
+    assert "Tool calls" in text
+    assert "Extended thinking turns" in text
+
+
+def test_md_render_includes_content_column_and_legend():
+    r = _build_fixture_report()
+    md = sm.render_md(r)
+    assert "**Content**" in md
+    assert "Extended thinking turns" in md
+    assert "Tool calls" in md
+
+
+def test_html_render_includes_content_column_and_cards():
+    r = _build_fixture_report()
+    html = sm.render_html(r, variant="single")
+    # Column header + a per-turn content cell rendered with tooltip
+    assert 'class="content-blocks"' in html
+    assert "Extended thinking engagement" in html
+    assert "Tool calls" in html
+    # Top-3 tool list surfaces in the Tool calls card
+    assert "Bash" in html
+
+
+def test_extract_turns_merges_streaming_content_blocks():
+    """Claude Code emits a single assistant message across N JSONL entries
+    (one per content block) that share the same msg_id and usage. Dedup
+    must UNION the content arrays, not keep-last-only, or Proposal B
+    counters silently drop thinking + earlier tool_use + text blocks.
+    """
+    entries = [
+        {"type": "user", "uuid": "u_pre", "timestamp": "2026-04-15T22:30:00Z",
+         "sessionId": "s", "message": {"role": "user", "content": "hi"}},
+        # Streaming occurrence 1: thinking only
+        {"type": "assistant", "uuid": "a1",
+         "timestamp": "2026-04-15T22:31:05.100Z", "sessionId": "s",
+         "message": {"id": "msg_stream", "model": "claude-opus-4-7",
+                      "role": "assistant",
+                      "content": [{"type": "thinking", "thinking": "",
+                                    "signature": "sig1"}],
+                      "usage": {"input_tokens": 10, "output_tokens": 50,
+                                "cache_read_input_tokens": 0,
+                                "cache_creation_input_tokens": 0}}},
+        # Streaming occurrence 2: tool_use only
+        {"type": "assistant", "uuid": "a2",
+         "timestamp": "2026-04-15T22:31:05.500Z", "sessionId": "s",
+         "message": {"id": "msg_stream", "model": "claude-opus-4-7",
+                      "role": "assistant",
+                      "content": [{"type": "tool_use", "id": "t_x",
+                                    "name": "Bash", "input": {}}],
+                      "usage": {"input_tokens": 10, "output_tokens": 50,
+                                "cache_read_input_tokens": 0,
+                                "cache_creation_input_tokens": 0}}},
+        # Streaming occurrence 3: second tool_use only
+        {"type": "assistant", "uuid": "a3",
+         "timestamp": "2026-04-15T22:31:05.900Z", "sessionId": "s",
+         "message": {"id": "msg_stream", "model": "claude-opus-4-7",
+                      "role": "assistant",
+                      "content": [{"type": "tool_use", "id": "t_y",
+                                    "name": "Read", "input": {}}],
+                      "usage": {"input_tokens": 10, "output_tokens": 50,
+                                "cache_read_input_tokens": 0,
+                                "cache_creation_input_tokens": 0}}},
+    ]
+    turns = sm._extract_turns(entries)
+    assert len(turns) == 1
+    content = turns[0]["message"]["content"]
+    types = [b["type"] for b in content]
+    # Union of all three streaming entries: 1 thinking + 2 tool_use.
+    assert types.count("thinking") == 1
+    assert types.count("tool_use") == 2
+    # Usage (cost math) correctly taken from last occurrence — identical across all.
+    assert turns[0]["message"]["usage"]["output_tokens"] == 50
+
+
+def test_no_content_blocks_means_column_omitted_in_text():
+    """Synthesize a minimal fixture with no content blocks and verify the
+    text report preserves its pre-v1.3.0 shape (no Content column/legend row).
+    """
+    entries = [
+        {"type": "user", "uuid": "uU", "timestamp": "2026-04-15T22:31:00.000Z",
+         "sessionId": "synth",
+         "message": {"role": "user", "content": "hello"}},
+        {"type": "assistant", "uuid": "aA",
+         "timestamp": "2026-04-15T22:31:05.000Z", "sessionId": "synth",
+         "message": {"id": "msg_S1", "model": "claude-sonnet-4-7",
+                      "role": "assistant",
+                      "usage": {"input_tokens": 10, "output_tokens": 20,
+                                "cache_read_input_tokens": 0,
+                                "cache_creation_input_tokens": 0}}},
+    ]
+    turns = sm._extract_turns(entries)
+    user_ts = sm._extract_user_timestamps(entries)
+    r = sm._build_report("session", "synth", [("synth", turns, user_ts)])
+    assert sm._has_content_blocks(r) is False
+    text = sm.render_text(r)
+    # Column legend lists the standard columns only — no `Content` row.
+    legend_block, _rest = text.split("\n\n", 1)
+    assert "Content" not in legend_block
+
+
 # --- Input validation --------------------------------------------------------
 
 def test_validate_session_id_accepts_uuid_and_hex():

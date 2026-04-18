@@ -368,6 +368,11 @@ templates.
 
 ## Proposal B — Content-block distribution
 
+> **Status: Implemented in v1.3.0.** The prose below is preserved as
+> historical design context. See `SKILL.md` for the current column/card
+> specification and `scripts/session-metrics.py` for the
+> implementation.
+
 **Fields.** Per-turn counts of `message.content[].type` values:
 `thinking`, `tool_use`, `text` on assistant entries, and
 `tool_result`, `image` on the preceding user entry.

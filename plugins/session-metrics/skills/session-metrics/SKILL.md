@@ -77,15 +77,17 @@ project root, named `session_<id8>_<YYYYMMDD_HHMMSS>.<ext>` (single) or
 
 ## Output columns
 
-| Column   | Meaning                                      |
-|----------|----------------------------------------------|
-| `#`      | Deduplicated turn index                      |
-| `Time`   | Timestamp of the turn in the user's local timezone (auto-detected from system; override with `--tz` or `--utc-offset`). The header shows the active tz label, e.g. `Time (UTC+10)` or `Time (Australia/Brisbane)`. Raw `timestamp` fields in JSON/CSV exports remain UTC ISO-8601 (`...Z`) for machine-readability. |
-| `Input`  | Net new input tokens (uncached portion only — cache reads/writes are shown separately) |
-| `Output` | Output tokens generated (includes thinking + tool_use block tokens) |
-| `CacheRd`| Tokens served from prompt cache (cheap)      |
-| `CacheWr`| Tokens written to prompt cache (one-time). **v1.2.0+**: a `1h` / `mix` badge (HTML) or `*` suffix (text / Markdown) marks turns that used the 1-hour TTL tier; hover or scroll to the footer for the 5m / 1h split. CSV/JSON expose `cache_write_5m_tokens` and `cache_write_1h_tokens` as dedicated columns alongside the existing `cache_write_tokens` sum. |
-| `Cost $` | Estimated USD for this turn                  |
+| Column    | Meaning                                      |
+|-----------|----------------------------------------------|
+| `#`       | Deduplicated turn index                      |
+| `Time`    | Timestamp of the turn in the user's local timezone (auto-detected from system; override with `--tz` or `--utc-offset`). The header shows the active tz label, e.g. `Time (UTC+10)` or `Time (Australia/Brisbane)`. Raw `timestamp` fields in JSON/CSV exports remain UTC ISO-8601 (`...Z`) for machine-readability. |
+| `Input`   | Net new input tokens (uncached portion only — cache reads/writes are shown separately) |
+| `Output`  | Output tokens generated (includes thinking + tool_use block tokens) |
+| `CacheRd` | Tokens served from prompt cache (cheap)      |
+| `CacheWr` | Tokens written to prompt cache (one-time). **v1.2.0+**: a `1h` / `mix` badge (HTML) or `*` suffix (text / Markdown) marks turns that used the 1-hour TTL tier; hover or scroll to the footer for the 5m / 1h split. CSV/JSON expose `cache_write_5m_tokens` and `cache_write_1h_tokens` as dedicated columns alongside the existing `cache_write_tokens` sum. |
+| `Content` | **v1.3.0+**: per-turn content-block distribution. Letter encoding `T` thinking, `u` tool_use, `x` text, `r` tool_result, `i` image (zero counts omitted). `tool_result` and `image` counts come from the user entry that immediately preceded the turn. Column renders only when at least one turn in the report carries any content block. HTML cells include a tooltip with expanded descriptions; CSV/JSON expose `thinking_blocks`, `tool_use_blocks`, `text_blocks`, `tool_result_blocks`, `image_blocks` as dedicated per-turn columns/keys. |
+| `Total`   | Sum of the four billable token buckets       |
+| `Cost $`  | Estimated USD for this turn                  |
 
 A short **column legend** renders near the Timeline header in every
 human-facing format (text, Markdown, HTML). CSV and JSON are
@@ -95,7 +97,12 @@ Footer shows session totals + **cache savings** vs a hypothetical
 no-cache run. When any turn used the 1-hour cache TTL tier, an extra
 `Extra cost paid for 1h cache tier` line breaks out the premium paid
 for the longer reuse window, and a **Cache TTL mix** dashboard card
-appears on the HTML report.
+appears on the HTML report. **v1.3.0+** adds two more conditional
+dashboard cards: **Extended thinking engagement** (shown when any turn
+carried a `thinking` block — counts turns and blocks but cannot
+recover per-block tokens, which are rolled into `output_tokens` by
+Anthropic) and **Tool calls** (shown when any turn used
+`tool_use` blocks — total, average per turn, and the top-3 tool names).
 
 ## Reference files
 
