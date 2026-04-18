@@ -8,6 +8,12 @@ A personal Claude Code plugin marketplace. Each plugin is an independent, standa
 
 Add this marketplace once, then install any plugin from it:
 
+> **Run `/plugin` commands inside the Claude Code terminal CLI**
+> (`claude` in your shell). They are not recognised in the desktop
+> app, claude.ai/code, or IDE extensions — you'll see *"/plugin isn't
+> a recognized command here"* if you try. Installed plugins then work
+> from every surface; only the install step requires the CLI.
+
 ```
 /plugin marketplace add centminmod/claude-plugins
 ```
