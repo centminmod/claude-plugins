@@ -6,7 +6,7 @@
     "name": "George Liu",
     "url": "https://github.com/centminmod"
   },
-  "homepage": "https://github.com/centminmod/claude-plugins/tree/main/plugins/session-metrics",
+  "homepage": "https://github.com/centminmod/claude-plugins/tree/master/plugins/session-metrics",
   "repository": "https://github.com/centminmod/claude-plugins",
   "license": "MIT",
   "keywords": [
