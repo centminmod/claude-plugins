@@ -82,12 +82,20 @@ project root, named `session_<id8>_<YYYYMMDD_HHMMSS>.<ext>` (single) or
 | `#`      | Deduplicated turn index                      |
 | `Time`   | Timestamp of the turn in the user's local timezone (auto-detected from system; override with `--tz` or `--utc-offset`). The header shows the active tz label, e.g. `Time (UTC+10)` or `Time (Australia/Brisbane)`. Raw `timestamp` fields in JSON/CSV exports remain UTC ISO-8601 (`...Z`) for machine-readability. |
 | `Input`  | Net new input tokens (uncached portion only — cache reads/writes are shown separately) |
-| `Output` | Output tokens generated                      |
+| `Output` | Output tokens generated (includes thinking + tool_use block tokens) |
 | `CacheRd`| Tokens served from prompt cache (cheap)      |
-| `CacheWr`| Tokens written to prompt cache (one-time)    |
+| `CacheWr`| Tokens written to prompt cache (one-time). **v1.2.0+**: a `1h` / `mix` badge (HTML) or `*` suffix (text / Markdown) marks turns that used the 1-hour TTL tier; hover or scroll to the footer for the 5m / 1h split. CSV/JSON expose `cache_write_5m_tokens` and `cache_write_1h_tokens` as dedicated columns alongside the existing `cache_write_tokens` sum. |
 | `Cost $` | Estimated USD for this turn                  |
 
-Footer shows session totals + **cache savings** vs a hypothetical no-cache run.
+A short **column legend** renders near the Timeline header in every
+human-facing format (text, Markdown, HTML). CSV and JSON are
+self-describing via their header row / key names — no inline legend.
+
+Footer shows session totals + **cache savings** vs a hypothetical
+no-cache run. When any turn used the 1-hour cache TTL tier, an extra
+`Extra cost paid for 1h cache tier` line breaks out the premium paid
+for the longer reuse window, and a **Cache TTL mix** dashboard card
+appears on the HTML report.
 
 ## Reference files
 

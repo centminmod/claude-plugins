@@ -48,36 +48,39 @@ _SCRIPT_VERSION = "1.0-rc.4"
 # See references/pricing.md for notes and source.
 # ---------------------------------------------------------------------------
 # Per-million-token rates (USD). Source: https://platform.claude.com/docs/en/about-claude/pricing
-# Snapshot: 2026-04-17. Cache-write column = 5-minute cache write (1.25x base input);
-# 1-hour cache writes cost 2x base input but are not currently tracked per-entry.
+# Snapshot: 2026-04-17. Two cache-write tiers: `cache_write` = 5-minute TTL
+# (1.25x base input), `cache_write_1h` = 1-hour TTL (2x base input). The
+# per-entry split is read from `usage.cache_creation.ephemeral_{5m,1h}_input_tokens`
+# when present; legacy transcripts without the nested object fall back to the
+# 5-minute rate via `_cost`.
 #
 # IMPORTANT: Opus 4.5 / 4.6 / 4.7 use the NEW cheaper tier ($5/$25) introduced
 # with the 4.5 generation. Opus 4 / 4.1 retain the OLD tier ($15/$75). Dict
 # order matters for prefix fallback — more-specific entries must appear first.
 _PRICING: dict[str, dict[str, float]] = {
     # --- Opus 4.5-generation (new tier: $5 input / $25 output) ---
-    "claude-opus-4-7":           {"input":  5.00, "output": 25.00, "cache_read": 0.50,  "cache_write":  6.25},
-    "claude-opus-4-6":           {"input":  5.00, "output": 25.00, "cache_read": 0.50,  "cache_write":  6.25},
-    "claude-opus-4-5":           {"input":  5.00, "output": 25.00, "cache_read": 0.50,  "cache_write":  6.25},
+    "claude-opus-4-7":           {"input":  5.00, "output": 25.00, "cache_read": 0.50,  "cache_write":  6.25, "cache_write_1h": 10.00},
+    "claude-opus-4-6":           {"input":  5.00, "output": 25.00, "cache_read": 0.50,  "cache_write":  6.25, "cache_write_1h": 10.00},
+    "claude-opus-4-5":           {"input":  5.00, "output": 25.00, "cache_read": 0.50,  "cache_write":  6.25, "cache_write_1h": 10.00},
     # --- Opus 4 / 4.1 (old tier, retained for historical sessions) ---
-    "claude-opus-4-1":           {"input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75},
-    "claude-opus-4":             {"input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75},
+    "claude-opus-4-1":           {"input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75, "cache_write_1h": 30.00},
+    "claude-opus-4":             {"input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75, "cache_write_1h": 30.00},
     # --- Sonnet 4.x + 3.7 (shared rates) ---
-    "claude-sonnet-4-7":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75},
-    "claude-sonnet-4-6":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75},
-    "claude-sonnet-4-5":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75},
-    "claude-sonnet-4":           {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75},
-    "claude-3-7-sonnet":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75},
-    "claude-3-5-sonnet":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75},
+    "claude-sonnet-4-7":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75, "cache_write_1h":  6.00},
+    "claude-sonnet-4-6":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75, "cache_write_1h":  6.00},
+    "claude-sonnet-4-5":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75, "cache_write_1h":  6.00},
+    "claude-sonnet-4":           {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75, "cache_write_1h":  6.00},
+    "claude-3-7-sonnet":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75, "cache_write_1h":  6.00},
+    "claude-3-5-sonnet":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75, "cache_write_1h":  6.00},
     # --- Haiku 4.5 (own tier: $1 input / $5 output) ---
-    "claude-haiku-4-5-20251001": {"input":  1.00, "output":  5.00, "cache_read": 0.10,  "cache_write":  1.25},
-    "claude-haiku-4-5":          {"input":  1.00, "output":  5.00, "cache_read": 0.10,  "cache_write":  1.25},
+    "claude-haiku-4-5-20251001": {"input":  1.00, "output":  5.00, "cache_read": 0.10,  "cache_write":  1.25, "cache_write_1h":  2.00},
+    "claude-haiku-4-5":          {"input":  1.00, "output":  5.00, "cache_read": 0.10,  "cache_write":  1.25, "cache_write_1h":  2.00},
     # --- Haiku 3.5 (older, cheaper input) ---
-    "claude-3-5-haiku":          {"input":  0.80, "output":  4.00, "cache_read": 0.08,  "cache_write":  1.00},
+    "claude-3-5-haiku":          {"input":  0.80, "output":  4.00, "cache_read": 0.08,  "cache_write":  1.00, "cache_write_1h":  1.60},
     # --- Opus 3 (deprecated; old-tier rates) ---
-    "claude-3-opus":             {"input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75},
+    "claude-3-opus":             {"input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75, "cache_write_1h": 30.00},
 }
-_DEFAULT_PRICING = {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75}
+_DEFAULT_PRICING = {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75, "cache_write_1h": 6.00}
 
 
 def _pricing_for(model: str) -> dict[str, float]:
@@ -89,13 +92,32 @@ def _pricing_for(model: str) -> dict[str, float]:
     return _DEFAULT_PRICING
 
 
+def _cache_write_split(u: dict) -> tuple[int, int]:
+    """Return ``(tokens_5m, tokens_1h)`` for the cache write on this turn.
+
+    Reads ``usage.cache_creation.ephemeral_{5m,1h}_input_tokens`` when the
+    nested object is present. Legacy transcripts without ``cache_creation``
+    fall back to treating the flat ``cache_creation_input_tokens`` total as
+    5-minute-tier tokens — preserving pre-v1.2.0 cost math for those files.
+    """
+    cc = u.get("cache_creation")
+    if isinstance(cc, dict):
+        return (
+            int(cc.get("ephemeral_5m_input_tokens", 0) or 0),
+            int(cc.get("ephemeral_1h_input_tokens", 0) or 0),
+        )
+    return int(u.get("cache_creation_input_tokens", 0) or 0), 0
+
+
 def _cost(u: dict, model: str) -> float:
     r = _pricing_for(model)
+    tokens_5m, tokens_1h = _cache_write_split(u)
     return (
-        u.get("input_tokens", 0)                  * r["input"]       / 1_000_000
-        + u.get("output_tokens", 0)               * r["output"]      / 1_000_000
-        + u.get("cache_read_input_tokens", 0)     * r["cache_read"]  / 1_000_000
-        + u.get("cache_creation_input_tokens", 0) * r["cache_write"] / 1_000_000
+        u.get("input_tokens", 0)              * r["input"]           / 1_000_000
+        + u.get("output_tokens", 0)           * r["output"]          / 1_000_000
+        + u.get("cache_read_input_tokens", 0) * r["cache_read"]      / 1_000_000
+        + tokens_5m                           * r["cache_write"]     / 1_000_000
+        + tokens_1h                           * r["cache_write_1h"]  / 1_000_000
     )
 
 
@@ -792,35 +814,56 @@ def _build_turn_record(global_index: int, entry: dict,
     inp = u.get("input_tokens", 0)
     out = u.get("output_tokens", 0)
     crd = u.get("cache_read_input_tokens", 0)
-    cwr = u.get("cache_creation_input_tokens", 0)
+    cwr_5m, cwr_1h = _cache_write_split(u)
+    cwr = cwr_5m + cwr_1h
+    if cwr == 0:
+        ttl = ""
+    elif cwr_1h == 0:
+        ttl = "5m"
+    elif cwr_5m == 0:
+        ttl = "1h"
+    else:
+        ttl = "mix"
     c = _cost(u, model)
     nc = _no_cache_cost(u, model)
     return {
-        "index":              global_index,
-        "timestamp":          entry.get("timestamp", ""),
-        "timestamp_fmt":      _fmt_ts(entry.get("timestamp", ""), tz_offset_hours),
-        "model":              model,
-        "input_tokens":       inp,
-        "output_tokens":      out,
-        "cache_read_tokens":  crd,
-        "cache_write_tokens": cwr,
-        "total_tokens":       inp + out + crd + cwr,
-        "cost_usd":           c,
-        "no_cache_cost_usd":  nc,
-        "speed":              u.get("speed", ""),
+        "index":                  global_index,
+        "timestamp":              entry.get("timestamp", ""),
+        "timestamp_fmt":          _fmt_ts(entry.get("timestamp", ""), tz_offset_hours),
+        "model":                  model,
+        "input_tokens":           inp,
+        "output_tokens":          out,
+        "cache_read_tokens":      crd,
+        "cache_write_tokens":     cwr,
+        "cache_write_5m_tokens":  cwr_5m,
+        "cache_write_1h_tokens":  cwr_1h,
+        "cache_write_ttl":        ttl,
+        "total_tokens":           inp + out + crd + cwr,
+        "cost_usd":               c,
+        "no_cache_cost_usd":      nc,
+        "speed":                  u.get("speed", ""),
     }
 
 
 def _totals_from_turns(turn_records: list[dict]) -> dict:
     t = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+         "cache_write_5m": 0, "cache_write_1h": 0, "extra_1h_cost": 0.0,
          "cost": 0.0, "no_cache_cost": 0.0, "turns": len(turn_records)}
     for r in turn_records:
         t["input"]        += r["input_tokens"]
         t["output"]       += r["output_tokens"]
         t["cache_read"]   += r["cache_read_tokens"]
         t["cache_write"]  += r["cache_write_tokens"]
+        t["cache_write_5m"] += r.get("cache_write_5m_tokens", 0)
+        t["cache_write_1h"] += r.get("cache_write_1h_tokens", 0)
         t["cost"]         += r["cost_usd"]
         t["no_cache_cost"] += r["no_cache_cost_usd"]
+        # Extra cost paid for opting into the 1h TTL tier (vs pricing those
+        # same tokens at the 5m rate). Meaningful only when cache_write_1h > 0.
+        tokens_1h = r.get("cache_write_1h_tokens", 0)
+        if tokens_1h:
+            rates = _pricing_for(r["model"])
+            t["extra_1h_cost"] += tokens_1h * (rates["cache_write_1h"] - rates["cache_write"]) / 1_000_000
     t["total"] = t["input"] + t["output"] + t["cache_read"] + t["cache_write"]
     t["total_input"] = t["input"] + t["cache_read"] + t["cache_write"]
     t["cache_savings"] = t["no_cache_cost"] - t["cost"]
@@ -926,6 +969,15 @@ def _has_fast(report: dict) -> bool:
     return False
 
 
+def _has_1h_cache(report: dict) -> bool:
+    """Return True if any turn used the 1-hour cache TTL tier."""
+    for s in report["sessions"]:
+        for t in s["turns"]:
+            if t.get("cache_write_1h_tokens", 0) > 0:
+                return True
+    return False
+
+
 def _fmt_ts(ts: str, offset_hours: float = 0.0) -> str:
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -952,12 +1004,28 @@ def _fmt_epoch_local(epoch: int, offset_hours: float = 0.0,
     ).strftime(fmt)
 
 
+def _fmt_cwr_row(t: dict) -> str:
+    """Per-turn CacheWr cell. Appends `*` when the turn used 1h-tier cache."""
+    n = t["cache_write_tokens"]
+    if t.get("cache_write_ttl") in ("1h", "mix"):
+        return f"{n:>8,}*"
+    return f"{n:>9,}"
+
+
+def _fmt_cwr_subtotal(s: dict) -> str:
+    """Subtotal/total CacheWr cell. `*` when any 1h tokens are in the sum."""
+    n = s.get("cache_write", 0)
+    if s.get("cache_write_1h", 0) > 0:
+        return f"{n:>8,}*"
+    return f"{n:>9,}"
+
+
 def _row_text(t: dict, show_mode: bool = False) -> str:
     base = COL_M if show_mode else COL
     args = [
         t["index"], t["timestamp_fmt"],
         f"{t['input_tokens']:>7,}", f"{t['output_tokens']:>7,}",
-        f"{t['cache_read_tokens']:>9,}", f"{t['cache_write_tokens']:>9,}",
+        f"{t['cache_read_tokens']:>9,}", _fmt_cwr_row(t),
         f"{t['total_tokens']:>10,}",
         f"${t['cost_usd']:>8.4f}",
     ]
@@ -972,13 +1040,39 @@ def _subtotal_text(label: str, s: dict, show_mode: bool = False) -> str:
     args = [
         label, "",
         f"{s['input']:>7,}", f"{s['output']:>7,}",
-        f"{s['cache_read']:>9,}", f"{s['cache_write']:>9,}",
+        f"{s['cache_read']:>9,}", _fmt_cwr_subtotal(s),
         f"{s['total']:>10,}",
         f"${s['cost']:>8.4f}",
     ]
     if show_mode:
         args.append("")
     return base.format(*args)
+
+
+def _text_legend(tz_label: str, show_mode: bool, show_ttl: bool) -> str:
+    """Build the column legend emitted above the timeline table."""
+    rows = [
+        ("#",       "deduplicated turn index"),
+        ("Time",    f"turn start, local tz ({tz_label})"),
+    ]
+    if show_mode:
+        rows.append(("Mode",  "fast / standard (only shown when fast mode was used)"))
+    rows.extend([
+        ("Input",   "net new input tokens (uncached)"),
+        ("Output",  "generated tokens (includes thinking + tool_use block tokens)"),
+        ("CacheRd", "tokens read from cache (cheap)"),
+    ])
+    if show_ttl:
+        rows.append(("CacheWr", "tokens written to cache; `*` = includes 1h-tier (see footer)"))
+    else:
+        rows.append(("CacheWr", "tokens written to cache (one-time)"))
+    rows.extend([
+        ("Total",   "sum of the four billable token buckets"),
+        ("Cost $",  "estimated USD for this turn"),
+    ])
+    w = max(len(k) for k, _ in rows)
+    lines = ["Columns:"] + [f"  {k:<{w}}  {v}" for k, v in rows]
+    return "\n".join(lines)
 
 
 def _footer_text(totals: dict, models: dict[str, int],
@@ -999,6 +1093,15 @@ def _footer_text(totals: dict, models: dict[str, int],
         f"Cache savings vs no-cache baseline : ${totals['cache_savings']:.4f}",
         f"Cache hit ratio (read / total input): {totals['cache_hit_pct']:.1f}%",
     ]
+    if totals.get("cache_write_1h", 0) > 0:
+        lines.append(
+            f"Extra cost paid for 1h cache tier  : ${totals.get('extra_1h_cost', 0.0):.4f}"
+        )
+        pct_1h = 100 * totals["cache_write_1h"] / max(1, totals["cache_write"])
+        lines.append(
+            f"Cache TTL mix (1h share of writes) : {pct_1h:.1f}%  "
+            f"[* in CacheWr column = includes 1h-tier cache write]"
+        )
     if models:
         lines.append("")
         lines.append("Models used:")
@@ -1072,8 +1175,13 @@ def render_text(report: dict) -> str:
     sessions = report["sessions"]
 
     m = _has_fast(report)
+    has_1h = _has_1h_cache(report)
     tz_offset = report.get("tz_offset_hours", 0.0)
+    tz_label = report.get("tz_label", "UTC")
     hdr, sep, wide = _text_table_headers(tz_offset, show_mode=m)
+
+    p(_text_legend(tz_label, show_mode=m, show_ttl=has_1h))
+    p()
 
     if report["mode"] == "project":
         p(f"Project: {report['slug']}")
@@ -1162,6 +1270,7 @@ def render_csv(report: dict) -> str:
     w = csv_mod.writer(out)
     w.writerow(["session_id", "turn", "timestamp", "model", "speed",
                 "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                "cache_write_5m_tokens", "cache_write_1h_tokens", "cache_write_ttl",
                 "total_tokens", "cost_usd", "no_cache_cost_usd"])
     for s in report["sessions"]:
         for t in s["turns"]:
@@ -1170,6 +1279,9 @@ def render_csv(report: dict) -> str:
                 t.get("speed", ""),
                 t["input_tokens"], t["output_tokens"],
                 t["cache_read_tokens"], t["cache_write_tokens"],
+                t.get("cache_write_5m_tokens", 0),
+                t.get("cache_write_1h_tokens", 0),
+                t.get("cache_write_ttl", ""),
                 t["total_tokens"],
                 f"{t['cost_usd']:.6f}", f"{t['no_cache_cost_usd']:.6f}",
             ])
@@ -1279,6 +1391,10 @@ def render_md(report: dict) -> str:
     p(f"| Output tokens | {totals['output']:,} |")
     p(f"| Cache read tokens | {totals['cache_read']:,} |")
     p(f"| Cache write tokens | {totals['cache_write']:,} |")
+    if totals.get("cache_write_1h", 0) > 0:
+        pct_1h = 100 * totals["cache_write_1h"] / max(1, totals["cache_write"])
+        p(f"| Cache TTL mix (1h share of writes) | {pct_1h:.1f}% |")
+        p(f"| Extra cost paid for 1h cache tier | ${totals.get('extra_1h_cost', 0.0):.4f} |")
     p()
 
     # Time-of-day section
@@ -1352,6 +1468,22 @@ def render_md(report: dict) -> str:
             p(f"| `{m}` | {cnt:,} | ${r['input']:.2f} | ${r['output']:.2f} | ${r['cache_read']:.2f} | ${r['cache_write']:.2f} |")
         p()
 
+    has_1h_cache = _has_1h_cache(report)
+    p("## Column legend")
+    p()
+    p("- **#** — deduplicated turn index")
+    p(f"- **Time** — turn start, local tz ({tz_label})")
+    p("- **Input (new)** — net new input tokens (uncached)")
+    p("- **Output** — generated tokens (includes thinking + tool_use block tokens)")
+    p("- **CacheRd** — tokens read from cache (cheap)")
+    if has_1h_cache:
+        p("- **CacheWr** — tokens written to cache; `*` suffix marks turns that used the 1-hour TTL tier")
+    else:
+        p("- **CacheWr** — tokens written to cache (one-time)")
+    p("- **Total** — sum of the four billable token buckets")
+    p("- **Cost $** — estimated USD for this turn")
+    p()
+
     for i, s in enumerate(report["sessions"], 1):
         if mode == "project":
             st = s["subtotal"]
@@ -1363,14 +1495,21 @@ def render_md(report: dict) -> str:
         p(f"| # | Time ({tz_label}) | Input (new) | Output | CacheRd | CacheWr | Total | Cost $ |")
         p("|--:|-----------|------------:|------:|--------:|--------:|------:|-------:|")
         for t in s["turns"]:
+            ttl = t.get("cache_write_ttl", "")
+            cwr_cell = f"{t['cache_write_tokens']:,}" + ("*" if ttl in ("1h", "mix") else "")
             p(f"| {t['index']} | {t['timestamp_fmt']} "
               f"| {t['input_tokens']:,} | {t['output_tokens']:,} "
-              f"| {t['cache_read_tokens']:,} | {t['cache_write_tokens']:,} "
+              f"| {t['cache_read_tokens']:,} | {cwr_cell} "
               f"| {t['total_tokens']:,} | ${t['cost_usd']:.4f} |")
         st = s["subtotal"]
+        st_cwr_cell = f"{st['cache_write']:,}" + ("*" if st.get("cache_write_1h", 0) > 0 else "")
         p(f"| **TOT** | | **{st['input']:,}** | **{st['output']:,}** "
-          f"| **{st['cache_read']:,}** | **{st['cache_write']:,}** "
+          f"| **{st['cache_read']:,}** | **{st_cwr_cell}** "
           f"| **{st['total']:,}** | **${st['cost']:.4f}** |")
+        if st.get("cache_write_1h", 0) > 0:
+            p()
+            p(f"_`*` = cache write includes the 1-hour TTL tier "
+              f"(5m: {st.get('cache_write_5m', 0):,}, 1h: {st['cache_write_1h']:,} tokens)._")
         p()
 
     return out.getvalue()
@@ -2674,11 +2813,23 @@ def render_html(report: dict, variant: str = "single",
 
     # ---- Table rows --------------------------------------------------------
     show_mode = _has_fast(report)
+    show_ttl  = _has_1h_cache(report)
 
     # Total columns = #, Time, Model, [Mode], Input, Output, CacheRd, CacheWr, Total, Cost
     _full_cols = 10 + (1 if show_mode else 0)
     # Label cell in subtotal rows spans the non-numeric prefix: #, Time, Model, [Mode]
     _label_span = 4 if show_mode else 3
+
+    def _cwr_cell(tokens: int, tokens_5m: int, tokens_1h: int,
+                  ttl: str, bold: bool = False) -> str:
+        num = f"{tokens:,}"
+        inner = f"<strong>{num}</strong>" if bold else num
+        if ttl in ("1h", "mix"):
+            cls = "ttl-1h" if ttl == "1h" else "ttl-mix"
+            title = f"5m: {tokens_5m:,} · 1h: {tokens_1h:,} tokens"
+            badge = f'<span class="badge-ttl {cls}" title="{title}">{ttl}</span>'
+            return f'<td class="num" title="{title}">{inner}{badge}</td>'
+        return f'<td class="num">{inner}</td>'
 
     def turn_row(t: dict, session_id: str) -> str:
         bar_w = min(100, int(t["cost_usd"] * 2000))
@@ -2688,6 +2839,12 @@ def render_html(report: dict, variant: str = "single",
             label = "fast" if spd == "fast" else "std"
             cls = ' class="mode-fast"' if spd == "fast" else ' class="mode-std"'
             mode_td = f'<td{cls}>{label}</td>'
+        cwr_td = _cwr_cell(
+            t["cache_write_tokens"],
+            t.get("cache_write_5m_tokens", 0),
+            t.get("cache_write_1h_tokens", 0),
+            t.get("cache_write_ttl", ""),
+        )
         return (
             f'<tr data-session="{session_id[:8]}">'
             f'<td class="num">{t["index"]}</td>'
@@ -2697,7 +2854,7 @@ def render_html(report: dict, variant: str = "single",
             f'<td class="num">{t["input_tokens"]:,}</td>'
             f'<td class="num">{t["output_tokens"]:,}</td>'
             f'<td class="num">{t["cache_read_tokens"]:,}</td>'
-            f'<td class="num">{t["cache_write_tokens"]:,}</td>'
+            f'{cwr_td}'
             f'<td class="num">{t["total_tokens"]:,}</td>'
             f'<td class="cost"><span class="bar" style="width:{bar_w}px"></span>'
             f'${t["cost_usd"]:.4f}</td>'
@@ -2720,13 +2877,21 @@ def render_html(report: dict, variant: str = "single",
         )
 
     def subtotal_row(label: str, st: dict) -> str:
+        tokens_1h = st.get("cache_write_1h", 0)
+        if tokens_1h > 0:
+            tokens_5m = st.get("cache_write_5m", 0)
+            sub_ttl = "mix" if st.get("cache_write_5m", 0) > 0 else "1h"
+        else:
+            tokens_5m = st.get("cache_write_5m", 0)
+            sub_ttl = ""
+        cwr_td = _cwr_cell(st["cache_write"], tokens_5m, tokens_1h, sub_ttl, bold=True)
         return (
             f'<tr class="subtotal">'
             f'<td colspan="{_label_span}"><strong>{label}</strong></td>'
             f'<td class="num"><strong>{st["input"]:,}</strong></td>'
             f'<td class="num"><strong>{st["output"]:,}</strong></td>'
             f'<td class="num"><strong>{st["cache_read"]:,}</strong></td>'
-            f'<td class="num"><strong>{st["cache_write"]:,}</strong></td>'
+            f'{cwr_td}'
             f'<td class="num"><strong>{st["total"]:,}</strong></td>'
             f'<td class="cost"><strong>${st["cost"]:.4f}</strong></td>'
             f'</tr>'
@@ -2776,14 +2941,34 @@ def render_html(report: dict, variant: str = "single",
 
     table_section_html = ""
     if include_chart and table_rows:
+        legend_parts = [
+            '<b>#</b> turn index (deduplicated) · ',
+            f'<b>Time</b> turn start ({tz_label}) · ',
+            '<b>Model</b> short model alias · ',
+        ]
+        if show_mode:
+            legend_parts.append('<b>Mode</b> fast / standard · ')
+        legend_parts.extend([
+            '<b>Input (new)</b> net new <code>input_tokens</code> (uncached) · ',
+            '<b>Output</b> <code>output_tokens</code> (includes thinking + tool_use block tokens) · ',
+            '<b>CacheRd</b> <code>cache_read_input_tokens</code> · ',
+        ])
+        if show_ttl:
+            legend_parts.append(
+                '<b>CacheWr</b> <code>cache_creation_input_tokens</code> '
+                '(badge marks 1h-tier turns; hover for 5m/1h split) · '
+            )
+        else:
+            legend_parts.append('<b>CacheWr</b> <code>cache_creation_input_tokens</code> · ')
+        legend_parts.extend([
+            '<b>Total</b> sum of the four billable token buckets · ',
+            '<b>Cost $</b> estimated USD for this turn.',
+        ])
+        legend_html = '<p class="legend-block">' + ''.join(legend_parts) + '</p>'
         table_section_html = (
-            '<h2>Timeline <span class="legend">'
-            'API splits input into three fields: '
-            '<b>Input (new)</b> = <code>input_tokens</code> (uncached) · '
-            '<b>CacheRd</b> = <code>cache_read_input_tokens</code> · '
-            '<b>CacheWr</b> = <code>cache_creation_input_tokens</code>. '
-            'Total input sent to the model = sum of all three.'
-            '</span></h2>\n<table>\n<thead><tr>\n'
+            '<h2>Timeline</h2>\n'
+            + legend_html + '\n'
+            + '<table>\n<thead><tr>\n'
             f'  <th class="num">#</th><th>Time ({tz_label})</th><th>Model</th>\n'
             f'  {"<th>Mode</th>" if show_mode else ""}\n'
             '  <th class="num">Input (new)</th><th class="num">Output</th>\n'
@@ -2804,6 +2989,17 @@ def render_html(report: dict, variant: str = "single",
 
     summary_cards_html = ""
     if include_insights:
+        ttl_mix_card = ""
+        if totals.get("cache_write_1h", 0) > 0:
+            pct_1h = 100 * totals["cache_write_1h"] / max(1, totals["cache_write"])
+            extra = totals.get("extra_1h_cost", 0.0)
+            ttl_mix_card = (
+                f'\n  <div class="card amber" '
+                f'title="1-hour cache writes cost 2× input vs 1.25× for the 5-minute tier. '
+                f'This card shows the premium you paid for longer cache reuse.">'
+                f'<div class="val">{pct_1h:.0f}% 1h · ${extra:.4f}</div>'
+                f'<div class="lbl">Cache TTL mix (extra paid for 1h)</div></div>'
+            )
         summary_cards_html = f'''\
 <div class="cards">
   <div class="card amber"><div class="val">${totals['cost']:.4f}</div><div class="lbl">Total cost (USD)</div></div>
@@ -2813,7 +3009,7 @@ def render_html(report: dict, variant: str = "single",
   <div class="card"><div class="val">{totals['input']:,}</div><div class="lbl">Input tokens (new)</div></div>
   <div class="card"><div class="val">{totals['output']:,}</div><div class="lbl">Output tokens</div></div>
   <div class="card"><div class="val">{totals['cache_read']:,}</div><div class="lbl">Cache read tokens</div></div>
-  <div class="card"><div class="val">{totals['cache_write']:,}</div><div class="lbl">Cache write tokens</div></div>
+  <div class="card"><div class="val">{totals['cache_write']:,}</div><div class="lbl">Cache write tokens</div></div>{ttl_mix_card}
 </div>'''
 
     toggle_script_html = ""
@@ -2888,6 +3084,21 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
   .models-table code {{ font-size: 11px; color: #a5d6ff; }}
   td.mode-fast {{ color: #3fb950; font-size: 10px; font-weight: 600; }}
   td.mode-std  {{ color: #484f58; font-size: 10px; }}
+  .badge-ttl {{ display: inline-block; margin-left: 6px; padding: 0 5px;
+                font-size: 9px; font-weight: 600; letter-spacing: 0.5px;
+                border-radius: 3px; vertical-align: middle; cursor: help; }}
+  .badge-ttl.ttl-1h  {{ background: #d2992233; color: #e3b341;
+                        border: 1px solid #d2992266; }}
+  .badge-ttl.ttl-mix {{ background: #8957e533; color: #bc8cff;
+                        border: 1px solid #8957e566; }}
+  .legend-block {{ color: #8b949e; font-size: 11px; margin: -4px 0 12px;
+                   padding: 8px 12px; background: #161b22;
+                   border: 1px solid #30363d; border-radius: 6px;
+                   line-height: 1.6; }}
+  .legend-block b {{ color: #c9d1d9; font-weight: 600; }}
+  .legend-block code {{ background: #0d1117; border: 1px solid #30363d;
+                        border-radius: 3px; padding: 0 4px; font-size: 10px;
+                        color: #a5d6ff; }}
   .chart-page-label {{ font-size: 11px; color: #8b949e; padding: 8px 16px 0;
                        border-top: 1px solid #30363d; margin-top: 4px; }}
 </style>

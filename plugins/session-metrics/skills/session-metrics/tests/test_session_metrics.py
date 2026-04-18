@@ -33,11 +33,14 @@ def test_pricing_opus_4_7_explicit():
     assert r["output"] == 25.00
     assert r["cache_read"] == 0.50
     assert r["cache_write"] == 6.25
+    # 1-hour TTL tier is 2x base input (vs 1.25x for 5m).
+    assert r["cache_write_1h"] == 10.00
 
 
 def test_pricing_sonnet_4_7_explicit():
     r = sm._pricing_for("claude-sonnet-4-7")
     assert r["input"] == 3.00
+    assert r["cache_write_1h"] == 6.00
 
 
 def test_pricing_opus_4_old_tier_retained():
@@ -45,6 +48,7 @@ def test_pricing_opus_4_old_tier_retained():
     r = sm._pricing_for("claude-opus-4")
     assert r["input"] == 15.00
     assert r["output"] == 75.00
+    assert r["cache_write_1h"] == 30.00
 
 
 def test_pricing_haiku_4_5_new_tier():
@@ -52,6 +56,7 @@ def test_pricing_haiku_4_5_new_tier():
     r = sm._pricing_for("claude-haiku-4-5-20251001")
     assert r["input"] == 1.00
     assert r["output"] == 5.00
+    assert r["cache_write_1h"] == 2.00
 
 
 def test_pricing_prefix_fallback():
@@ -73,7 +78,48 @@ def test_cost_opus_all_buckets():
     }
     # Opus 4.7 new tier: 120*5 + 80*25 + 500*0.5 + 1000*6.25
     #                  = 600 + 2000 + 250 + 6250 = 9100 per M
+    # Legacy fallback path: no nested cache_creation, so the full 1000 tokens
+    # price at the 5m rate (6.25/M).
     assert sm._cost(usage, "claude-opus-4-7") == pytest.approx(0.00910, abs=1e-7)
+
+
+def test_cost_splits_5m_and_1h_when_nested_present():
+    """Nested ``cache_creation`` object triggers the split pricing path."""
+    usage = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 1000,  # Sum — not used when nested present
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 600,
+            "ephemeral_1h_input_tokens": 400,
+        },
+    }
+    # Sonnet 4.7: 5m = 3.75, 1h = 6.00
+    # 600*3.75 + 400*6.00 = 2250 + 2400 = 4650 per M = 0.00465
+    assert sm._cost(usage, "claude-sonnet-4-7") == pytest.approx(0.00465, abs=1e-7)
+
+
+def test_cache_write_split_fallback_without_nested():
+    """Legacy transcripts (no nested cache_creation) charge everything at 5m."""
+    usage = {
+        "cache_creation_input_tokens": 1000,
+    }
+    tokens_5m, tokens_1h = sm._cache_write_split(usage)
+    assert tokens_5m == 1000
+    assert tokens_1h == 0
+
+
+def test_cache_write_split_reads_nested_when_present():
+    usage = {
+        "cache_creation_input_tokens": 1000,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 200,
+            "ephemeral_1h_input_tokens": 800,
+        },
+    }
+    tokens_5m, tokens_1h = sm._cache_write_split(usage)
+    assert tokens_5m == 200
+    assert tokens_1h == 800
 
 
 def test_no_cache_cost_folds_cache_tokens():
@@ -122,7 +168,8 @@ def test_is_user_prompt_excludes_assistant_type():
 def test_fixture_dedup_keeps_last_write():
     entries = sm._parse_jsonl(_FIXTURE)
     turns = sm._extract_turns(entries)
-    assert len(turns) == 4
+    # msg_A..D (legacy flat cache writes) + msg_E (pure 1h) + msg_F (mix) = 6
+    assert len(turns) == 6
     by_id = {t["message"]["id"]: t["message"]["usage"] for t in turns}
     # msg_A appears twice; the last write (120/80/500/1000) must win
     assert by_id["msg_A"]["input_tokens"] == 120
@@ -132,16 +179,16 @@ def test_fixture_dedup_keeps_last_write():
 def test_fixture_user_timestamps_default_excludes_sidechain_and_tool_results():
     entries = sm._parse_jsonl(_FIXTURE)
     ts = sm._extract_user_timestamps(entries)
-    # u2 (text list) + u6 (plain string) = 2.  u1 meta, u3/u4/u7 tool_result,
+    # u2, u6, u8, u9 are text prompts.  u1 meta, u3/u4/u7 tool_result,
     # u5 sidechain — all excluded.
-    assert len(ts) == 2
+    assert len(ts) == 4
 
 
 def test_fixture_user_timestamps_include_sidechain_adds_one():
     entries = sm._parse_jsonl(_FIXTURE)
     ts = sm._extract_user_timestamps(entries, include_sidechain=True)
     # adds u5 sidechain text
-    assert len(ts) == 3
+    assert len(ts) == 5
 
 
 # --- End-to-end totals on the fixture ---------------------------------------
@@ -153,26 +200,134 @@ def _build_fixture_report():
 
 def test_fixture_total_cost_exact():
     r = _build_fixture_report()
-    # New Opus 4.7 tier ($5/$25/$0.50/$6.25), Sonnet 4.7 unchanged ($3/$15/$0.30/$3.75).
-    # msg_A (opus, deduped, last write wins):  120*5 + 80*25 + 500*0.5 + 1000*6.25 = 9100/M  = 0.00910
-    # msg_B (sonnet): 10*3 + 20*15 + 2000*0.3 + 0*3.75                              = 930/M   = 0.00093
-    # msg_C (opus):    5*5 + 15*25 + 3000*0.5 + 0*6.25                              = 1900/M  = 0.00190
-    # msg_D (sonnet): 200*3 + 300*15 + 1500*0.3 + 0*3.75                            = 5550/M  = 0.00555
-    # Total = 0.01748
-    assert r["totals"]["cost"] == pytest.approx(0.01748, abs=1e-7)
+    # Opus 4.7 ($5/$25/$0.50/$6.25/$10.00), Sonnet 4.7 ($3/$15/$0.30/$3.75/$6.00).
+    # msg_A (opus, deduped, legacy flat cwr):   120*5 + 80*25 + 500*0.5 + 1000*6.25       = 0.00910
+    # msg_B (sonnet):                            10*3 + 20*15 + 2000*0.3 + 0              = 0.00093
+    # msg_C (opus):                               5*5 + 15*25 + 3000*0.5 + 0              = 0.00190
+    # msg_D (sonnet):                           200*3 + 300*15 + 1500*0.3 + 0             = 0.00555
+    # msg_E (opus, pure 1h):                     10*5 + 20*25 + 0 + 500*10.00             = 0.00555
+    # msg_F (sonnet, mix 5m=600 + 1h=400):        5*3 + 10*15 + 0 + 600*3.75 + 400*6.00   = 0.004815
+    # Total = 0.027845
+    assert r["totals"]["cost"] == pytest.approx(0.027845, abs=1e-7)
 
 
 def test_fixture_turns_count_and_models():
     r = _build_fixture_report()
-    assert r["totals"]["turns"] == 4
-    assert r["models"]["claude-opus-4-7"] == 2
-    assert r["models"]["claude-sonnet-4-7"] == 2
+    assert r["totals"]["turns"] == 6
+    assert r["models"]["claude-opus-4-7"] == 3       # msg_A, msg_C, msg_E
+    assert r["models"]["claude-sonnet-4-7"] == 3     # msg_B, msg_D, msg_F
 
 
 def test_fixture_time_of_day_total_is_user_prompt_count():
     r = _build_fixture_report()
-    # 2 real user prompts — must NOT equal the 7 user-type entries in the file
-    assert r["time_of_day"]["message_count"] == 2
+    # 4 real user prompts — must NOT equal the user-type entry count in the file
+    assert r["time_of_day"]["message_count"] == 4
+
+
+# --- Cache TTL drilldown (Proposal A) ---------------------------------------
+
+def test_fixture_ttl_classification_per_turn():
+    """Each turn carries a correct `cache_write_ttl` derived from its split."""
+    r = _build_fixture_report()
+    by_id = {t["model"] + "_" + str(t["index"]): t for t in r["sessions"][0]["turns"]}
+    # Index 1 = msg_A (legacy flat → classified as 5m via fallback)
+    assert r["sessions"][0]["turns"][0]["cache_write_ttl"] == "5m"
+    # Index 5 = msg_E (pure 1h)
+    msg_E = r["sessions"][0]["turns"][4]
+    assert msg_E["cache_write_ttl"] == "1h"
+    assert msg_E["cache_write_5m_tokens"] == 0
+    assert msg_E["cache_write_1h_tokens"] == 500
+    # Index 6 = msg_F (mix)
+    msg_F = r["sessions"][0]["turns"][5]
+    assert msg_F["cache_write_ttl"] == "mix"
+    assert msg_F["cache_write_5m_tokens"] == 600
+    assert msg_F["cache_write_1h_tokens"] == 400
+
+
+def test_fixture_totals_ttl_aggregation():
+    r = _build_fixture_report()
+    t = r["totals"]
+    # 5m buckets: msg_A 1000 (flat fallback) + msg_F 600 = 1600
+    assert t["cache_write_5m"] == 1600
+    # 1h buckets: msg_E 500 + msg_F 400 = 900
+    assert t["cache_write_1h"] == 900
+    # Extra cost paid for the 1h tier (delta vs. 5m rate):
+    #   msg_E: 500 * (10.00 - 6.25)/M = 0.001875 (opus)
+    #   msg_F: 400 * (6.00 - 3.75)/M  = 0.000900 (sonnet)
+    # Total = 0.002775
+    assert t["extra_1h_cost"] == pytest.approx(0.002775, abs=1e-7)
+
+
+def test_has_1h_cache_detects_fixture():
+    r = _build_fixture_report()
+    assert sm._has_1h_cache(r) is True
+
+
+def test_has_1h_cache_false_on_legacy_only():
+    """A report built from only legacy flat-cache turns reports False."""
+    legacy_entries = sm._parse_jsonl(_FIXTURE)
+    # Strip msg_E, msg_F and their paired users from the raw entries
+    keep = [e for e in legacy_entries
+            if e.get("uuid") not in {"u8", "a5", "u9", "a6"}]
+    # Extract turns from the trimmed set and build a synthetic report
+    trimmed_turns = sm._extract_turns(keep)
+    user_ts = sm._extract_user_timestamps(keep)
+    r = sm._build_report("session", "test-slug", [("s1", trimmed_turns, user_ts)])
+    assert sm._has_1h_cache(r) is False
+
+
+def test_csv_has_ttl_columns():
+    r = _build_fixture_report()
+    csv_out = sm.render_csv(r)
+    header = csv_out.splitlines()[0]
+    assert "cache_write_5m_tokens" in header
+    assert "cache_write_1h_tokens" in header
+    assert "cache_write_ttl" in header
+
+
+def test_json_has_ttl_totals_keys():
+    r = _build_fixture_report()
+    import json as _json
+    data = _json.loads(sm.render_json(r))
+    assert "cache_write_5m" in data["totals"]
+    assert "cache_write_1h" in data["totals"]
+    assert "extra_1h_cost" in data["totals"]
+    # Per-turn nested fields
+    t = data["sessions"][0]["turns"][-1]  # msg_F
+    assert t["cache_write_ttl"] == "mix"
+    assert t["cache_write_5m_tokens"] == 600
+    assert t["cache_write_1h_tokens"] == 400
+
+
+def test_text_render_includes_legend_and_1h_annotation():
+    r = _build_fixture_report()
+    text = sm.render_text(r)
+    # Legend header block present
+    assert "Columns:" in text
+    assert "CacheRd" in text
+    # 1h-tier annotation surfaces the `*` suffix and footer explanation
+    assert "*" in text
+    assert "Extra cost paid for 1h cache tier" in text
+
+
+def test_md_render_includes_legend_and_annotation():
+    r = _build_fixture_report()
+    md = sm.render_md(r)
+    assert "## Column legend" in md
+    assert "1-hour TTL tier" in md
+    # Summary card line for the extra 1h cost
+    assert "Extra cost paid for 1h cache tier" in md
+
+
+def test_html_render_includes_legend_and_badge():
+    r = _build_fixture_report()
+    html = sm.render_html(r, variant="single")
+    assert 'class="legend-block"' in html
+    # TTL badge renders on the 1h and mix rows
+    assert 'class="badge-ttl ttl-1h"' in html
+    assert 'class="badge-ttl ttl-mix"' in html
+    # Cache TTL mix dashboard card
+    assert "Cache TTL mix" in html
 
 
 # --- Input validation --------------------------------------------------------
@@ -283,10 +438,10 @@ def test_weekday_hour_matrix_offset_crosses_day_boundary():
 def test_fixture_hour_of_day_from_real_prompts():
     r = _build_fixture_report()
     hod = r["time_of_day"]["hour_of_day"]
-    # u2 at 22:31 UTC + u6 at 03:45 UTC = one each at h=22 and h=3
+    # u2 at 22:31 UTC + u6/u8/u9 at 03:45/03:46 UTC = 1 at h=22, 3 at h=3
     assert hod["hours"][22] == 1
-    assert hod["hours"][3] == 1
-    assert hod["total"] == 2
+    assert hod["hours"][3] == 3
+    assert hod["total"] == 4
 
 
 # --- 5-hour session blocks ---------------------------------------------------
@@ -314,8 +469,8 @@ def test_session_blocks_counts():
     # assistant timestamps aren't deduped in block building — both are events.
     # What matters: user_msg_count is from filtered prompts.
     assert blocks[0]["user_msg_count"] == 1
-    # Block 1: u6 + a4 = 1 user, 1 turn
-    assert blocks[1]["user_msg_count"] == 1
+    # Block 1: u6 + a4 + u8 + a5 + u9 + a6 = 3 user prompts, 3 turns
+    assert blocks[1]["user_msg_count"] == 3
 
 
 def test_session_blocks_cost_sums_match_report_total():
@@ -384,7 +539,7 @@ def test_weekly_rollup_uses_deduped_cost():
         r["sessions"], [(sid, turns, user_ts)], r["session_blocks"],
         now_epoch=now,
     )
-    assert ro["trailing_7d"]["cost"] == pytest.approx(0.01748, abs=1e-7)
+    assert ro["trailing_7d"]["cost"] == pytest.approx(0.027845, abs=1e-7)
     assert ro["prior_7d"]["cost"] == pytest.approx(0.0, abs=1e-9)
 
 

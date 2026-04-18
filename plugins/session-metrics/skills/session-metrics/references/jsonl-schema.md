@@ -316,6 +316,12 @@ first. Each row is a candidate for a future report-expansion plan.
 
 ## Proposal A — Ephemeral cache TTL drilldown
 
+**Status:** **Implemented in v1.2.0.** Cost math, per-turn records,
+CSV/JSON exports, the Markdown legend + annotation, the HTML TTL
+badge + "Cache TTL mix" dashboard card, and the new column legend
+all ship in this release. The sections below are retained as
+historical design context.
+
 **Fields.** `cache_creation.ephemeral_1h_input_tokens` and
 `cache_creation.ephemeral_5m_input_tokens` (both nested inside
 `message.usage.cache_creation`).
