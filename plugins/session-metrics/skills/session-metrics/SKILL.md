@@ -18,27 +18,29 @@ a timeline-ordered cost summary with per-turn and cumulative totals.
 
 ```bash
 # Current session (auto-detected from cwd)
-uv run python .claude/skills/session-metrics/scripts/session-metrics.py
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py
 
 # Specific session ID
-uv run python .claude/skills/session-metrics/scripts/session-metrics.py --session <uuid>
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --session <uuid>
 
 # Specific project slug (use = when slug starts with "-")
-uv run python .claude/skills/session-metrics/scripts/session-metrics.py --slug=-home-user-projects-myapp
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --slug=-home-user-projects-myapp
 # Or via env var (always safe):
-CLAUDE_PROJECT_SLUG="-home-user-projects-myapp" uv run python .claude/skills/session-metrics/scripts/session-metrics.py
+CLAUDE_PROJECT_SLUG="-home-user-projects-myapp" uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py
 
 # List available sessions for this project
-uv run python .claude/skills/session-metrics/scripts/session-metrics.py --list
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --list
 
 # All sessions — timeline + per-session subtotals + grand project total
-uv run python .claude/skills/session-metrics/scripts/session-metrics.py --project-cost
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --project-cost
 
 # Export to exports/session-metrics/ (one or more formats)
-uv run python .claude/skills/session-metrics/scripts/session-metrics.py --output json
-uv run python .claude/skills/session-metrics/scripts/session-metrics.py --output json csv md html
-uv run python .claude/skills/session-metrics/scripts/session-metrics.py --project-cost --output html
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --output json
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --output json csv md html
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --project-cost --output html
 ```
+
+> `${CLAUDE_SKILL_DIR}` is expanded by Claude Code to the skill's install directory (plugin cache, project-local copy, or bundled template — whichever applies). When running the script manually from a shell, substitute the actual path.
 
 ## Export formats
 
