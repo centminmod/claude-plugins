@@ -26,6 +26,14 @@ Add this marketplace once, then install any plugin from it:
 
 More plugins coming.
 
+### Further reading — `session-metrics`
+
+Background articles by the author on what the skill does and what it
+surfaces in practice:
+
+- [I built a token-cost analyzer skill for Claude Code](https://ai.georgeliu.com/p/i-built-a-token-cost-analyzer-skill) — how the skill was designed and what it reports.
+- [I ran two Claude Opus 4.7 5-hour sessions](https://ai.georgeliu.com/p/i-ran-two-claude-opus-47-5hr-sessions) — real-world session-metrics output from two back-to-back Opus 4.7 sessions, with cache-hit, cost, and token-usage analysis.
+
 ## How the skill gets triggered
 
 Plugin skills are namespaced as `plugin-name:skill-name` — for example
