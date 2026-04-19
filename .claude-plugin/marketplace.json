@@ -9,7 +9,7 @@
       "name": "session-metrics",
       "source": "./plugins/session-metrics",
       "description": "Per-turn token, cost, and cache metrics for Claude Code sessions. Multi-format export (text/JSON/CSV/MD/HTML) with 5-hour session blocks, weekly roll-up, hour-of-day punchcard, and pluggable chart libraries. Two-session --compare with IFEval pass-rate and shareable HTML report; --count-tokens-only for an inference-free tokenizer check against the Anthropic API.",
-      "version": "1.6.1",
+      "version": "1.6.2",
       "homepage": "https://github.com/centminmod/claude-plugins",
       "author": {
         "name": "George Liu"

@@ -8,23 +8,46 @@ description: >
   "show me token usage", "session summary", "cost so far", or any request to
   analyse or display per-turn metrics from the current or a past session.
 
-  **Does NOT auto-route into model-comparison mode.** Comparing two models
-  is an explicit operation that changes every column in the report and
-  requires a capture protocol. Only invoke compare mode when the user has
-  typed the literal CLI flag `--compare` (or `--compare-prep`,
-  `--count-tokens-only`) in a command they showed you, OR when they
-  explicitly said "run a compare report" / "use the compare feature".
-  Natural-language phrases like "compare 4.6 vs 4.7 cost" or "which model
-  is cheaper" should be answered by running the normal single-session
-  report on the current session and then pointing the user at
-  `session-metrics --compare-prep` if they want a controlled benchmark.
-  Never add `--compare` to a command line based on inferred intent.
+  Do NOT auto-dispatch compare mode (--compare / --compare-prep /
+  --count-tokens-only) from natural-language phrases. The skill body uses
+  $ARGUMENTS[0] as the dispatch key — if the first positional argument is not
+  literally "compare", "compare-prep", or "count-tokens", route to the default
+  single-session report.
 ---
 
 # Session Metrics
 
 Runs `scripts/session-metrics.py` against the Claude Code JSONL log to produce
 a timeline-ordered cost summary with per-turn and cumulative totals.
+
+## Dispatch — how to route this invocation
+
+**First positional argument received:** `$ARGUMENTS[0]`
+**Full argument string:** `$ARGUMENTS`
+
+Read `$ARGUMENTS[0]` above and match it by **literal equality** against the
+table below. Claude Code already tokenized the arguments shell-style, so no
+parsing is required — just compare strings.
+
+| `$ARGUMENTS[0]`     | Route                                     | Then read |
+|---------------------|-------------------------------------------|-----------|
+| `compare`           | Two-session compare                       | `## Model comparison` below, then [`references/model-compare.md`](references/model-compare.md) before running |
+| `compare-prep`      | Print capture protocol + 10-prompt suite  | `## Model comparison` below |
+| `count-tokens`      | API-key-only tokenizer check              | `## Model comparison` below |
+| *(empty, or any other value)* | Default single-session report   | `## Quick usage` below |
+
+This is the single gate that keeps compare mode off the natural-language
+path. **Do not infer the route from the user's chat history; only use the
+literal value of `$ARGUMENTS[0]` above.**
+
+When the skill auto-triggers from a natural-language question ("how much did
+this session cost?", "show me token usage"), there are no positional
+arguments — `$ARGUMENTS[0]` is empty — and you always route to the default.
+Phrases like "compare 4.6 vs 4.7 cost" arriving as natural language do NOT
+produce `$ARGUMENTS[0] = compare` and must not route into compare mode;
+answer them by running the default report on the current session and
+suggesting `/session-metrics compare-prep` if the user wants a real
+benchmark.
 
 ## Quick usage
 
@@ -84,155 +107,71 @@ project root, named `session_<id8>_<YYYYMMDD_HHMMSS>.<ext>` (single) or
 |------|---------|
 | `--tz <IANA>`                | IANA timezone for time-of-day bucketing **and timeline/export timestamps**. Defaults to the system local tz (auto-detected via `TZ` env var or the OS setting). |
 | `--utc-offset <H>`           | Fixed UTC offset, DST-naive. Use `--tz` for DST-aware. |
-
-> **Invocation note for the AI.** Don't pass `--tz` or `--utc-offset` unless the user explicitly asks for a specific timezone. The script auto-detects the user's system tz and renders all human-facing timestamps (timeline, session headers, generated-at banner, block anchors) in that tz. JSON/CSV raw `timestamp` fields stay UTC ISO-8601 as a machine-readable audit trail.
 | `--no-cache`                 | Skip `~/.cache/session-metrics/parse/` and always re-parse from scratch. |
 | `--include-subagents`        | Also tally spawned subagent JSONL files. |
+
+> **Invocation note for the AI.** Don't pass `--tz` or `--utc-offset` unless the user explicitly asks for a specific timezone. The script auto-detects the user's system tz and renders all human-facing timestamps (timeline, session headers, generated-at banner, block anchors) in that tz. JSON/CSV raw `timestamp` fields stay UTC ISO-8601 as a machine-readable audit trail.
 
 ## Output columns
 
 | Column    | Meaning                                      |
 |-----------|----------------------------------------------|
 | `#`       | Deduplicated turn index                      |
-| `Time`    | Timestamp of the turn in the user's local timezone (auto-detected from system; override with `--tz` or `--utc-offset`). The header shows the active tz label, e.g. `Time (UTC+10)` or `Time (Australia/Brisbane)`. Raw `timestamp` fields in JSON/CSV exports remain UTC ISO-8601 (`...Z`) for machine-readability. |
+| `Time`    | Timestamp of the turn in the user's local timezone (auto-detected; override with `--tz` / `--utc-offset`). Header shows the active tz label. Raw `timestamp` fields in JSON/CSV exports remain UTC ISO-8601 (`...Z`) for machine-readability. |
 | `Input`   | Net new input tokens (uncached portion only — cache reads/writes are shown separately) |
 | `Output`  | Output tokens generated (includes thinking + tool_use block tokens) |
 | `CacheRd` | Tokens served from prompt cache (cheap)      |
-| `CacheWr` | Tokens written to prompt cache (one-time). **v1.2.0+**: a `1h` / `mix` badge (HTML) or `*` suffix (text / Markdown) marks turns that used the 1-hour TTL tier; hover or scroll to the footer for the 5m / 1h split. CSV/JSON expose `cache_write_5m_tokens` and `cache_write_1h_tokens` as dedicated columns alongside the existing `cache_write_tokens` sum. |
-| `Content` | **v1.3.0+**: per-turn content-block distribution. Letter encoding `T` thinking, `u` tool_use, `x` text, `r` tool_result, `i` image (zero counts omitted). `tool_result` and `image` counts come from the user entry that immediately preceded the turn. Column renders only when at least one turn in the report carries any content block. HTML cells include a tooltip with expanded descriptions; CSV/JSON expose `thinking_blocks`, `tool_use_blocks`, `text_blocks`, `tool_result_blocks`, `image_blocks` as dedicated per-turn columns/keys. |
+| `CacheWr` | Tokens written to prompt cache (one-time). `1h` / `mix` badge marks turns that used the 1-hour TTL tier; CSV/JSON expose `cache_write_5m_tokens` and `cache_write_1h_tokens` as dedicated columns. |
+| `Content` | Per-turn content-block distribution. Letter encoding `T` thinking, `u` tool_use, `x` text, `r` tool_result, `i` image (zero counts omitted). Renders only when at least one turn carries any content block. CSV/JSON expose `thinking_blocks` / `tool_use_blocks` / `text_blocks` / `tool_result_blocks` / `image_blocks` as dedicated per-turn columns. |
 | `Total`   | Sum of the four billable token buckets       |
 | `Cost $`  | Estimated USD for this turn                  |
 
-A short **column legend** renders near the Timeline header in every
-human-facing format (text, Markdown, HTML). CSV and JSON are
-self-describing via their header row / key names — no inline legend.
+Deep-dive on exact column semantics, JSON keys, and detection rules:
+[`references/jsonl-schema.md`](references/jsonl-schema.md).
 
-Footer shows session totals + **cache savings** vs a hypothetical
-no-cache run. When any turn used the 1-hour cache TTL tier, an extra
-`Extra cost paid for 1h cache tier` line breaks out the premium paid
-for the longer reuse window, and a **Cache TTL mix** dashboard card
-appears on the HTML report. **v1.3.0+** adds two more conditional
-dashboard cards: **Extended thinking engagement** (shown when any turn
-carried a `thinking` block — counts turns and blocks but cannot
-recover per-block tokens, which are rolled into `output_tokens` by
-Anthropic) and **Tool calls** (shown when any turn used
-`tool_use` blocks — total, average per turn, and the top-3 tool names).
-**v1.4.0+** adds a **Session resumes** conditional card + an inline
-timeline divider row at each resume point. Detection is precise: it
-fires only when a `<command-name>/exit</command-name>` local command
-appears within the last ~10 user entries before a synthetic no-op
-assistant turn — the fingerprint of a `claude -c` resume. Recall is
-incomplete: resumes after Ctrl+C or crash leave no trace, so the count
-is a *lower bound* (hover the card for the caveat). JSON exports
-include a top-level `resumes` array and a per-turn `is_resume_marker`
-boolean; CSV does not add new columns.
+Footer shows session totals + **cache savings** vs a hypothetical no-cache
+run. Conditional dashboard cards appear when their feature was used in the
+session: **Cache TTL mix** (when any 1h-tier cache writes happened),
+**Extended thinking engagement** (when any turn carried a `thinking` block),
+**Tool calls** (top-3 tool names), **Session resumes** (timeline divider at
+each `claude -c` resume point, detected from `/exit` + synthetic-turn
+fingerprint — lower-bound count), and the **Usage Insights** panel
+(prose-style pattern characterisations inspired by Anthropic's `/usage`
+command, auto-hide below threshold, exposed in JSON under `usage_insights`
+and in Markdown under `## Usage Insights`).
 
-**v1.5.0+** adds a **Usage Insights** panel to the HTML dashboard —
-prose-style characterisations of usage patterns inspired by Anthropic's
-`/usage` command (e.g. *"38% of cost came from sessions running 3+
-subagents"*, *"72% of cost was spent on turns with ≥150k context
-filled"*). 10 candidate insights compute against the report with
-auto-hide thresholds; only those that cross the bar render. The
-highest-value passing insight sits above-the-fold; the rest collapse
-into a native `<details>/<summary>` accordion (no JavaScript). Insights
-also flow into the JSON export under the top-level `usage_insights`
-key (each entry: `id`, `headline`, `body`, `value`, `threshold`,
-`shown`, `always_on`) and into the Markdown export as a flat
-`## Usage Insights` bullet list. Text and CSV outputs are unchanged.
-Each session dict additionally gains a `duration_seconds` field
-(integer, computed from raw timestamps) used by the long-session and
-session-pacing insights.
+## Model comparison
 
-## Model comparison (`--compare`)
+Reached only when `$ARGUMENTS[0]` is `compare`, `compare-prep`, or
+`count-tokens` (see the Dispatch section at the top of this file). Covers
+two modes — **controlled** session pair and **observational** project
+aggregate — plus a separate API-key-only `--count-tokens-only` tool.
 
-**Only invoke when the user explicitly types `--compare` / `--compare-prep`
-/ `--count-tokens-only` in a command or explicitly asks to "run a compare
-report". Do not dispatch from inferred intent — see the trigger-discipline
-clause in the frontmatter.**
+**For Claude subscription-plan users, `--compare` is the mode you want.**
+It reads local JSONLs — no API key needed. `--count-tokens-only` is a
+narrow pre-capture API-key tool, **not** the subscription path; do not
+suggest it when the user is comparing two subscription-plan sessions.
 
-Compares two Claude Code sessions (or two sets of sessions) on tokens, cost,
-cache behaviour, tool-call fan-out, and IFEval-style instruction compliance.
-Two modes: **controlled** (session pair running the canonical suite) and
-**observational** (project-level aggregate across model families).
-
-**For Claude subscription-plan users:** `--compare` is the mode you want.
-Claude Code authenticates via your subscription transparently and writes the
-session JSONLs to `~/.claude/projects/…`. The skill reads those JSONLs
-locally — **no API key is needed** for `--compare` or `--compare-prep` or
-any of the renderers. Only the separate `--count-tokens-only` mode (§below)
-needs an API key, and it is a narrow pre-capture smoke test — not the tool
-for measuring subscription-plan token usage.
-
-```bash
-# Print the capture protocol + canonical 10-prompt suite
-session-metrics --compare-prep > /tmp/suite.md     # defaults to 4.6 vs 4.7
-session-metrics --compare-prep claude-opus-4-7 claude-opus-4-8
-
-# Controlled compare (both sides ran the suite) — the subscription workflow
-session-metrics --compare last-opus-4-6 last-opus-4-7 --output md
-
-# Controlled compare with shareable HTML dashboard (single self-contained file)
-session-metrics --compare last-opus-4-6 last-opus-4-7 --output html
-
-# Mask freeform prompt fingerprints before sharing
-session-metrics --compare last-opus-4-6 last-opus-4-7 --output html --redact-user-prompts
-
-# Observational aggregate across every session of each family in the project
-session-metrics --compare all-opus-4-6 all-opus-4-7 --yes
-```
-
-Each prompt in the suite carries a sentinel line
-(`[session-metrics:compare-suite:v1:prompt=<name>]`) so the skill knows which
-turn is which and runs the matching Python predicate against the assistant's
-text. Summary strip surfaces the IFEval pass-rate delta alongside the cost
-delta so quality and cost are read together.
-
-**HTML output (v1.6.0+)**: `--output html` for compare mode emits a single
-self-contained HTML document (dashboard + detail fused — no split). Layout:
-advisory banners at top, per-side model cards, KPI summary strip, a
-Quality-vs-cost card that juxtaposes cost ratio with IFEval Δ, per-turn table
-with ratio heatmap tint (Mode 1) or aggregate detail (Mode 2), inline
-histogram of per-turn input-token ratios (mean / p50 / p95), and a
-reproducibility stamp. Pass `--redact-user-prompts` to swap freeform
-fingerprint snippets for a `[redacted]` marker; sentinel-tagged suite prompts
-stay visible because they're canonical and non-PII.
-
-**Dashboard hint (v1.6.0+)**: regular single-session and `--project-cost`
-dashboards surface a `model_compare` Usage Insights card when the project's
-session dir contains ≥ 2 distinct Anthropic model families. Copy escalates
-from "detected, run `--compare-prep` to benchmark" (before the user tries
-`--compare`) to "refresh attribution with a new run" (after). Suppress with
-`--no-model-compare-insight`.
-
-**`count_tokens` API mode (v1.6.0+, narrow use case)**: `--count-tokens-only`
-hits `POST /v1/messages/count_tokens` once per prompt × model and prints an
-input-token ratio table — no inference, no output/cost data. It **requires
-an API key** because the Anthropic endpoint requires one; that is an
-API-side gate, not a design choice. Pair with `--compare-models A B` to
-choose the two model IDs (defaults: `claude-opus-4-6` vs `claude-opus-4-7`).
-
-> **Do not reach for `--count-tokens-only` to measure subscription-plan
-> token usage.** Subscription auth and the API-key `count_tokens` endpoint
-> are separate billing / auth paths. To compare real Claude subscription
-> sessions on two models, use `--compare` against the two session JSONLs
-> (produced by running the same prompts through each model via `/model`
-> inside Claude Code). `--count-tokens-only` is only useful when you want
-> a pre-capture tokenizer smoke test before running sessions at all, or
-> when you have an API key and don't want to pay inference cost just to
-> see the tokenizer delta.
-
-Full walkthrough + interpretation guide + methodology caveats:
-[`references/model-compare.md`](references/model-compare.md).
+**Before proposing any compare-mode command, read
+[`references/model-compare.md`](references/model-compare.md).** That doc
+covers the full capture protocol, CLI flag table, Mode 1 vs Mode 2 output
+contracts, prompt-suite catalogue, IFEval predicates, HTML variant layout,
+`count_tokens` caveats, and troubleshooting. The eager content in this
+file deliberately stays minimal so single-session reports don't pay for
+compare-mode context they don't use.
 
 ## Reference files
 
 - [`references/pricing.md`](references/pricing.md) — Per-model token prices used
-  for cost calculation. Read this when the user asks about pricing or if you need
-  to add a new model.
+  for cost calculation. Read when the user asks about pricing or you need to
+  add a new model.
 - [`references/jsonl-schema.md`](references/jsonl-schema.md) — JSONL entry
-  structure. Read this when debugging missing data or extending the script.
+  structure + full output-column semantics, cache-TTL split rationale, content-
+  block distribution, resume detection. Read when debugging missing data,
+  extending the script, or interpreting any non-obvious column/key.
 - [`references/model-compare.md`](references/model-compare.md) — `--compare`
   workflow, prompt-suite catalogue, IFEval predicates, interpretation guide.
+  Read when `$ARGUMENTS[0]` routes into compare mode.
 
 ## How session detection works
 
