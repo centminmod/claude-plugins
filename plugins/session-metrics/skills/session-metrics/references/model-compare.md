@@ -22,63 +22,326 @@ If you just want per-session metrics for today's work, don't use this — run `s
 
 ---
 
-## Two modes
+## Entry points
 
-| Mode | Input | Output | Validity |
-|------|-------|--------|----------|
-| **Controlled** (Mode 1) | Two single-session JSONLs that both ran the canonical suite | Per-turn paired table, IFEval column, tokenizer-ratio summary | Clean attribution. Same prompts → ratio = tokenizer + output-length delta only. |
-| **Observational** (Mode 2) | `all-<family>` or two project-level specifiers | Aggregate-only cards, no per-turn pairing | Drift summary. Conflates tokenizer shift with prompt-distribution shift. |
+Four CLI surfaces. Pick the one that matches the input the user already has:
 
-`auto` scope (default) picks Mode 1 for session pairs, Mode 2 for any `all-<family>` arg. Force with `--compare-scope session|project`.
+| Flag | Input | Output | Auth | Validity |
+|------|-------|--------|------|----------|
+| **`--compare-run`** *(preferred)* | Model IDs only (defaults to `[1m]` pair) | Auto-captures two sessions via `claude -p` headless, then renders Mode 1 report | Claude subscription (inherits Claude Code auth) | Clean attribution, same prompts both sides, no human-in-the-loop variance. |
+| **`--compare A B`** Mode 1 (controlled) | Two single-session JSONLs that both ran the canonical suite | Per-turn paired table, IFEval column, tokenizer-ratio summary | None (reads local JSONL) | Clean attribution if both ran the canonical suite. |
+| **`--compare A B`** Mode 2 (observational) | `all-<family>` or two project-level specifiers | Aggregate-only cards, no per-turn pairing | None (reads local JSONL) | Drift summary. Conflates tokenizer shift with prompt-distribution shift. |
+| **`--count-tokens-only`** | Prompt suite + model IDs | Input-token counts only, no inference | `ANTHROPIC_API_KEY` | Input-only. Can't measure output/cost. Use for a pre-capture tokenizer smoke test. |
+
+`--compare` `auto` scope (default) picks Mode 1 for session pairs, Mode 2 for any `all-<family>` arg. Force with `--compare-scope session|project`.
+
+**Default model pair (for `--compare-run` and `--compare-prep`):**
+`claude-opus-4-6[1m]` vs `claude-opus-4-7[1m]` — matches Claude Code's
+shipping Opus tier. Users opt into the 200k variants by passing the
+unsuffixed IDs. `--count-tokens-only` keeps the unsuffixed defaults
+because the Anthropic API endpoint does not accept the `[1m]` tag.
 
 ---
 
-## Workflow A — Controlled comparison (recommended)
+## Workflow A — Automated (recommended)
 
-### 1. Print the capture protocol + prompts
+**One command.** No `/model` juggling, no paste-10-prompts-twice,
+no `/exit` dance. The skill spawns two [headless Claude Code](https://code.claude.com/docs/en/headless)
+sub-processes under the hood (one per model), feeds each the canonical
+suite, then runs `--compare` on the resulting JSONL pair. Runs entirely
+against local JSONLs — no `ANTHROPIC_API_KEY` involved.
 
-```bash
-session-metrics --compare-prep > /tmp/compare-prompts.md
+### Prerequisites
+
+- **A Claude subscription plan** (Pro / Max / Team / Enterprise).
+  Headless `claude -p` inherits whatever auth the interactive CLI is
+  using — the same session quota, the same models.
+- **`claude` on your PATH.** Verify with `claude --version`.
+- **`/model` access to both models.** Headless uses the same entitlement
+  system as interactive; if `/model claude-opus-4-6` doesn't work
+  interactively, `claude -p --model claude-opus-4-6` won't either. Run
+  `/model` in any existing session to inspect the picker.
+
+### One command
+
+```
+/session-metrics compare-run claude-opus-4-6 claude-opus-4-7
 ```
 
-Defaults to `claude-opus-4-6` vs `claude-opus-4-7`. Override with positional model IDs:
+(Or from a shell: `uv run python <skill-dir>/scripts/session-metrics.py
+--compare-run claude-opus-4-6 claude-opus-4-7`.)
 
-```bash
-session-metrics --compare-prep claude-opus-4-7 claude-opus-4-8
+### The 4-way Opus combo
+
+The two positional args accept any model ID your Claude subscription
+exposes via `/model`. For the Opus 4 family that's typically these
+four IDs (two models × two context tiers):
+
+| ID | Variant |
+|----|---------|
+| `claude-opus-4-6` | 4.6, default context tier |
+| `claude-opus-4-7` | 4.7, default context tier |
+| `claude-opus-4-6[1m]` | 4.6, 1M-context tier |
+| `claude-opus-4-7[1m]` | 4.7, 1M-context tier |
+
+Any two of those IDs can be passed to `--compare-run`. Pick the pair
+that matches what you are actually deciding:
+
+| Pair | What the cost ratio measures |
+|------|------------------------------|
+| 4-6 vs 4-7 *(same tier)* | Tokenizer delta at default tier. |
+| 4-6[1m] vs 4-7[1m] *(same tier)* | Tokenizer delta at 1M tier. |
+| 4-6 vs 4-6[1m] *(same model)* | Pure context-tier delta. |
+| 4-7 vs 4-7[1m] *(same model)* | Same, for 4.7. |
+| 4-6 vs 4-7[1m] *(mixed)* | Tokenizer **and** tier. |
+| 4-6[1m] vs 4-7 *(mixed)* | Same, flipped. |
+
+Mixed-tier pairs are valid but will fire the compare report's
+existing `context-tier-mismatch` advisory — the ratio then conflates
+tokenizer shift with window-tier shift. Match tiers on both sides
+when you want a clean tokenizer-only read.
+
+Quote the brackets in an interactive shell: `'claude-opus-4-7[1m]'`
+(bash / zsh treat `[…]` as a glob pattern). The slash-command
+form (`/session-metrics compare-run …` inside Claude Code)
+pre-tokenizes args, so quoting is unnecessary there.
+
+The run will:
+
+1. Create a throwaway scratch directory under `$TMPDIR` (override with
+   `--compare-run-scratch-dir DIR`).
+2. Gate on interactive confirmation — it prints *"about to run 20
+   headless Claude Code invocations (10 prompts × 2 models) against
+   your subscription quota"* and waits for `y`. Bypass with `--yes` /
+   `-y` (required on non-TTY stdin).
+3. For side A, mint one fresh session UUID and loop the 10 suite
+   prompts through `claude -p --session-id <uuid>` (first) then
+   `claude -p --resume <uuid>` (remaining nine). All 10 turns land in
+   a single JSONL. Repeat for side B with a different UUID.
+4. Auto-invoke the existing `--compare` renderer on the two JSONL
+   paths. You get the same HTML / Markdown / JSON report as the
+   manual workflow.
+
+Every `claude -p` subprocess inherits a pinned tool set and permission
+mode so both sides are symmetric:
+
+- `--allowedTools "Bash,Read,Write,Edit,Glob,Grep"` (override with
+  `--compare-run-allowed-tools`)
+- `--permission-mode bypassPermissions` (override with
+  `--compare-run-permission-mode`; pass `""` to omit)
+- `--output-format json` (for deterministic stdout parsing)
+
+Optional safety belts:
+
+- `--compare-run-max-budget-usd USD` — per-subprocess cost ceiling
+  (Claude Code's own `--max-budget-usd`).
+- `--compare-run-per-call-timeout SECONDS` — wall-clock timeout per
+  prompt; default 900 (15 min) because the `tool_heavy_task` prompt
+  can fan out.
+
+If any single `claude -p` call fails, the orchestrator aborts with
+the stderr from that call and leaves the partial JSONL on disk for
+inspection. No retry loop — Claude Code itself handles transient
+rate-limit retries internally (via `system/api_retry` events).
+
+### Typical output
+
+```
+About to run --compare-run: 10 prompts × 2 models = 20 headless Claude Code invocations.
+  Side A: claude-opus-4-6   Side B: claude-opus-4-7
+  Scratch dir: /tmp/sm-compare-run-abc123
+Each call runs full inference and counts against your subscription quota / rate limit.
+Proceed? [y/N]: y
+
+=== Side A: claude-opus-4-6  session_id=<uuid-a> ===
+  [claude-opus-4-6] prompt 1/10: claudemd_summarise
+  [claude-opus-4-6] prompt 2/10: english_prose
+  …
+=== Side B: claude-opus-4-7  session_id=<uuid-b> ===
+  [claude-opus-4-7] prompt 1/10: claudemd_summarise
+  …
+=== Capture complete. Rendering compare report (A=<uuid-a>, B=<uuid-b>) ===
+<compare report output follows>
 ```
 
-### 2. Capture side A
+### When to use Workflow B (manual) instead
 
-1. Start a fresh Claude Code session in an **empty scratch directory** (no large CLAUDE.md, no pre-existing memory).
-2. Run `/model claude-opus-4-6` (or whichever side A).
-3. Verify: run `/model` with no args — should echo the model ID.
-4. Paste each of the 10 prompts from the suite in order. Let each complete before pasting the next.
-5. Exit.
+Fall back to the manual protocol below when any of these apply:
 
-### 3. Capture side B
+- You don't have `claude` on PATH (e.g. CI container without the CLI installed).
+- Your plan exposes `/model` differently in interactive vs headless and
+  the automated run can't reach one of the models.
+- You want a human in the loop for each prompt (e.g. debugging why
+  one side's tool-heavy prompt behaves oddly before committing to a
+  full 20-call run).
 
-Repeat in a **new** fresh session with `/model claude-opus-4-7` (or your side B). Paste the same 10 prompts in the same order.
+---
 
-### 4. Generate the report
+## Workflow B — Manual controlled capture (fallback)
+
+Five ordered steps. Runs entirely against local JSONL files — no
+`ANTHROPIC_API_KEY` involved at any point.
+
+### Prerequisites
+
+- **A Claude subscription plan** (Pro / Max / Team / Enterprise). The
+  skill reads whatever Claude Code writes to `~/.claude/projects/…` —
+  auth is whatever Claude Code is already using.
+- **Access to both models via `/model`.** Open any existing Claude
+  Code session and type `/model`; the popup lists the models your
+  account can switch to. If `claude-opus-4-6` or `claude-opus-4-7` is
+  not listed, stop here — your plan tier does not expose the pair you
+  want to compare, and the rest of this workflow cannot proceed.
+- **The `session-metrics` skill installed** (plugin marketplace or
+  direct copy — see the repo README).
+
+### Step 1 — Create an empty scratch directory
+
+A throwaway project dir isolates the capture from any `CLAUDE.md`,
+memory files, or prior session state in your real projects. Without
+this, side A and side B warm different caches and the ratios no
+longer attribute cleanly to the model.
 
 ```bash
-session-metrics --compare last-opus-4-6 last-opus-4-7 --output md
+mkdir -p /tmp/compare-4-6-vs-4-7
+cd /tmp/compare-4-6-vs-4-7
 ```
 
-Or pass explicit JSONL paths / session UUIDs.
+**Every subsequent step runs from this directory.** Step 5's
+`last-opus-4-6` / `last-opus-4-7` magic tokens resolve only against
+the current working directory's project slug — launching the final
+compare from a different shell dir will find no sessions.
 
-### Output
+### Step 2 — Print the 10-prompt suite
 
-The report surfaces:
+In the scratch dir, start a Claude Code session:
 
-- **Summary strip** — input/output/total/cost ratios (B vs A), IFEval pass rate per side, pass-rate delta.
-- **Per-turn table** — paired rows with A and B tokens, ratios, and a `prompt` column naming the suite prompt. The `A✓` / `B✓` columns show IFEval pass/fail.
-- **Advisories banner** — flags context-tier mismatch, cache-warmth drift (>10 pp), suite-version mismatch, empty sides.
+```bash
+claude
+```
+
+Invoke the prep command (skill dispatch; `$ARGUMENTS[0]` = `compare-prep`):
+
+```
+/session-metrics compare-prep
+```
+
+The skill prints the capture protocol followed by all 10 prompts to
+stdout. Copy the prompts somewhere you can paste from twice — a
+second terminal tab, an editor buffer, or:
+
+```
+/session-metrics compare-prep > /tmp/compare-prompts.md
+```
+
+Each prompt body begins with a sentinel like
+`[session-metrics:compare-suite:v1:prompt=claudemd_summarise]`. **Do
+not strip it** when pasting — the compare report uses the sentinel to
+pair A-side and B-side turns back to their source prompt and to run
+the IFEval predicate.
+
+Default pair is `claude-opus-4-6` vs `claude-opus-4-7`. To prep for a
+different pair, pass two positional model IDs:
+
+```
+/session-metrics compare-prep claude-opus-4-7 claude-opus-4-8
+```
+
+Exit this prep session with `/exit` before Step 3.
+
+### Step 3 — Capture side A (Opus 4.6)
+
+Still in the scratch dir, start a **fresh** Claude Code session:
+
+```bash
+claude
+```
+
+Switch to the baseline model and verify the switch took effect:
+
+```
+/model claude-opus-4-6
+/model
+```
+
+The second `/model` call (no argument) echoes the currently-active
+model. Confirm it reads `claude-opus-4-6` before pasting any prompts
+— otherwise the capture is invalid.
+
+Paste the 10 prompts **one at a time, in order**. Wait for each
+reply to fully finish (no streaming cursor) before pasting the next.
+Pasting two at once interleaves tool calls and breaks the per-turn
+pairing.
+
+When all 10 prompts have completed, exit:
+
+```
+/exit
+```
+
+Claude Code writes the session JSONL to
+`~/.claude/projects/-tmp-compare-4-6-vs-4-7/<uuid>.jsonl`.
+
+### Step 4 — Capture side B (Opus 4.7)
+
+Repeat Step 3 in a **new** fresh Claude Code session from the same
+scratch dir:
+
+```bash
+claude
+```
+
+```
+/model claude-opus-4-7
+/model
+```
+
+Paste the **same 10 prompts in the same order**. Wait for each,
+then `/exit`.
+
+### Step 5 — Generate the compare report
+
+Still in the scratch dir:
+
+```
+/session-metrics compare last-opus-4-6 last-opus-4-7 --output html
+```
+
+(Or from any shell, bypassing the skill dispatch:
+`uv run python <skill-dir>/scripts/session-metrics.py --compare last-opus-4-6 last-opus-4-7 --output html`.)
+
+`last-opus-4-6` resolves to the most recent qualifying
+single-session JSONL for the `opus-4-6` family **in the current
+project slug**; same for `last-opus-4-7`. Because you captured both
+sides from `/tmp/compare-4-6-vs-4-7`, both tokens resolve to the
+sessions you just recorded.
+
+If auto-resolution returns nothing (usually because a session was
+shorter than the 5-user-turn minimum), pass explicit JSONL paths:
+
+```
+/session-metrics compare \
+  ~/.claude/projects/-tmp-compare-4-6-vs-4-7/<uuid-a>.jsonl \
+  ~/.claude/projects/-tmp-compare-4-6-vs-4-7/<uuid-b>.jsonl \
+  --output html
+```
+
+Or loosen the filter with `--compare-min-turns 1`.
+
+Output-format options: `--output text` (stdout, default), `md`,
+`json`, `csv`, `html`. HTML is the richest and is self-contained
+(one file, shareable).
+
+### What the output shows
+
+- **Summary strip** — input / output / total / cost ratios (B ÷ A), IFEval pass rate per side, pass-rate delta in percentage points.
+- **Per-turn table** — one row per paired turn with A and B tokens, ratios, a `prompt` column naming the suite prompt, and `A✓` / `B✓` columns showing IFEval pass/fail.
+- **Advisories banner** — flags `context-tier-mismatch` (e.g. one side on 1M-context tier), `cache-share-drift` (sides differ by >10 pp in cache-read share), `suite-version-mismatch`, empty-side. **Read any advisory before trusting the headline ratio.**
 
 ### Interpretation
 
-- **Cost ratio ≫ 1.0 with identical pricing** → tokenizer or output-length driven. Pricing is identical between `claude-opus-4-6` and `claude-opus-4-7` at the time of writing, so the full cost delta is tokenizer. See [`references/pricing.md`](pricing.md).
-- **IFEval pass rate up + cost up** → classic quality/cost trade-off. Read together.
+- **Cost ratio ≫ 1.0 with identical pricing** → tokenizer- or output-length-driven. Pricing is identical between `claude-opus-4-6` and `claude-opus-4-7` at the time of writing, so the full cost delta is tokenizer (see [`pricing.md`](pricing.md)).
+- **IFEval pass rate up + cost up** → classic quality/cost trade-off. Read the two together; the [Should I switch?](#should-i-switch-decision-framework) table below codifies the decision.
 - **Near-1.0× on CJK prose, large ratio on code / CLAUDE.md** → expected; Claude 4.7's tokenizer compresses code/prose differently than CJK.
 
 ---

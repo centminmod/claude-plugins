@@ -2937,7 +2937,7 @@ def _compare_prep_protocol(model_a: str, model_b: str) -> str:
         f"     let each complete before pasting the next.\n"
         f"  4. Exit. Start a NEW fresh session.\n"
         f"  5. Run:     /model {model_b}\n"
-        f"     Verify:  /model          (expect: {model_b!r} or {model_b + '[1m]'!r})\n"
+        f"     Verify:  /model          (expect: {model_b!r})\n"
         f"  6. Paste the same prompts in the same order.\n"
         f"  7. Exit. Then run:\n"
         f"        session-metrics --compare last-<family-A> last-<family-B> --output md\n"
@@ -2979,10 +2979,14 @@ def _run_compare_prep(
     if out is None:
         out = sys.stdout
     models = list(models) if models else []
+    # Defaults match what Claude Code actually ships: both Opus 4.6 and
+    # 4.7 route to their 1M-context tier (``[1m]``) unless the user picks
+    # the 200k variant explicitly. Comparing ``[1m]`` vs ``[1m]`` therefore
+    # reflects real-world usage, not a laboratory baseline.
     if len(models) == 0:
-        model_a, model_b = "claude-opus-4-6", "claude-opus-4-7"
+        model_a, model_b = "claude-opus-4-6[1m]", "claude-opus-4-7[1m]"
     elif len(models) == 1:
-        model_a, model_b = models[0], "claude-opus-4-7"
+        model_a, model_b = models[0], "claude-opus-4-7[1m]"
     elif len(models) == 2:
         model_a, model_b = models[0], models[1]
     else:
@@ -3381,3 +3385,379 @@ def _run_count_tokens_only(
     _render_count_tokens_text(
         results, effective_models, out=out, fallback_from=fallback_from,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 10 — Automated headless capture (``--compare-run``)
+# ---------------------------------------------------------------------------
+#
+# One-command alternative to the manual capture protocol in
+# ``references/model-compare.md``. Spawns two ``claude -p`` (headless)
+# sessions — one per model — feeds each the canonical prompt suite, then
+# hands the resulting JSONL pair off to the existing :func:`_run_compare`
+# renderer. Designed for subscription-plan users who want zero variance
+# between sides: same prompts, same order, same tool set, same working
+# directory, no human-in-the-loop typos.
+#
+# Why not run this from inside an interactive Claude Code session? The
+# headless docs are explicit that user-invoked skills aren't available
+# under ``-p``. So the orchestrator runs from a plain shell, spawns
+# ``claude -p`` sub-processes itself, and reads the JSONLs Claude Code
+# writes to ``~/.claude/projects/<slug>/`` as a side effect.
+
+_DEFAULT_COMPARE_RUN_ALLOWED_TOOLS = "Bash,Read,Write,Edit,Glob,Grep"
+_DEFAULT_COMPARE_RUN_PERMISSION_MODE = "bypassPermissions"
+_DEFAULT_COMPARE_RUN_TIMEOUT_SEC = 900.0  # 15 min / prompt; tool-heavy #5 is slowest
+
+
+class CompareRunError(RuntimeError):
+    """Raised when the ``--compare-run`` orchestrator can't continue.
+
+    Covers three failure classes: ``claude`` binary not on PATH, a
+    non-zero exit from a ``claude -p`` subprocess, or a JSON parse
+    failure on the subprocess stdout. The caller catches and prints
+    to stderr with exit 1 — partial JSONLs from the prior prompts are
+    left in place so the user can inspect or resume.
+    """
+
+
+def _claude_headless_call(
+    prompt: str,
+    *,
+    model: str,
+    session_id: str,
+    is_first_turn: bool,
+    cwd: Path,
+    allowed_tools: str,
+    permission_mode: str | None,
+    max_budget_usd: float | None,
+    timeout: float,
+    subprocess_run,
+) -> dict:
+    """Shell out to ``claude -p`` for one prompt and return the parsed JSON result.
+
+    First-turn invocations pass ``--session-id <uuid>`` to seed the JSONL
+    filename deterministically; continuation turns pass ``--resume <uuid>``
+    so all turns append to the same file. ``--output-format json`` gives us
+    ``{session_id, result, usage, total_cost_usd, ...}`` on stdout for
+    cost telemetry and success confirmation.
+
+    Raises :class:`CompareRunError` on FileNotFoundError (claude not on
+    PATH), non-zero returncode, or stdout that doesn't parse as JSON.
+
+    ``subprocess_run`` injection is a test seam; production callers pass
+    ``subprocess.run``.
+    """
+    cmd = ["claude", "-p", prompt, "--model", model, "--output-format", "json"]
+    if is_first_turn:
+        cmd += ["--session-id", session_id]
+    else:
+        cmd += ["--resume", session_id]
+    if allowed_tools:
+        cmd += ["--allowedTools", allowed_tools]
+    if permission_mode:
+        cmd += ["--permission-mode", permission_mode]
+    if max_budget_usd is not None:
+        cmd += ["--max-budget-usd", str(max_budget_usd)]
+    try:
+        result = subprocess_run(
+            cmd,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise CompareRunError(
+            "'claude' binary not found on PATH — install Claude Code first "
+            "or run from a shell where the CLI is reachable."
+        ) from exc
+    if result.returncode != 0:
+        raise CompareRunError(
+            f"claude -p failed for model={model!r} "
+            f"(returncode={result.returncode}). "
+            f"stderr[:400]={(result.stderr or '')[:400]!r}"
+        )
+    try:
+        return json.loads(result.stdout or "")
+    except json.JSONDecodeError as exc:
+        raise CompareRunError(
+            f"claude -p returned non-JSON output for model={model!r}: {exc}. "
+            f"stdout[:200]={(result.stdout or '')[:200]!r}"
+        ) from exc
+
+
+def _run_compare_side(
+    model: str,
+    session_id: str,
+    suite: dict,
+    *,
+    cwd: Path,
+    allowed_tools: str,
+    permission_mode: str | None,
+    max_budget_usd: float | None,
+    timeout: float,
+    subprocess_run,
+    progress_out,
+) -> list[dict]:
+    """Feed the full prompt suite into one model via ``claude -p``.
+
+    Loops ``suite`` in iteration order (which matches filename order on
+    disk). First iteration uses ``--session-id``; later iterations use
+    ``--resume`` against the same UUID so every turn lands in a single
+    JSONL at ``~/.claude/projects/<slug-of-cwd>/<session_id>.jsonl``.
+
+    Returns the list of per-prompt JSON results from stdout (for
+    diagnostics / rollup). Raises :class:`CompareRunError` on the
+    first failure — the partial JSONL is left on disk for inspection.
+    """
+    results: list[dict] = []
+    prompts = list(suite.items())
+    total = len(prompts)
+    for i, (name, entry) in enumerate(prompts, 1):
+        progress_out.write(
+            f"  [{model}] prompt {i}/{total}: {name}\n"
+        )
+        progress_out.flush()
+        out_json = _claude_headless_call(
+            entry["body"],
+            model=model,
+            session_id=session_id,
+            is_first_turn=(i == 1),
+            cwd=cwd,
+            allowed_tools=allowed_tools,
+            permission_mode=permission_mode,
+            max_budget_usd=max_budget_usd,
+            timeout=timeout,
+            subprocess_run=subprocess_run,
+        )
+        results.append({"name": name, "response": out_json})
+    return results
+
+
+def _confirm_compare_run_or_exit(
+    model_a: str,
+    model_b: str,
+    prompt_count: int,
+    *,
+    scratch_dir: Path,
+    assume_yes: bool,
+    stdin=None,
+) -> None:
+    """Confirmation gate before firing 2 × N headless inference calls.
+
+    Mirrors :func:`_confirm_count_tokens_or_exit` — ``--yes`` bypass,
+    non-TTY stdin without ``--yes`` is a hard refusal, interactive prompt
+    defaults to no. Unlike count-tokens mode, each call here runs full
+    inference and burns real subscription quota, so the message
+    emphasises that rather than rate-limit requests.
+    """
+    if stdin is None:
+        stdin = sys.stdin
+    total_calls = 2 * prompt_count
+    print(
+        f"About to run --compare-run: {prompt_count} prompts × 2 models = "
+        f"{total_calls} headless Claude Code invocations.",
+        file=sys.stderr,
+    )
+    print(
+        f"  Side A: {model_a}   Side B: {model_b}",
+        file=sys.stderr,
+    )
+    print(
+        f"  Scratch dir: {scratch_dir}",
+        file=sys.stderr,
+    )
+    print(
+        "Each call runs full inference and counts against your subscription "
+        "quota / rate limit.",
+        file=sys.stderr,
+    )
+    if assume_yes:
+        print("(--yes given; proceeding)", file=sys.stderr)
+        return
+    if not getattr(stdin, "isatty", lambda: False)():
+        print(
+            "[error] --compare-run requires --yes when stdin is not a TTY "
+            "(prevents surprise quota burn in scripts).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        answer = input("Proceed? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n(aborted)", file=sys.stderr)
+        sys.exit(0)
+    if not answer.startswith("y"):
+        print("(aborted)", file=sys.stderr)
+        sys.exit(0)
+
+
+def _run_compare_run(
+    model_a: str,
+    model_b: str,
+    *,
+    scratch_dir: Path | None = None,
+    suite_dir: Path | None = None,
+    assume_yes: bool = False,
+    allowed_tools: str = _DEFAULT_COMPARE_RUN_ALLOWED_TOOLS,
+    permission_mode: str | None = _DEFAULT_COMPARE_RUN_PERMISSION_MODE,
+    max_budget_usd: float | None = None,
+    per_call_timeout: float = _DEFAULT_COMPARE_RUN_TIMEOUT_SEC,
+    formats: list[str] | None = None,
+    single_page: bool = False,
+    chart_lib: str = "highcharts",
+    redact_user_prompts: bool = False,
+    tz_offset: float = 0.0,
+    tz_label: str = "UTC",
+    use_cache: bool = True,
+    include_subagents: bool = False,
+    pair_by: str = "fingerprint",
+    min_turns: int = 5,
+    allow_suite_mismatch: bool = False,
+    subprocess_run=None,
+    uuid_factory=None,
+    stdin=None,
+    progress_out=None,
+    tempfile_mkdtemp=None,
+    auto_resume: bool = True,
+) -> dict:
+    """Orchestrator for ``--compare-run``: capture both sides, then compare.
+
+    End-to-end flow:
+
+    1. Resolve or create a scratch directory. Every ``claude -p``
+       subprocess runs with this as cwd, which determines the project
+       slug Claude Code writes to.
+    2. Load the canonical prompt suite and gate on user confirmation
+       (``--yes`` bypass; non-TTY refusal without it).
+    3. For each side, mint a fresh UUID and pump the 10 prompts
+       through ``claude -p --session-id <uuid>`` (first) then
+       ``claude -p --resume <uuid>`` (remaining). Each side's turns
+       land in a single JSONL under
+       ``~/.claude/projects/<slug>/<uuid>.jsonl``.
+    4. Hand the two UUIDs off to :func:`_run_compare` — the same
+       renderer the manual Workflow A uses. User sees the same HTML /
+       Markdown / JSON report at the end either way.
+
+    All the I/O-ish surfaces (subprocess, uuid, tempfile, stdin,
+    progress output) are injected so tests can exercise the whole
+    orchestrator without spawning real processes. Returns a small
+    diagnostic dict (used by tests; the CLI caller ignores it).
+    """
+    import subprocess as _subprocess  # stdlib-only; lazy-loaded
+    import tempfile as _tempfile
+    import uuid as _uuid
+
+    if subprocess_run is None:
+        subprocess_run = _subprocess.run
+    if uuid_factory is None:
+        uuid_factory = lambda: str(_uuid.uuid4())  # noqa: E731
+    if tempfile_mkdtemp is None:
+        tempfile_mkdtemp = lambda: Path(  # noqa: E731
+            _tempfile.mkdtemp(prefix="sm-compare-run-")
+        )
+    if progress_out is None:
+        progress_out = sys.stderr
+    formats = formats or []
+
+    # Step 1: scratch dir. Resolve symlinks (``/tmp`` → ``/private/tmp`` on
+    # macOS) so the slug we compute later matches what Claude Code derives
+    # from its own cwd when the subprocess runs — otherwise the JSONLs land
+    # in one project dir and we look for them in another.
+    if scratch_dir is None:
+        scratch_dir = Path(tempfile_mkdtemp()).resolve()
+    else:
+        scratch_dir = Path(scratch_dir).expanduser().resolve()
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 2: prompt suite + confirmation gate
+    try:
+        suite = _load_prompt_suite(suite_dir)
+    except PromptSuiteError as exc:
+        print(f"[error] prompt suite: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if not suite:
+        print(
+            "[error] prompt suite is empty or missing (expected under "
+            f"{suite_dir or _PROMPT_SUITE_DIR})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    _confirm_compare_run_or_exit(
+        model_a, model_b, len(suite),
+        scratch_dir=scratch_dir, assume_yes=assume_yes, stdin=stdin,
+    )
+
+    # Step 3: capture side A then side B
+    side_uuids: dict[str, str] = {}
+    for side_label, model in (("A", model_a), ("B", model_b)):
+        session_id = uuid_factory()
+        side_uuids[side_label] = session_id
+        print(
+            f"\n=== Side {side_label}: {model}  session_id={session_id} ===",
+            file=progress_out,
+        )
+        try:
+            _run_compare_side(
+                model, session_id, suite,
+                cwd=scratch_dir,
+                allowed_tools=allowed_tools,
+                permission_mode=permission_mode,
+                max_budget_usd=max_budget_usd,
+                timeout=per_call_timeout,
+                subprocess_run=subprocess_run,
+                progress_out=progress_out,
+            )
+        except CompareRunError as exc:
+            print(f"[error] side {side_label} ({model}): {exc}", file=sys.stderr)
+            print(
+                f"[info] partial JSONL (if any) remains at "
+                f"~/.claude/projects/<slug>/{session_id}.jsonl — inspect or "
+                f"re-run once the cause is fixed. scratch_dir={scratch_dir}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Step 4: hand off to the existing compare renderer
+    m = _main()
+    if hasattr(m, "_cwd_to_slug"):
+        slug = m._cwd_to_slug(str(scratch_dir))
+    else:
+        # Fall back: compute slug the same way the main module does.
+        slug = str(scratch_dir).replace("/", "-")
+
+    print(
+        f"\n=== Capture complete. Rendering compare report "
+        f"(A={side_uuids['A']}, B={side_uuids['B']}) ===",
+        file=progress_out,
+    )
+    if auto_resume:
+        _run_compare(
+            side_uuids["A"], side_uuids["B"],
+            slug=slug,
+            pair_by=pair_by,
+            compare_scope="session",
+            min_turns=min_turns,
+            formats=formats,
+            tz_offset=tz_offset,
+            tz_label=tz_label,
+            include_subagents=include_subagents,
+            use_cache=use_cache,
+            single_page=single_page,
+            chart_lib=chart_lib,
+            assume_yes=True,
+            prompt_suite_dir=suite_dir,
+            allow_suite_mismatch=allow_suite_mismatch,
+            redact_user_prompts=redact_user_prompts,
+        )
+
+    return {
+        "scratch_dir": str(scratch_dir),
+        "slug": slug,
+        "side_a_session_id": side_uuids["A"],
+        "side_b_session_id": side_uuids["B"],
+        "suite_prompt_count": len(suite),
+    }

@@ -4627,6 +4627,49 @@ def _build_parser() -> argparse.ArgumentParser:
                         "positional model IDs; defaults to 'claude-opus-4-6 "
                         "claude-opus-4-7'. A single model is accepted for "
                         "input-token measurement without ratios.")
+    # --- Phase 10 — Automated headless capture ---------------------------
+    p.add_argument("--compare-run", nargs="*", metavar="MODEL",
+                   default=None,
+                   help="Fully automated compare: spawns two 'claude -p' "
+                        "(headless) sessions, feeds each the canonical "
+                        "10-prompt suite, then runs --compare on the result. "
+                        "Takes 0-2 positional model IDs; defaults to "
+                        "'claude-opus-4-6[1m] claude-opus-4-7[1m]' because "
+                        "that matches Claude Code's shipping default (1M-"
+                        "context Opus). Pass 'claude-opus-4-6 claude-opus-4-7' "
+                        "to compare the 200k-context variants instead; mixed "
+                        "tiers are accepted and fire the existing context-"
+                        "tier-mismatch advisory on the report. Runs 2 × N "
+                        "inference calls against your subscription quota — "
+                        "confirmation gate requires --yes on non-TTY.")
+    p.add_argument("--compare-run-scratch-dir", metavar="DIR", default=None,
+                   help="Scratch directory for --compare-run captures. "
+                        "Defaults to a fresh mkdtemp under $TMPDIR. The "
+                        "directory becomes the cwd for every 'claude -p' "
+                        "subprocess, which determines the project slug "
+                        "Claude Code writes session JSONLs under.")
+    p.add_argument("--compare-run-allowed-tools", metavar="TOOLS",
+                   default=None,
+                   help="--allowedTools value passed to each 'claude -p' "
+                        "subprocess in --compare-run. Default: "
+                        "'Bash,Read,Write,Edit,Glob,Grep'. Identical on both "
+                        "sides so the tool-call ratio stays comparable.")
+    p.add_argument("--compare-run-permission-mode", metavar="MODE",
+                   default=None,
+                   help="--permission-mode value for every --compare-run "
+                        "subprocess (default: 'bypassPermissions' so the "
+                        "headless calls don't stall waiting for human "
+                        "approval). Pass an empty string to omit the flag.")
+    p.add_argument("--compare-run-max-budget-usd", type=float, default=None,
+                   metavar="USD",
+                   help="Per-subprocess --max-budget-usd ceiling for "
+                        "--compare-run. Not set by default. Threaded to each "
+                        "'claude -p' invocation unchanged.")
+    p.add_argument("--compare-run-per-call-timeout", type=float, default=None,
+                   metavar="SECONDS",
+                   help="Wall-clock timeout for each 'claude -p' subprocess "
+                        "in --compare-run. Default 900s (15 min); the "
+                        "tool-heavy prompt is the usual slowest.")
     return p
 
 
@@ -4699,6 +4742,66 @@ def main() -> None:
             args.compare_models,
             suite_dir=suite_dir,
             assume_yes=args.yes,
+        )
+        return
+
+    if args.compare_run is not None:
+        smc = _load_compare_module()
+        suite_dir = Path(args.compare_prompts).expanduser() if args.compare_prompts else None
+        scratch_dir = Path(args.compare_run_scratch_dir).expanduser() \
+            if args.compare_run_scratch_dir else None
+        # Resolve 0/1/2 positional model IDs to an (A, B) pair. Default is
+        # the 1M-context Opus tier because that is what Claude Code ships
+        # as the default Opus routing — comparing 200k vs 200k is a
+        # deliberate opt-out, not a realistic baseline.
+        _default_a = "claude-opus-4-6[1m]"
+        _default_b = "claude-opus-4-7[1m]"
+        _models = list(args.compare_run)
+        if len(_models) == 0:
+            model_a, model_b = _default_a, _default_b
+        elif len(_models) == 1:
+            model_a, model_b = _models[0], _default_b
+        elif len(_models) == 2:
+            model_a, model_b = _models[0], _models[1]
+        else:
+            print("[error] --compare-run takes 0, 1, or 2 model IDs; "
+                  f"got {len(_models)}", file=sys.stderr)
+            sys.exit(1)
+        # Allow empty string to mean "omit --permission-mode"; None means "use default".
+        if args.compare_run_permission_mode is None:
+            permission_mode = "bypassPermissions"
+        elif args.compare_run_permission_mode == "":
+            permission_mode = None
+        else:
+            permission_mode = args.compare_run_permission_mode
+        allowed_tools = args.compare_run_allowed_tools \
+            or "Bash,Read,Write,Edit,Glob,Grep"
+        timeout = args.compare_run_per_call_timeout or 900.0
+        try:
+            _touch_compare_state_marker(_cwd_to_slug(str(scratch_dir.resolve()))
+                                        if scratch_dir else slug)
+        except (OSError, AttributeError):
+            pass
+        smc._run_compare_run(
+            model_a, model_b,
+            scratch_dir=scratch_dir,
+            suite_dir=suite_dir,
+            assume_yes=args.yes,
+            allowed_tools=allowed_tools,
+            permission_mode=permission_mode,
+            max_budget_usd=args.compare_run_max_budget_usd,
+            per_call_timeout=timeout,
+            formats=formats,
+            single_page=args.single_page,
+            chart_lib=chart_lib,
+            redact_user_prompts=args.redact_user_prompts,
+            tz_offset=tz_offset,
+            tz_label=tz_label,
+            use_cache=not args.no_cache,
+            include_subagents=args.include_subagents,
+            pair_by=args.pair_by,
+            min_turns=args.compare_min_turns,
+            allow_suite_mismatch=args.allow_suite_mismatch,
         )
         return
 

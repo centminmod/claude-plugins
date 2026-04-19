@@ -3293,8 +3293,11 @@ def test_compare_prep_default_models():
     buf = _io_p45.StringIO()
     smc._run_compare_prep([], out=buf)
     txt = buf.getvalue()
-    assert "claude-opus-4-6" in txt
-    assert "claude-opus-4-7" in txt
+    # Default pair is the 1M-context tier because Claude Code ships Opus
+    # routed to ``[1m]``. Comparing ``[1m]`` vs ``[1m]`` reflects real-
+    # world usage; the 200k variants are a deliberate opt-out.
+    assert "claude-opus-4-6[1m]" in txt
+    assert "claude-opus-4-7[1m]" in txt
     assert "PROMPT SUITE (v1" in txt
 
 
@@ -3307,12 +3310,13 @@ def test_compare_prep_custom_models():
 
 
 def test_compare_prep_single_model_defaults_second():
-    # One positional model → A overridden, B stays at the 4.7 default.
+    # One positional model → A overridden, B stays at the 4.7[1m] default
+    # (to match Claude Code's shipping Opus tier).
     buf = _io_p45.StringIO()
     smc._run_compare_prep(["claude-opus-4-5"], out=buf)
     txt = buf.getvalue()
     assert "claude-opus-4-5" in txt
-    assert "claude-opus-4-7" in txt
+    assert "claude-opus-4-7[1m]" in txt
 
 
 def test_compare_prep_three_models_refused(capsys):
@@ -4309,3 +4313,427 @@ def test_cli_count_tokens_custom_models(monkeypatch, capsys):
     # Both models were actually called.
     assert "claude-sonnet-4-6" in seen_models
     assert "claude-sonnet-4-7" in seen_models
+
+
+# ============================================================================
+# Phase 10 — Automated headless capture (--compare-run)
+# ============================================================================
+#
+# The orchestrator spawns ``claude -p`` sub-processes via ``subprocess.run``.
+# These tests inject a fake ``subprocess_run`` that records the argv each
+# call would have used, returns a canned JSON payload, and never actually
+# invokes the CLI. Coverage is aimed at the assembly + dispatch contract:
+# argv composition, first-turn-vs-resume semantics, error propagation,
+# confirmation gate, and scratch-dir resolution. The end-to-end handoff to
+# ``_run_compare`` (which itself has extensive coverage upstream) is
+# stubbed so compare-run tests don't need on-disk fixture JSONLs.
+
+
+class _FakeCompletedProcess:
+    """Minimal ``subprocess.CompletedProcess`` substitute for tests."""
+    def __init__(self, *, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _make_fake_subprocess_run(
+    *,
+    default_stdout='{"result":"ok","session_id":"stub"}',
+    returncode_sequence=None,
+    stderr="",
+):
+    """Build a fake ``subprocess.run`` + the list it records into.
+
+    Returns ``(fake_run, calls)``. Each element of ``calls`` is the argv
+    the caller would have shelled out. ``returncode_sequence`` lets tests
+    make specific invocations fail (e.g. the third call returns 1) while
+    others succeed.
+    """
+    calls: list[list[str]] = []
+    rc_iter = iter(returncode_sequence or [])
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        try:
+            rc = next(rc_iter)
+        except StopIteration:
+            rc = 0
+        return _FakeCompletedProcess(
+            returncode=rc,
+            stdout=default_stdout,
+            stderr=stderr,
+        )
+
+    return fake_run, calls
+
+
+class _FakeTty:
+    """Minimal stdin-like object exposing ``isatty`` for gate tests."""
+    def __init__(self, is_tty: bool):
+        self._is_tty = is_tty
+
+    def isatty(self) -> bool:
+        return self._is_tty
+
+
+def test_compare_run_happy_path_assembles_expected_argv(tmp_path, monkeypatch):
+    """20 invocations (10 prompts × 2 models) land in the right cwd with
+    the right flags. Side A uses ``--session-id`` once then ``--resume``
+    nine times; side B does the same with a different UUID."""
+    fake_run, calls = _make_fake_subprocess_run()
+    uuids = iter(["uuid-a", "uuid-b"])
+    # Patch the compare-module's _run_compare so we don't need real JSONLs.
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+
+    result = smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7",
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: next(uuids),
+        stdin=_FakeTty(False),
+        auto_resume=False,  # skip _run_compare handoff entirely for this test
+    )
+
+    # 10 prompts × 2 models = 20 calls.
+    assert len(calls) == 20
+    # First call for side A uses --session-id, not --resume.
+    first_a = calls[0]
+    assert "claude" == first_a[0]
+    assert "-p" in first_a
+    assert "--model" in first_a and "claude-opus-4-6" in first_a
+    assert "--session-id" in first_a and "uuid-a" in first_a
+    assert "--resume" not in first_a
+    # All nine subsequent side-A calls use --resume, not --session-id.
+    for c in calls[1:10]:
+        assert "--resume" in c and "uuid-a" in c
+        assert "--session-id" not in c
+        assert "claude-opus-4-6" in c
+    # Side B starts at index 10 with --session-id against uuid-b.
+    first_b = calls[10]
+    assert "--session-id" in first_b and "uuid-b" in first_b
+    assert "claude-opus-4-7" in first_b
+    for c in calls[11:20]:
+        assert "--resume" in c and "uuid-b" in c
+        assert "claude-opus-4-7" in c
+    # Each call gets --output-format json, --allowedTools, --permission-mode.
+    for c in calls:
+        assert "--output-format" in c and "json" in c
+        assert "--allowedTools" in c
+        assert "--permission-mode" in c and "bypassPermissions" in c
+    # Diagnostic payload matches what the CLI dispatch consumes.
+    assert result["side_a_session_id"] == "uuid-a"
+    assert result["side_b_session_id"] == "uuid-b"
+    assert result["suite_prompt_count"] == 10
+    assert result["scratch_dir"] == str(tmp_path.resolve())
+
+
+def test_compare_run_claude_missing_raises_compare_run_error(tmp_path, monkeypatch):
+    """FileNotFoundError from subprocess.run → CompareRunError so the
+    caller prints a clear 'claude not on PATH' message and exits 1."""
+    def fake_run(cmd, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory: 'claude'")
+
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    with pytest.raises(SystemExit) as exc:
+        smc._run_compare_run(
+            "claude-opus-4-6", "claude-opus-4-7",
+            scratch_dir=tmp_path,
+            assume_yes=True,
+            subprocess_run=fake_run,
+            uuid_factory=lambda: "u",
+            stdin=_FakeTty(False),
+            auto_resume=False,
+        )
+    assert exc.value.code == 1
+
+
+def test_compare_run_nonzero_returncode_surfaces_as_compare_run_error(
+    tmp_path, monkeypatch, capsys,
+):
+    """A mid-run 'claude -p' failure (returncode=1) aborts with a clear
+    message that mentions the model and preserves partial-JSONL info."""
+    # Second call on side A returns rc=1.
+    fake_run, _calls = _make_fake_subprocess_run(
+        returncode_sequence=[0, 1],
+        stderr="rate limit exceeded",
+    )
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    with pytest.raises(SystemExit) as exc:
+        smc._run_compare_run(
+            "claude-opus-4-6", "claude-opus-4-7",
+            scratch_dir=tmp_path,
+            assume_yes=True,
+            subprocess_run=fake_run,
+            uuid_factory=lambda: "uuid-a",
+            stdin=_FakeTty(False),
+            auto_resume=False,
+        )
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "claude-opus-4-6" in err
+    assert "rate limit exceeded" in err
+    assert "partial JSONL" in err
+
+
+def test_compare_run_malformed_json_output_errors(tmp_path, monkeypatch):
+    """If ``claude -p`` returns returncode=0 but stdout isn't valid JSON,
+    the orchestrator still aborts rather than proceeding with unknown
+    session state."""
+    fake_run, _ = _make_fake_subprocess_run(
+        default_stdout="not json at all",
+    )
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    with pytest.raises(SystemExit) as exc:
+        smc._run_compare_run(
+            "claude-opus-4-6", "claude-opus-4-7",
+            scratch_dir=tmp_path,
+            assume_yes=True,
+            subprocess_run=fake_run,
+            uuid_factory=lambda: "u",
+            stdin=_FakeTty(False),
+            auto_resume=False,
+        )
+    assert exc.value.code == 1
+
+
+def test_compare_run_refuses_non_tty_without_yes(tmp_path, monkeypatch, capsys):
+    """Without ``--yes``, a non-TTY stdin hard-refuses so scripted
+    invocations can't silently burn 20 calls of subscription quota."""
+    fake_run, _ = _make_fake_subprocess_run()
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    with pytest.raises(SystemExit) as exc:
+        smc._run_compare_run(
+            "claude-opus-4-6", "claude-opus-4-7",
+            scratch_dir=tmp_path,
+            assume_yes=False,
+            subprocess_run=fake_run,
+            uuid_factory=lambda: "u",
+            stdin=_FakeTty(False),
+            auto_resume=False,
+        )
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "--yes" in err and "TTY" in err
+
+
+def test_compare_run_creates_scratch_dir_when_none(monkeypatch):
+    """``scratch_dir=None`` pulls the path from ``tempfile_mkdtemp`` rather
+    than defaulting to cwd. Prevents polluting the user's working dir
+    with a fresh project slug that Claude Code would otherwise create."""
+    fake_run, calls = _make_fake_subprocess_run()
+    mkdtemp_called = {"n": 0}
+
+    def fake_mkdtemp():
+        mkdtemp_called["n"] += 1
+        # Return an existing path that won't be created — skip actual IO.
+        return Path("/tmp")
+
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7",
+        scratch_dir=None,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: "u",
+        stdin=_FakeTty(False),
+        tempfile_mkdtemp=fake_mkdtemp,
+        auto_resume=False,
+    )
+    assert mkdtemp_called["n"] == 1
+    # Every subprocess call runs with cwd under /tmp (the temp root).
+    # We don't assert the kwargs here because fake_run ignores them, but
+    # the code path that resolves scratch_dir was exercised above.
+    assert len(calls) == 20
+
+
+def test_compare_run_permission_mode_empty_string_omits_flag(tmp_path, monkeypatch):
+    """Passing ``permission_mode=None`` (e.g. from the CLI's empty-string
+    opt-out) drops the ``--permission-mode`` flag entirely, so the
+    subprocess defaults to whatever ``claude -p`` uses natively."""
+    fake_run, calls = _make_fake_subprocess_run()
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7",
+        scratch_dir=tmp_path,
+        permission_mode=None,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: "u",
+        stdin=_FakeTty(False),
+        auto_resume=False,
+    )
+    for c in calls:
+        assert "--permission-mode" not in c
+
+
+def test_compare_run_threads_max_budget_usd(tmp_path, monkeypatch):
+    """``--compare-run-max-budget-usd`` flows through to each subprocess
+    as a ``--max-budget-usd <USD>`` argument pair."""
+    fake_run, calls = _make_fake_subprocess_run()
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7",
+        scratch_dir=tmp_path,
+        max_budget_usd=2.50,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: "u",
+        stdin=_FakeTty(False),
+        auto_resume=False,
+    )
+    for c in calls:
+        assert "--max-budget-usd" in c
+        idx = c.index("--max-budget-usd")
+        assert c[idx + 1] == "2.5"
+
+
+def test_compare_run_passes_context_tier_suffix_verbatim(tmp_path, monkeypatch):
+    """The ``[1m]`` context-tier suffix must flow through to the subprocess
+    argv without mangling, so the 4-way Opus combo (4-6, 4-7, 4-6[1m],
+    4-7[1m]) works. We rely on ``subprocess.run`` (not a shell) receiving
+    argv as a list, which side-steps any glob interpretation."""
+    fake_run, calls = _make_fake_subprocess_run()
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    smc._run_compare_run(
+        "claude-opus-4-6[1m]", "claude-opus-4-7[1m]",
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: "u",
+        stdin=_FakeTty(False),
+        auto_resume=False,
+    )
+    # Every side-A call carries the [1m]-suffixed model literal.
+    for c in calls[:10]:
+        assert "claude-opus-4-6[1m]" in c
+    for c in calls[10:20]:
+        assert "claude-opus-4-7[1m]" in c
+
+
+def test_compare_run_accepts_mixed_tier_pair(tmp_path, monkeypatch):
+    """Mixed-tier pairs (e.g. 4-6 vs 4-7[1m]) are valid inputs — the
+    orchestrator does not refuse them. The resulting compare report
+    fires the existing ``context-tier-mismatch`` advisory, which is
+    handled downstream by ``_build_advisories``."""
+    fake_run, calls = _make_fake_subprocess_run()
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7[1m]",
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: "u",
+        stdin=_FakeTty(False),
+        auto_resume=False,
+    )
+    assert any("claude-opus-4-6" in c and "claude-opus-4-7[1m]" not in c
+               for c in calls[:10])
+    assert any("claude-opus-4-7[1m]" in c for c in calls[10:20])
+
+
+def test_cli_compare_run_defaults_to_1m_variants(monkeypatch, tmp_path):
+    """``--compare-run`` with no positional args resolves to the ``[1m]``
+    pair because that matches Claude Code's shipping Opus default. Flipping
+    this default to the 200k tier would have meant new users benchmarking
+    a variant they don't actually use in real sessions."""
+    captured = {}
+
+    def fake_orchestrator(model_a, model_b, **kwargs):
+        captured["model_a"] = model_a
+        captured["model_b"] = model_b
+        return {}
+
+    monkeypatch.setattr(smc, "_run_compare_run", fake_orchestrator)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "session-metrics.py",
+            "--compare-run",  # zero positional args
+            "--compare-run-scratch-dir", str(tmp_path),
+            "--yes",
+        ],
+    )
+    sm.main()
+    assert captured["model_a"] == "claude-opus-4-6[1m]"
+    assert captured["model_b"] == "claude-opus-4-7[1m]"
+
+
+def test_cli_compare_run_single_positional_defaults_b_to_1m(monkeypatch, tmp_path):
+    """One positional model → A overridden, B stays at the ``[1m]``
+    default. Lets users compare a custom 4-6 variant against canonical
+    4-7 without typing both IDs."""
+    captured = {}
+    monkeypatch.setattr(
+        smc, "_run_compare_run",
+        lambda a, b, **kw: captured.update({"model_a": a, "model_b": b}),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "session-metrics.py",
+            "--compare-run", "claude-opus-4-6",
+            "--compare-run-scratch-dir", str(tmp_path),
+            "--yes",
+        ],
+    )
+    sm.main()
+    assert captured["model_a"] == "claude-opus-4-6"
+    assert captured["model_b"] == "claude-opus-4-7[1m]"
+
+
+def test_cli_compare_run_three_positional_args_refused(monkeypatch, tmp_path, capsys):
+    """Three or more positional model IDs should be refused at dispatch
+    with a clear error — the function takes exactly two sides."""
+    monkeypatch.setattr(
+        smc, "_run_compare_run",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not run")),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "session-metrics.py",
+            "--compare-run", "a", "b", "c",
+            "--compare-run-scratch-dir", str(tmp_path),
+            "--yes",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        sm.main()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "0, 1, or 2" in err
+
+
+def test_cli_compare_run_end_to_end(monkeypatch, tmp_path):
+    """End-to-end: argparse path. ``--compare-run MODEL_A MODEL_B`` wires
+    through to ``smc._run_compare_run`` with the expected positional /
+    keyword arguments. No real subprocess is spawned — we patch
+    ``_run_compare_run`` itself and assert the call shape."""
+    captured = {}
+
+    def fake_orchestrator(model_a, model_b, **kwargs):
+        captured["model_a"] = model_a
+        captured["model_b"] = model_b
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(smc, "_run_compare_run", fake_orchestrator)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "session-metrics.py",
+            "--compare-run", "claude-opus-4-6", "claude-opus-4-7",
+            "--compare-run-scratch-dir", str(tmp_path),
+            "--yes",
+        ],
+    )
+    sm.main()
+    assert captured["model_a"] == "claude-opus-4-6"
+    assert captured["model_b"] == "claude-opus-4-7"
+    assert captured["scratch_dir"] == tmp_path
+    assert captured["assume_yes"] is True
+    # Defaults land correctly on pass-through options.
+    assert captured["permission_mode"] == "bypassPermissions"
+    assert "Bash" in captured["allowed_tools"]

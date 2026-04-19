@@ -8,11 +8,11 @@ description: >
   "show me token usage", "session summary", "cost so far", or any request to
   analyse or display per-turn metrics from the current or a past session.
 
-  Do NOT auto-dispatch compare mode (--compare / --compare-prep /
-  --count-tokens-only) from natural-language phrases. The skill body uses
+  Do NOT auto-dispatch compare mode (--compare / --compare-prep / --compare-run
+  / --count-tokens-only) from natural-language phrases. The skill body uses
   $ARGUMENTS[0] as the dispatch key — if the first positional argument is not
-  literally "compare", "compare-prep", or "count-tokens", route to the default
-  single-session report.
+  literally "compare", "compare-prep", "compare-run", or "count-tokens", route
+  to the default single-session report.
 ---
 
 # Session Metrics
@@ -31,8 +31,9 @@ parsing is required — just compare strings.
 
 | `$ARGUMENTS[0]`     | Route                                     | Then read |
 |---------------------|-------------------------------------------|-----------|
-| `compare`           | Two-session compare                       | `## Model comparison` below, then [`references/model-compare.md`](references/model-compare.md) before running |
-| `compare-prep`      | Print capture protocol + 10-prompt suite  | `## Model comparison` below |
+| `compare`           | Two-session compare on JSONLs that already exist | `## Model comparison` below, then [`references/model-compare.md`](references/model-compare.md) before running |
+| `compare-run`       | Fully automated capture: spawns two `claude -p` sessions, feeds the suite, then runs `--compare` | `## Model comparison` below, then [`references/model-compare.md`](references/model-compare.md) "Workflow A — automated" |
+| `compare-prep`      | Print manual capture protocol + 10-prompt suite (fallback when headless is unavailable) | `## Model comparison` below |
 | `count-tokens`      | API-key-only tokenizer check              | `## Model comparison` below |
 | *(empty, or any other value)* | Default single-session report   | `## Quick usage` below |
 
@@ -142,23 +143,30 @@ and in Markdown under `## Usage Insights`).
 
 ## Model comparison
 
-Reached only when `$ARGUMENTS[0]` is `compare`, `compare-prep`, or
-`count-tokens` (see the Dispatch section at the top of this file). Covers
-two modes — **controlled** session pair and **observational** project
-aggregate — plus a separate API-key-only `--count-tokens-only` tool.
+Reached only when `$ARGUMENTS[0]` is `compare`, `compare-run`,
+`compare-prep`, or `count-tokens` (see the Dispatch section at the top
+of this file).
 
-**For Claude subscription-plan users, `--compare` is the mode you want.**
-It reads local JSONLs — no API key needed. `--count-tokens-only` is a
-narrow pre-capture API-key tool, **not** the subscription path; do not
-suggest it when the user is comparing two subscription-plan sessions.
+**Default pair is `claude-opus-4-6[1m]` vs `claude-opus-4-7[1m]`** —
+the 1M-context tier, because that matches Claude Code's shipping Opus
+routing. Users opt into the 200k-context variants by passing the
+unsuffixed IDs explicitly. Mixed-tier pairs are accepted and surface
+the existing `context-tier-mismatch` advisory on the report.
+
+| Mode | Use when |
+|------|----------|
+| `compare-run` *(preferred)* | User wants the report with no manual capture. Orchestrator spawns two `claude -p` sessions via subscription auth, feeds the canonical suite, then runs `--compare`. Zero API key. |
+| `compare`                   | Two session JSONLs already exist (either from a prior `compare-run`, or from manual `/model` + paste). Input is a path / UUID / `last-<family>` / `all-<family>` token. |
+| `compare-prep`              | Print the manual capture protocol. Only suggest when `claude -p` is unavailable (e.g. CI container without the CLI). |
+| `count-tokens`              | API-key tokenizer smoke test. NOT a subscription path; do not suggest to users comparing two subscription sessions. |
 
 **Before proposing any compare-mode command, read
-[`references/model-compare.md`](references/model-compare.md).** That doc
-covers the full capture protocol, CLI flag table, Mode 1 vs Mode 2 output
-contracts, prompt-suite catalogue, IFEval predicates, HTML variant layout,
-`count_tokens` caveats, and troubleshooting. The eager content in this
-file deliberately stays minimal so single-session reports don't pay for
-compare-mode context they don't use.
+[`references/model-compare.md`](references/model-compare.md).** That
+doc has the full flag table, four workflow recipes, 4-way Opus combo
+matrix, IFEval predicates, advisory semantics, and troubleshooting.
+The eager content in this file deliberately stays minimal so
+single-session reports don't pay for compare-mode context they don't
+use.
 
 ## Reference files
 
