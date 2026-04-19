@@ -1,5 +1,7 @@
 # centminmod / claude-plugins
 
+Site: <https://ai.georgeliu.com/p/my-claude-code-plugin-marketplace>
+
 A personal Claude Code plugin marketplace. Each plugin is an independent, standalone unit that can be installed into any Claude Code project with a single command.
 
 > Claude Code's plugin system supports multiple plugins per marketplace and handles install + update lifecycle automatically. See the [official plugin-marketplaces docs](https://code.claude.com/docs/en/plugin-marketplaces) for the broader ecosystem.
@@ -31,6 +33,7 @@ More plugins coming.
 Background articles by the author on what the skill does and what it
 surfaces in practice:
 
+- [My Claude Code Plugin Marketplace Is Now Public. Install Session Metrics Skill Plugin](https://ai.georgeliu.com/p/my-claude-code-plugin-marketplace).
 - [I built a token-cost analyzer skill for Claude Code](https://ai.georgeliu.com/p/i-built-a-token-cost-analyzer-skill) — how the skill was designed and what it reports.
 - [I ran two Claude Opus 4.7 5-hour sessions](https://ai.georgeliu.com/p/i-ran-two-claude-opus-47-5hr-sessions) — real-world session-metrics output from two back-to-back Opus 4.7 sessions, with cache-hit, cost, and token-usage analysis.
 
