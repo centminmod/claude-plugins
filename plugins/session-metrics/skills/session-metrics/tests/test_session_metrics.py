@@ -505,6 +505,32 @@ def test_resumes_card_absent_when_no_markers():
     assert '>Session resumes' not in html
 
 
+def test_html_distinguishes_terminal_exit_marker_from_resume_marker():
+    # Two markers in one session: a mid-session resume (followed by more turns)
+    # and a terminal exit (last turn in the session). The dashboard card
+    # already breaks these out as "N detected · M terminal exit"; the timeline
+    # divider must use the same distinction so the two surfaces stay
+    # internally consistent.
+    r = _build_fixture_report()
+    turns = r["sessions"][0]["turns"]
+    # Mid marker on first turn (followed by 5 more — so non-terminal)
+    turns[0]["is_resume_marker"] = True
+    turns[0]["is_terminal_exit_marker"] = False
+    # Terminal marker on last turn (no subsequent turns in session)
+    turns[-1]["is_resume_marker"] = True
+    turns[-1]["is_terminal_exit_marker"] = True
+    r["sessions"][0]["resumes"] = sm._build_resumes(turns)
+    r["resumes"] = [m for s in r["sessions"] for m in s["resumes"]]
+
+    html = sm.render_html(r, variant="single")
+    # Resume pill: blue, "Session resumed" label
+    assert 'class="resume-marker-pill"' in html
+    assert "Session resumed" in html
+    # Terminal pill: amber via .terminal modifier, "Session exited" label
+    assert 'class="resume-marker-pill terminal"' in html
+    assert "Session exited" in html
+
+
 # --- Content-block distribution (Proposal B) --------------------------------
 
 def test_count_content_blocks_mixed_list():

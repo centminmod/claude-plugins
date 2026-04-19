@@ -1078,6 +1078,19 @@ def _build_report(
         turn_records = [_build_turn_record(global_idx + i, t, tz_offset_hours)
                         for i, t in enumerate(raw_turns)]
         global_idx += len(turn_records)
+        resumes = _build_resumes(turn_records)
+        # Stamp `is_terminal_exit_marker` onto the last-turn marker (if any) so
+        # the timeline divider can distinguish "user came back" from "user's
+        # most recent /exit with no subsequent work in this JSONL". The
+        # dashboard card already splits these in its sublabel; the timeline
+        # needs the same distinction to stay internally consistent.
+        for r in resumes:
+            if r["terminal"]:
+                idx = r["turn_index"]
+                for t in turn_records:
+                    if t["index"] == idx:
+                        t["is_terminal_exit_marker"] = True
+                        break
         sessions_out.append({
             "session_id":  session_id,
             "first_ts":    _fmt_ts(raw_turns[0].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
@@ -1086,7 +1099,7 @@ def _build_report(
             "subtotal":    _totals_from_turns(turn_records),
             "models":      _model_counts(turn_records),
             "time_of_day": _build_time_of_day(user_ts, offset_hours=tz_offset_hours),
-            "resumes":     _build_resumes(turn_records),
+            "resumes":     resumes,
         })
 
     all_turns = [t for s in sessions_out for t in s["turns"]]
@@ -3207,17 +3220,35 @@ def render_html(report: dict, variant: str = "single",
         # counted in the turn index; only the rendering changes.
         if t.get("is_resume_marker"):
             ts_fmt = html_mod.escape(t.get("timestamp_fmt", ""))
+            is_terminal = t.get("is_terminal_exit_marker", False)
+            # Terminal: this is the most recent /exit with no subsequent work
+            # in the JSONL. The user may or may not have resumed yet — the
+            # JSONL alone can't tell us. Resume: there is later work in the
+            # file, so a return is observable.
+            if is_terminal:
+                pill_cls   = "resume-marker-pill terminal"
+                icon_html  = "&#9211;"  # ⏻ power symbol
+                label_text = "Session exited"
+                tooltip    = ("Most recent /exit local command in this JSONL "
+                              "with no subsequent assistant turn observed. "
+                              "Whether the user has resumed since cannot be "
+                              "determined from this file alone.")
+            else:
+                pill_cls   = "resume-marker-pill"
+                icon_html  = "&#8634;"  # ↻ cycle
+                label_text = "Session resumed"
+                tooltip    = ("claude -c replayed a prior /exit local-command "
+                              "into this session; CC emitted a no-op "
+                              "`<synthetic>` assistant entry. Detection is "
+                              "precise when it fires but may under-count "
+                              "(resumes after Ctrl+C or crash leave no trace).")
             return (
                 f'<tr class="resume-marker-row" data-session="{session_id[:8]}">'
                 f'<td class="num resume-marker-idx">{t["index"]}</td>'
                 f'<td colspan="{_full_cols - 1}" class="resume-marker-cell">'
-                f'<span class="resume-marker-pill" '
-                f'title="claude -c replayed a prior /exit local-command into '
-                f'this session; CC emitted a no-op `<synthetic>` assistant entry. '
-                f'Detection is precise when it fires but may under-count '
-                f'(resumes after Ctrl+C or crash leave no trace).">'
-                f'<span class="resume-marker-icon">&#8634;</span>'
-                f'<strong>Session resumed</strong>'
+                f'<span class="{pill_cls}" title="{tooltip}">'
+                f'<span class="resume-marker-icon">{icon_html}</span>'
+                f'<strong>{label_text}</strong>'
                 f'<span class="resume-marker-time">at {ts_fmt}</span>'
                 f'</span></td></tr>'
             )
@@ -3583,6 +3614,9 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                                              font-size: 14px; line-height: 1; }}
   .resume-marker-pill .resume-marker-time {{ color: #8b949e; font-size: 11px;
                                              font-variant-numeric: tabular-nums; }}
+  .resume-marker-pill.terminal {{ background: #2e1f0d; border-color: #9c7a2f; }}
+  .resume-marker-pill.terminal strong,
+  .resume-marker-pill.terminal .resume-marker-icon {{ color: #e3b341; }}
 </style>
 </head>
 <body>
