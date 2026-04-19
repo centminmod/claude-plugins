@@ -1145,6 +1145,173 @@ def _fmt_long_duration(seconds: float) -> str:
     return f"{days}d {rem}h" if rem else f"{days}d"
 
 
+# ---------------------------------------------------------------------------
+# Compare-insight state marker + multi-family detection (Phase 7)
+# ---------------------------------------------------------------------------
+
+def _compare_state_marker_path(slug: str) -> Path:
+    """File whose presence means the user has run ``--compare`` at least
+    once for this project.
+
+    Lives under the project's JSONL directory (not the session-metrics
+    cache) so uninstalling session-metrics doesn't lose the marker, and
+    so deleting a project's session dir cleans up the marker alongside
+    everything else.
+    """
+    return _projects_dir() / slug / ".session-metrics-compare-used"
+
+
+def _touch_compare_state_marker(slug: str) -> None:
+    """Drop the opt-in marker before running ``--compare``.
+
+    Best-effort: a filesystem failure here shouldn't abort the compare
+    run. Callers wrap the call in a try/except that swallows ``OSError``.
+    The marker content is an ISO-8601 timestamp so later tooling could
+    show "first compare run on date X" — not used yet, but cheap to
+    record.
+    """
+    marker = _compare_state_marker_path(slug)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8",
+    )
+
+
+def _has_compare_state_marker(slug: str) -> bool:
+    """True iff :func:`_touch_compare_state_marker` has been called
+    for this project (i.e., the user opted into compare-aware insights)."""
+    return _compare_state_marker_path(slug).is_file()
+
+
+def _scan_project_family_mix(slug: str) -> list[str]:
+    """Return the sorted set of fine-grained model family slugs
+    (``"opus-4-6"`` etc.) observed across every session in the project.
+
+    Pulled via the compare module's ``_project_family_inventory`` so
+    the family slug matches compare-mode conventions (1M-context suffix
+    stripped). Called only by ``_compute_model_compare_insight`` — the
+    main-report insight bank doesn't re-scan the disk for the other
+    cards because the report already has all the data it needs.
+    """
+    try:
+        smc = sys.modules.get("session_metrics_compare")
+        if smc is None:
+            # Lazy-load. The helper is in a sibling file; import here so
+            # regular single-session reports don't pay for it.
+            here = Path(__file__).resolve().parent
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "session_metrics_compare",
+                here / "session_metrics_compare.py",
+            )
+            if spec is None or spec.loader is None:
+                return []
+            smc = importlib.util.module_from_spec(spec)
+            sys.modules.setdefault("session_metrics", sys.modules[__name__])
+            sys.modules["session_metrics_compare"] = smc
+            spec.loader.exec_module(smc)
+        inventory = smc._project_family_inventory(slug, use_cache=True)
+    except (OSError, AttributeError, ImportError):
+        return []
+    return sorted(f for f in inventory.keys() if f)
+
+
+def _version_suffix_of_family(family: str) -> tuple[int, ...]:
+    """Parse trailing integer-dash segments out of a family slug.
+
+    ``opus-4-7`` → ``(4, 7)``; ``sonnet-4-5-haiku`` → ``(4, 5)``.
+    Used to order families for the "newer / older" insight copy. Returns
+    ``()`` when no trailing ints are present — families compared as
+    equal in that case fall back to alphabetical ordering in the caller.
+    """
+    parts = family.split("-")
+    nums: list[int] = []
+    # Walk from the right and collect integers until we hit a non-int.
+    for part in reversed(parts):
+        if part.isdigit():
+            nums.append(int(part))
+        else:
+            break
+    return tuple(reversed(nums))
+
+
+def _order_family_pair(families: list[str]) -> tuple[str, str] | None:
+    """Pick a deterministic (older, newer) pair from a family list.
+
+    - If exactly two families, orders by version suffix (higher =
+      newer), falling back to alphabetical.
+    - If more than two, picks the two most distinct by version: the
+      lowest-version family as "older" and the highest as "newer". Ties
+      fall back to alphabetical.
+    - Returns ``None`` when fewer than two families are present.
+    """
+    distinct = [f for f in dict.fromkeys(families) if f]
+    if len(distinct) < 2:
+        return None
+    keyed = sorted(distinct, key=lambda f: (_version_suffix_of_family(f), f))
+    return (keyed[0], keyed[-1])
+
+
+def _compute_model_compare_insight(report: dict) -> dict | None:
+    """Build the Phase-7 model-compare insight card for a report.
+
+    Fires with a soft hint when:
+    - the user has NOT yet run ``--compare`` in this project, AND
+    - at least two distinct model families appear in the project's
+      sessions (not just this report's sessions — we scan the project
+      dir so the hint still shows on a single-session report that only
+      used one family, as long as the *project* has two).
+
+    Fires with a stronger card ("run '--compare' for an attribution-
+    grade benchmark") once the marker exists — the hint shape is the
+    same, but the copy acknowledges the user has already engaged.
+
+    Returns ``None`` (caller suppresses the card) when:
+    - fewer than two families are present in the project, or
+    - ``--no-model-compare-insight`` was passed (caller handles this;
+      the builder itself doesn't read CLI flags), or
+    - the project slug can't be determined.
+    """
+    slug = report.get("slug") or ""
+    if not slug:
+        return None
+    families = _scan_project_family_mix(slug)
+    pair = _order_family_pair(families)
+    if not pair:
+        return None
+    older, newer = pair
+    already_used = _has_compare_state_marker(slug)
+    n_families = len([f for f in families if f])
+    if already_used:
+        headline = f"{n_families} model families &mdash; run a fresh compare"
+        body = (
+            f" &mdash; <code>{html_mod.escape(older)}</code> and "
+            f"<code>{html_mod.escape(newer)}</code> both appear in this "
+            f"project. Re-run <code>session-metrics --compare last-"
+            f"{html_mod.escape(older)} last-{html_mod.escape(newer)}</code> "
+            f"to refresh attribution numbers with your latest sessions."
+        )
+    else:
+        headline = f"{n_families} model families detected"
+        body = (
+            f" in this project's sessions &mdash; "
+            f"<code>{html_mod.escape(older)}</code> and "
+            f"<code>{html_mod.escape(newer)}</code>. "
+            f"Run <code>session-metrics --compare-prep</code> to set up a "
+            f"controlled comparison that isolates tokenizer / output-length "
+            f"effects from workload shift."
+        )
+    return {
+        "id":        "model_compare",
+        "headline":  headline,
+        "body":      body,
+        "value":     float(n_families),
+        "threshold": 2.0,
+        "shown":     True,
+        "always_on": True,
+    }
+
+
 def _compute_usage_insights(report: dict) -> list[dict]:
     """Compute the Usage Insights candidate list. See module-level
     `_INSIGHT_*` constants for thresholds. Each entry:
@@ -1367,6 +1534,16 @@ def _compute_usage_insights(report: dict) -> list[dict]:
             "always_on": True,
         })
 
+    # 11. Model compare hint — fires when the project has ≥2 distinct
+    # model families. Gated behind a state marker so the card escalates
+    # from "hint you can run a benchmark" to "re-run for fresh numbers"
+    # once the user actually tries --compare. Suppressed CLI-side via
+    # --no-model-compare-insight.
+    if not report.get("_suppress_model_compare_insight"):
+        mc = _compute_model_compare_insight(report)
+        if mc is not None:
+            candidates.append(mc)
+
     return candidates
 
 
@@ -1377,6 +1554,7 @@ def _build_report(
     tz_offset_hours: float = 0.0,
     tz_label: str = "UTC",
     peak: dict | None = None,
+    suppress_model_compare_insight: bool = False,
 ) -> dict:
     """Build a structured report dict from raw session data.
 
@@ -1449,8 +1627,16 @@ def _build_report(
         "weekly_rollup":   _build_weekly_rollup(sessions_out, sessions_raw, blocks),
         "peak":            peak,
         "resumes":         [r for s in sessions_out for r in s["resumes"]],
+        # CLI opt-out for the Phase 7 model-compare insight card. Keyed
+        # with an underscore so downstream JSON exports don't leak the
+        # flag into user-facing schema; `_compute_usage_insights` reads
+        # it before returning the list.
+        "_suppress_model_compare_insight": suppress_model_compare_insight,
     }
     report["usage_insights"] = _compute_usage_insights(report)
+    # Drop the internal flag after use so the report dict stays clean
+    # for downstream renderers / JSON export.
+    report.pop("_suppress_model_compare_insight", None)
     return report
 
 
@@ -1839,6 +2025,8 @@ def _footer_text(totals: dict, models: dict[str, int],
 # ---------------------------------------------------------------------------
 
 def render_text(report: dict) -> str:
+    if report.get("mode") == "compare":
+        return sys.modules["session_metrics_compare"].render_compare_text(report)
     out = io.StringIO()
 
     def p(*args, **kw):
@@ -1921,6 +2109,8 @@ def render_json(report: dict) -> str:
     shallow copy of the report — session turns, subtotals, and model dicts are
     shared by reference to avoid copying ~thousands of turn record dicts.
     """
+    if report.get("mode") == "compare":
+        return sys.modules["session_metrics_compare"].render_compare_json(report)
     # Shallow-transform: only replace time_of_day sections
     export = {**report}
     if "time_of_day" in export:
@@ -1941,6 +2131,8 @@ def render_csv(report: dict) -> str:
     A blank separator row is followed by a ``USER ACTIVITY BY TIME OF DAY``
     summary with per-session and project-wide counts bucketed at UTC.
     """
+    if report.get("mode") == "compare":
+        return sys.modules["session_metrics_compare"].render_compare_csv(report)
     out = io.StringIO()
     w = csv_mod.writer(out)
     w.writerow(["session_id", "turn", "timestamp", "model", "speed",
@@ -2035,6 +2227,8 @@ def render_md(report: dict) -> str:
     Includes summary cards, user activity by time of day (UTC), model pricing
     table, and per-session turn-level tables with subtotals.
     """
+    if report.get("mode") == "compare":
+        return sys.modules["session_metrics_compare"].render_compare_md(report)
     out = io.StringIO()
 
     def p(*args, **kw):
@@ -4096,6 +4290,10 @@ def _write_output(fmt: str, content: str, report: dict,
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if mode == "project":
         stem = f"project_{ts}"
+    elif mode == "compare":
+        a_sid = (report.get("side_a") or {}).get("session_id") or "a"
+        b_sid = (report.get("side_b") or {}).get("session_id") or "b"
+        stem = f"compare_{a_sid[:8]}_vs_{b_sid[:8]}_{ts}"
     else:
         sid = report["sessions"][0]["session_id"][:8]
         stem = f"session_{sid}_{ts}"
@@ -4143,7 +4341,8 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
                          peak: dict | None = None,
                          single_page: bool = False,
                          use_cache: bool = True,
-                         chart_lib: str = "highcharts") -> None:
+                         chart_lib: str = "highcharts",
+                         suppress_model_compare_insight: bool = False) -> None:
     print(f"Session : {jsonl_path.stem}", file=sys.stderr)
     print(f"File    : {jsonl_path}", file=sys.stderr)
     print(file=sys.stderr)
@@ -4154,9 +4353,11 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
         print("[info] No assistant turns with usage data found.", file=sys.stderr)
         return
 
-    report = _build_report("session", slug, [(session_id, turns, user_ts)],
-                            tz_offset_hours=tz_offset, tz_label=tz_label,
-                            peak=peak)
+    report = _build_report(
+        "session", slug, [(session_id, turns, user_ts)],
+        tz_offset_hours=tz_offset, tz_label=tz_label, peak=peak,
+        suppress_model_compare_insight=suppress_model_compare_insight,
+    )
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib)
 
 
@@ -4165,7 +4366,8 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
                       peak: dict | None = None,
                       single_page: bool = False,
                       use_cache: bool = True,
-                      chart_lib: str = "highcharts") -> None:
+                      chart_lib: str = "highcharts",
+                      suppress_model_compare_insight: bool = False) -> None:
     files = _find_jsonl_files(slug)
     if not files:
         print(f"[error] No sessions found for slug: {slug}", file=sys.stderr)
@@ -4182,21 +4384,39 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
         print("[info] No turns with usage data found across any session.", file=sys.stderr)
         return
 
-    report = _build_report("project", slug, sessions_raw,
-                            tz_offset_hours=tz_offset, tz_label=tz_label,
-                            peak=peak)
+    report = _build_report(
+        "project", slug, sessions_raw,
+        tz_offset_hours=tz_offset, tz_label=tz_label, peak=peak,
+        suppress_model_compare_insight=suppress_model_compare_insight,
+    )
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib)
 
 
 def _dispatch(report: dict, formats: list[str],
                single_page: bool = False,
-               chart_lib: str = "highcharts") -> None:
+               chart_lib: str = "highcharts",
+               redact_user_prompts: bool = False) -> None:
     # Always render text to stdout
     print(render_text(report))
+
+    is_compare = report.get("mode") == "compare"
 
     for fmt in formats:
         if fmt == "text":
             continue   # already printed
+        if fmt == "html" and is_compare:
+            # Compare HTML is always single-page — the report is compact
+            # enough to read at a glance, and splitting dashboard/detail
+            # would fragment the story (summary cards and per-turn table
+            # are read together). ``--single-page`` / ``--chart-lib`` are
+            # silently ignored for compare output.
+            smc = sys.modules["session_metrics_compare"]
+            content = smc.render_compare_html(
+                report, redact_user_prompts=redact_user_prompts,
+            )
+            path = _write_output(fmt, content, report)
+            print(f"[export] HTML (compare) → {path}", file=sys.stderr)
+            continue
         if fmt == "html" and not single_page:
             # Split into two files. Dashboard references detail as a sibling
             # by filename-only href so file:// works without a server.
@@ -4295,6 +4515,84 @@ def _build_parser() -> argparse.ArgumentParser:
                         "Default: highcharts (vendored, non-commercial). "
                         "Alternatives: uplot/chartjs (MIT). "
                         "Use 'none' for a no-JS detail page.")
+    # --- Compare-mode flags ------------------------------------------------
+    # ``--compare`` is the single entrypoint: any other compare-mode flag is
+    # a no-op without it. Kept out of the ``--project-cost`` / single-session
+    # code paths so natural-language prompts ("session cost?") never fall
+    # into this branch — dispatch only happens when the user explicitly
+    # passes two specifiers via ``--compare``.
+    p.add_argument("--compare", nargs=2, metavar=("A", "B"),
+                   help="Run a model-compare report over two sessions. Each "
+                        "arg may be a .jsonl path, a session UUID, or a "
+                        "'last-<family>' / 'all-<family>' magic token. "
+                        "Supports Mode 1 (controlled session pair) and "
+                        "Mode 2 (observational project aggregate). "
+                        "See references/model-compare.md.")
+    p.add_argument("--pair-by", choices=["fingerprint", "ordinal"],
+                   default="fingerprint",
+                   help="Turn-pairing strategy for --compare. 'fingerprint' "
+                        "(default) hashes the first 200 chars of each user "
+                        "prompt; 'ordinal' pairs by turn index.")
+    p.add_argument("--compare-min-turns", type=int, default=5, metavar="N",
+                   help="Minimum user-prompt turns required for a 'last-<family>' "
+                        "resolver match. Default 5; lower when deliberately "
+                        "comparing short sessions.")
+    p.add_argument("--compare-scope", choices=["auto", "session", "project"],
+                   default="auto",
+                   help="Force a compare-mode scope. 'auto' (default) picks "
+                        "'controlled' for session pairs and 'observational' "
+                        "for project aggregates. 'session' refuses "
+                        "'all-<family>' args. 'project' forces observational "
+                        "mode even when both args are single sessions.")
+    p.add_argument("--yes", "-y", action="store_true",
+                   help="Auto-accept confirmation prompts for expensive "
+                        "compare paths (Phase 3: 'all-<family>' rollups, "
+                        "count-tokens API mode, multi-trial runs). Accepted "
+                        "now for CLI-shape stability.")
+    # --- Compare capture-protocol helper (Phase 4) -----------------------
+    p.add_argument("--compare-prep", nargs="*", metavar="MODEL",
+                   default=None,
+                   help="Emit the capture protocol + canonical prompt suite "
+                        "to stdout. Takes 0-2 positional model IDs; defaults "
+                        "to 'claude-opus-4-6 claude-opus-4-7'. Pipe to a file "
+                        "for easy copy-paste into two fresh Claude Code "
+                        "sessions.")
+    p.add_argument("--compare-prompts", metavar="DIR",
+                   help="Override the compare-suite prompt directory (default: "
+                        "references/model-compare/prompts next to this script). "
+                        "Used by --compare for predicate eval and by "
+                        "--compare-prep for the prompt list.")
+    p.add_argument("--allow-suite-mismatch", action="store_true",
+                   help="Proceed with a --compare even when the two sessions "
+                        "ran different compare-suite versions. Without this "
+                        "flag the compare refuses (ratios would conflate "
+                        "suite shift with model shift).")
+    # --- Phase 6 / 7 — HTML compare + Insights card ----------------------
+    p.add_argument("--redact-user-prompts", action="store_true",
+                   help="In the compare HTML report, replace freeform "
+                        "user-prompt fingerprints with '[redacted]' so the "
+                        "file is safe to share. Sentinel-tagged suite "
+                        "prompts (canonical, non-PII) stay visible.")
+    p.add_argument("--no-model-compare-insight", action="store_true",
+                   help="Suppress the Model-compare insight card on the "
+                        "single-session / project dashboards. Use when the "
+                        "hint is noisy (e.g. a project with many historical "
+                        "families but no interest in running a benchmark).")
+    # --- Phase 8 — count_tokens API mode --------------------------------
+    p.add_argument("--count-tokens-only", action="store_true",
+                   help="Compare input-token counts between two models using "
+                        "the /v1/messages/count_tokens API — no inference, no "
+                        "cost (other than request rate). Requires "
+                        "ANTHROPIC_API_KEY. Pair with --compare-models to "
+                        "choose the pair (defaults: claude-opus-4-6 vs "
+                        "claude-opus-4-7). Output tokens and total cost are "
+                        "NOT measured — run --compare for that.")
+    p.add_argument("--compare-models", nargs="*", metavar="MODEL",
+                   default=None,
+                   help="Model pair for --count-tokens-only. Takes 0-2 "
+                        "positional model IDs; defaults to 'claude-opus-4-6 "
+                        "claude-opus-4-7'. A single model is accepted for "
+                        "input-token measurement without ratios.")
     return p
 
 
@@ -4312,6 +4610,34 @@ def _maybe_warn_chart_license(chart_lib: str, formats: list[str]) -> None:
               f"--chart-lib none to opt out.", file=sys.stderr)
 
 
+def _load_compare_module():
+    """Lazy-load the sibling ``session_metrics_compare`` module.
+
+    Split out of ``main()`` so the import cost is paid only when the
+    user actually runs compare mode — everyday single-session reports
+    don't touch it. Also registers this script as ``session_metrics``
+    in ``sys.modules`` before the compare module executes, because the
+    compare module's one-way coupling helper (``_main()``) looks up
+    that name. When this file is executed directly its ``__name__`` is
+    ``"__main__"``, so the registration is non-redundant.
+    """
+    if "session_metrics_compare" in sys.modules:
+        return sys.modules["session_metrics_compare"]
+    sys.modules.setdefault("session_metrics", sys.modules[__name__])
+    import importlib.util
+    here = Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location(
+        "session_metrics_compare", here / "session_metrics_compare.py")
+    if spec is None or spec.loader is None:
+        print("[error] could not locate session_metrics_compare.py alongside "
+              "session-metrics.py", file=sys.stderr)
+        sys.exit(1)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["session_metrics_compare"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main() -> None:
     args = _build_parser().parse_args()
     slug = args.slug or _env_slug() or _cwd_to_slug()
@@ -4326,23 +4652,76 @@ def main() -> None:
         _list_sessions(slug)
         return
 
+    if args.compare_prep is not None:
+        smc = _load_compare_module()
+        suite_dir = Path(args.compare_prompts).expanduser() if args.compare_prompts else None
+        smc._run_compare_prep(args.compare_prep, suite_dir=suite_dir)
+        return
+
+    if args.count_tokens_only:
+        smc = _load_compare_module()
+        suite_dir = Path(args.compare_prompts).expanduser() if args.compare_prompts else None
+        smc._run_count_tokens_only(
+            args.compare_models,
+            suite_dir=suite_dir,
+            assume_yes=args.yes,
+        )
+        return
+
+    if args.compare:
+        smc = _load_compare_module()
+        suite_dir = Path(args.compare_prompts).expanduser() if args.compare_prompts else None
+        # State-marker file: Phase 7's dashboard insight card only fires
+        # after the user has successfully run --compare once in this project.
+        # Dropping the marker here (before the run, as a best-effort) means
+        # that even if the compare crashes mid-way we still remember the
+        # user attempted one — the whole point is to suppress spam on
+        # projects where nobody's interested in a benchmark.
+        try:
+            _touch_compare_state_marker(slug)
+        except OSError:
+            pass
+        smc._run_compare(
+            args.compare[0], args.compare[1],
+            slug=slug,
+            pair_by=args.pair_by,
+            compare_scope=args.compare_scope,
+            min_turns=args.compare_min_turns,
+            formats=formats,
+            tz_offset=tz_offset,
+            tz_label=tz_label,
+            include_subagents=args.include_subagents,
+            use_cache=not args.no_cache,
+            single_page=args.single_page,
+            chart_lib=chart_lib,
+            assume_yes=args.yes,
+            prompt_suite_dir=suite_dir,
+            allow_suite_mismatch=args.allow_suite_mismatch,
+            redact_user_prompts=args.redact_user_prompts,
+        )
+        return
+
     if args.project_cost:
         print(f"Slug : {slug}", file=sys.stderr)
         print(f"TZ   : {tz_label} (UTC{'+' if tz_offset >= 0 else '-'}{abs(tz_offset):g})", file=sys.stderr)
         print(file=sys.stderr)
-        _run_project_cost(slug, args.include_subagents, formats, tz_offset, tz_label,
-                           peak=peak, single_page=args.single_page,
-                           use_cache=not args.no_cache,
-                           chart_lib=chart_lib)
+        _run_project_cost(
+            slug, args.include_subagents, formats, tz_offset, tz_label,
+            peak=peak, single_page=args.single_page,
+            use_cache=not args.no_cache, chart_lib=chart_lib,
+            suppress_model_compare_insight=args.no_model_compare_insight,
+        )
         return
 
     jsonl_path, resolved_slug = _resolve_session(args)
     print(f"Slug    : {resolved_slug}", file=sys.stderr)
     print(f"TZ      : {tz_label} (UTC{'+' if tz_offset >= 0 else '-'}{abs(tz_offset):g})", file=sys.stderr)
-    _run_single_session(jsonl_path, resolved_slug, args.include_subagents, formats,
-                         tz_offset, tz_label, peak=peak, single_page=args.single_page,
-                         use_cache=not args.no_cache,
-                         chart_lib=chart_lib)
+    _run_single_session(
+        jsonl_path, resolved_slug, args.include_subagents, formats,
+        tz_offset, tz_label, peak=peak, single_page=args.single_page,
+        use_cache=not args.no_cache, chart_lib=chart_lib,
+        suppress_model_compare_insight=args.no_model_compare_insight,
+    )
 
 
 if __name__ == "__main__":

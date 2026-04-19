@@ -131,6 +131,71 @@ Each session dict additionally gains a `duration_seconds` field
 (integer, computed from raw timestamps) used by the long-session and
 session-pacing insights.
 
+## Model comparison (`--compare`)
+
+Compares two Claude Code sessions (or two sets of sessions) on tokens, cost,
+cache behaviour, tool-call fan-out, and IFEval-style instruction compliance.
+Two modes: **controlled** (session pair running the canonical suite) and
+**observational** (project-level aggregate across model families).
+
+```bash
+# Print the capture protocol + canonical 10-prompt suite
+session-metrics --compare-prep > /tmp/suite.md     # defaults to 4.6 vs 4.7
+session-metrics --compare-prep claude-opus-4-7 claude-opus-4-8
+
+# Controlled compare (both sides ran the suite)
+session-metrics --compare last-opus-4-6 last-opus-4-7 --output md
+
+# Controlled compare with shareable HTML dashboard (single self-contained file)
+session-metrics --compare last-opus-4-6 last-opus-4-7 --output html
+
+# Mask freeform prompt fingerprints before sharing
+session-metrics --compare last-opus-4-6 last-opus-4-7 --output html --redact-user-prompts
+
+# Observational aggregate across every session of each family in the project
+session-metrics --compare all-opus-4-6 all-opus-4-7 --yes
+
+# Inference-free tokenizer check — no sessions needed, just an API key
+ANTHROPIC_API_KEY=sk-... session-metrics --count-tokens-only --yes
+ANTHROPIC_API_KEY=sk-... session-metrics --count-tokens-only \
+    --compare-models claude-sonnet-4-6 claude-sonnet-4-7 --yes
+```
+
+Each prompt in the suite carries a sentinel line
+(`[session-metrics:compare-suite:v1:prompt=<name>]`) so the skill knows which
+turn is which and runs the matching Python predicate against the assistant's
+text. Summary strip surfaces the IFEval pass-rate delta alongside the cost
+delta so quality and cost are read together.
+
+**HTML output (v1.6.0+)**: `--output html` for compare mode emits a single
+self-contained HTML document (dashboard + detail fused — no split). Layout:
+advisory banners at top, per-side model cards, KPI summary strip, a
+Quality-vs-cost card that juxtaposes cost ratio with IFEval Δ, per-turn table
+with ratio heatmap tint (Mode 1) or aggregate detail (Mode 2), inline
+histogram of per-turn input-token ratios (mean / p50 / p95), and a
+reproducibility stamp. Pass `--redact-user-prompts` to swap freeform
+fingerprint snippets for a `[redacted]` marker; sentinel-tagged suite prompts
+stay visible because they're canonical and non-PII.
+
+**Dashboard hint (v1.6.0+)**: regular single-session and `--project-cost`
+dashboards surface a `model_compare` Usage Insights card when the project's
+session dir contains ≥ 2 distinct Anthropic model families. Copy escalates
+from "detected, run `--compare-prep` to benchmark" (before the user tries
+`--compare`) to "refresh attribution with a new run" (after). Suppress with
+`--no-model-compare-insight`.
+
+**`count_tokens` API mode (v1.6.0+)**: `--count-tokens-only` hits
+`POST /v1/messages/count_tokens` once per prompt × model pair and prints an
+input-token ratio table — no inference, no output/cost data, just the
+tokenizer delta the article is about. Requires `ANTHROPIC_API_KEY`; pair with
+`--compare-models A B` to choose the two model IDs (defaults to the reference
+`claude-opus-4-6` vs `claude-opus-4-7` pair). Includes a confirmation gate
+(bypass with `--yes`) and a first-call probe that falls back to single-model
+counting if the baseline model is not accessible to the API key.
+
+Full walkthrough + interpretation guide + methodology caveats:
+[`references/model-compare.md`](references/model-compare.md).
+
 ## Reference files
 
 - [`references/pricing.md`](references/pricing.md) — Per-model token prices used
@@ -138,6 +203,8 @@ session-pacing insights.
   to add a new model.
 - [`references/jsonl-schema.md`](references/jsonl-schema.md) — JSONL entry
   structure. Read this when debugging missing data or extending the script.
+- [`references/model-compare.md`](references/model-compare.md) — `--compare`
+  workflow, prompt-suite catalogue, IFEval predicates, interpretation guide.
 
 ## How session detection works
 

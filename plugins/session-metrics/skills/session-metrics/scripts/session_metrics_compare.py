@@ -1,0 +1,3383 @@
+"""Compare primitives for session-metrics.
+
+Split out from ``session-metrics.py`` to keep per-file size manageable
+as the compare feature grows (planned: pairing, rendering, insights
+card, count-tokens API mode — see ``~/.claude/plans/`` for the full
+design).
+
+Scope boundary:
+
+- **This module** — compare-specific helpers: model-family slug,
+  turn pairing, per-project family inventory, CLI-arg resolver.
+- **``session-metrics.py``** — everything else: pricing, JSONL
+  parsing, session loading, existing report rendering, CLI entry.
+
+Runtime coupling is one-way: a small set of helpers is looked up
+from ``sys.modules["session_metrics"]`` via :func:`_main` when
+needed. Callers (the CLI and tests) must ensure ``session-metrics.py``
+has been imported first under that module name.
+"""
+from __future__ import annotations
+
+import csv as csv_mod
+import hashlib
+import io
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Runtime coupling helper
+# ---------------------------------------------------------------------------
+
+_MAIN_MODULE_NAME = "session_metrics"
+
+
+def _main():
+    """Return the loaded ``session-metrics`` module.
+
+    Raises :class:`RuntimeError` if it hasn't been loaded yet. Tests
+    and the CLI entrypoint both load the main module under the name
+    ``session_metrics`` before calling any compare helper that needs
+    it (``_find_jsonl_files``, ``_load_session``, ``_SESSION_RE``,
+    ``_projects_dir``).
+    """
+    mod = sys.modules.get(_MAIN_MODULE_NAME)
+    if mod is None:
+        raise RuntimeError(
+            f"{_MAIN_MODULE_NAME!r} must be loaded before compare helpers "
+            "that depend on it are called"
+        )
+    return mod
+
+
+# ---------------------------------------------------------------------------
+# Model-family slug (fine-grained; distinct from coarse _model_family)
+# ---------------------------------------------------------------------------
+
+_CONTEXT_TIER_SUFFIX_RE = re.compile(r"\[[^\]]*\]$")
+
+
+def _strip_context_tier_suffix(model_id: str) -> str:
+    """Strip a trailing bracketed context-tier tag like ``[1m]``.
+
+    Claude Code tags the 1M-context Opus 4.7 variant as
+    ``claude-opus-4-7[1m]`` in ``message.model``. For compare-mode
+    family matching we treat this as the same family as the non-[1m]
+    baseline — pricing is identical (prefix fallback already handles
+    it) and the tokenizer is the same.
+    """
+    return _CONTEXT_TIER_SUFFIX_RE.sub("", model_id or "")
+
+
+def _model_family_slug(model_id: str) -> str:
+    """Fine-grained family slug from a model id — e.g. ``opus-4-7``.
+
+    Distinct from ``session_metrics._model_family()`` (which returns
+    the coarse ``"Opus"`` / ``"Sonnet"`` / ``"Haiku"`` bucket used by
+    the dashboard card). This finer-grained slug is what the
+    compare-mode ``last-<family>`` / ``all-<family>`` resolver keys
+    off of, and what sessions get grouped by for Mode 2 (project-
+    aggregate) compare.
+
+    - Strips the ``[1m]`` (or similar bracketed) context-tier suffix.
+    - Strips the leading ``claude-`` namespace.
+    - Strips trailing date stamps like ``-20251001`` seen on some
+      haiku ids — so ``claude-haiku-4-5`` and
+      ``claude-haiku-4-5-20251001`` return the same slug.
+    - Returns ``""`` for unknown / empty / non-Claude model ids so
+      callers can detect and refuse gracefully (BYOK / proxy guard).
+    """
+    if not model_id:
+        return ""
+    m = _strip_context_tier_suffix(model_id).lower()
+    if not m.startswith("claude-"):
+        return ""
+    m = m[len("claude-"):]
+    # Trim a trailing ``-YYYYMMDD`` date stamp if present.
+    m = re.sub(r"-\d{8}$", "", m)
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Turn pairing
+# ---------------------------------------------------------------------------
+
+# Fingerprint length: hash the first N characters of a user prompt to
+# pair turns across two sessions that ran the same prompts. Chosen
+# long enough to avoid collisions in practice (even short prompts
+# differ in their first 200 chars) but short enough that trailing
+# whitespace / minor edits don't cause mismatches.
+_FINGERPRINT_PREFIX_LEN = 200
+
+
+def _user_prompt_fingerprint_text(preceding_user_content: object) -> str:
+    """Extract plain text from a ``_preceding_user_content`` value.
+
+    Returns the concatenated ``text`` of every text block, whitespace-
+    collapsed and stripped. Non-text blocks (tool_result, image) are
+    ignored — they don't represent a user-written prompt. Returns
+    ``""`` for empty / missing / pure-tool-result entries, which the
+    fingerprint pairing should skip.
+    """
+    if preceding_user_content is None:
+        return ""
+    if isinstance(preceding_user_content, str):
+        return " ".join(preceding_user_content.split())
+    if isinstance(preceding_user_content, list):
+        parts: list[str] = []
+        for block in preceding_user_content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text = block.get("text") or ""
+                if text:
+                    parts.append(text)
+        joined = " ".join(parts)
+        return " ".join(joined.split())
+    return ""
+
+
+def _user_prompt_fingerprint(text: str) -> str:
+    """Stable sha1 hash of the first ``_FINGERPRINT_PREFIX_LEN`` chars
+    of a user prompt.
+
+    The text is whitespace-collapsed upstream by
+    :func:`_user_prompt_fingerprint_text`, so CR/LF drift and
+    leading/trailing whitespace don't change the hash. The prefix
+    is taken after normalization so different line-endings don't
+    shift chars in and out of the hashed window.
+    """
+    head = (text or "")[:_FINGERPRINT_PREFIX_LEN]
+    return hashlib.sha1(head.encode("utf-8")).hexdigest()
+
+
+def _pair_turns(
+    a_turns: list[dict],
+    b_turns: list[dict],
+    mode: str = "fingerprint",
+) -> dict:
+    """Pair turns from session A with turns from session B.
+
+    Input turns are raw entries as returned by
+    ``session_metrics._extract_turns()`` — they carry
+    ``_preceding_user_content`` for fingerprint pairing. Subagent /
+    sidechain entries are filtered out upstream by ``_load_session``
+    when ``include_subagents=False``.
+
+    Strategies:
+
+    - ``mode="ordinal"``: pairs turn ``i`` of A with turn ``i`` of B.
+      Emits whichever tail is longer as unmatched. Simplest possible
+      pairing; assumes the user ran the same prompt sequence in both
+      sessions.
+
+    - ``mode="fingerprint"`` (default): hashes the first
+      ``_FINGERPRINT_PREFIX_LEN`` chars of each turn's preceding user
+      prompt and pairs on hash equality. Tolerant of minor drift,
+      skipped turns, or extra turns on one side. Within each side,
+      duplicate fingerprints (same prompt asked twice) are paired by
+      ordinal within-hash position so the second occurrence on A
+      pairs with the second occurrence on B.
+
+    Returns a dict::
+
+        {
+            "mode":        "ordinal" | "fingerprint",
+            "paired":      [(a_turn, b_turn), ...],
+            "unmatched_a": [a_turn, ...],
+            "unmatched_b": [b_turn, ...],
+            "warnings":    [str, ...],   # human-readable advisories
+        }
+    """
+    if mode not in ("ordinal", "fingerprint"):
+        raise ValueError(f"unknown pairing mode: {mode!r}")
+
+    warnings: list[str] = []
+
+    if mode == "ordinal":
+        n = min(len(a_turns), len(b_turns))
+        paired = list(zip(a_turns[:n], b_turns[:n]))
+        tail_a = list(a_turns[n:])
+        tail_b = list(b_turns[n:])
+        if tail_a or tail_b:
+            warnings.append(
+                f"ordinal pairing: lengths differ "
+                f"(a={len(a_turns)}, b={len(b_turns)}); "
+                f"{len(tail_a) + len(tail_b)} turn(s) left unmatched"
+            )
+        return {
+            "mode":        "ordinal",
+            "paired":      paired,
+            "unmatched_a": tail_a,
+            "unmatched_b": tail_b,
+            "warnings":    warnings,
+        }
+
+    # Fingerprint mode.
+    a_by_fp: dict[str, list[dict]] = {}
+    b_by_fp: dict[str, list[dict]] = {}
+    a_empty: list[dict] = []
+    b_empty: list[dict] = []
+    for t in a_turns:
+        text = _user_prompt_fingerprint_text(t.get("_preceding_user_content"))
+        if not text:
+            a_empty.append(t)
+            continue
+        a_by_fp.setdefault(_user_prompt_fingerprint(text), []).append(t)
+    for t in b_turns:
+        text = _user_prompt_fingerprint_text(t.get("_preceding_user_content"))
+        if not text:
+            b_empty.append(t)
+            continue
+        b_by_fp.setdefault(_user_prompt_fingerprint(text), []).append(t)
+
+    paired: list[tuple[dict, dict]] = []
+    unmatched_a: list[dict] = list(a_empty)
+    unmatched_b: list[dict] = list(b_empty)
+    for fp, a_list in a_by_fp.items():
+        b_list = b_by_fp.get(fp, [])
+        k = min(len(a_list), len(b_list))
+        for i in range(k):
+            paired.append((a_list[i], b_list[i]))
+        unmatched_a.extend(a_list[k:])
+        unmatched_b.extend(b_list[k:])
+    # B-side fingerprints with no A counterpart.
+    for fp, b_list in b_by_fp.items():
+        if fp not in a_by_fp:
+            unmatched_b.extend(b_list)
+
+    if not paired and (a_turns or b_turns):
+        warnings.append(
+            "fingerprint pairing matched 0 turns — did both sessions run "
+            "the same prompt suite?"
+        )
+    if unmatched_a or unmatched_b:
+        warnings.append(
+            f"fingerprint pairing: {len(unmatched_a)} turn(s) on side A and "
+            f"{len(unmatched_b)} on side B had no partner"
+        )
+    return {
+        "mode":        "fingerprint",
+        "paired":      paired,
+        "unmatched_a": unmatched_a,
+        "unmatched_b": unmatched_b,
+        "warnings":    warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Project-level inventory and arg resolver
+# ---------------------------------------------------------------------------
+
+def _dominant_model_family(turns: list[dict]) -> str:
+    """Most frequent ``_model_family_slug`` across a session's turns.
+
+    Ties broken by first-seen order (Python 3.7+ dict insertion order).
+    Returns ``""`` if ``turns`` is empty or no turn has a known family.
+    """
+    counts: dict[str, int] = {}
+    for t in turns:
+        model = (t.get("message") or {}).get("model") or t.get("model") or ""
+        slug = _model_family_slug(model)
+        if slug:
+            counts[slug] = counts.get(slug, 0) + 1
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def _project_family_inventory(
+    slug: str,
+    include_subagents: bool = False,
+    use_cache: bool = True,
+) -> dict[str, list[tuple[Path, int]]]:
+    """Scan every session in a project and group by dominant family.
+
+    Returns:
+        ``{family_slug: [(path, user_turn_count), ...], ...}`` where
+        the inner lists are sorted most-recent-first (matching the
+        order of ``session_metrics._find_jsonl_files``). Sessions
+        whose dominant model doesn't resolve to a known family are
+        bucketed under ``""``.
+    """
+    m = _main()
+    inventory: dict[str, list[tuple[Path, int]]] = {}
+    for path in m._find_jsonl_files(slug, include_subagents=include_subagents):
+        try:
+            _sid, turns, user_ts = m._load_session(
+                path, include_subagents=include_subagents, use_cache=use_cache,
+            )
+        except OSError:
+            continue
+        family = _dominant_model_family(turns)
+        inventory.setdefault(family, []).append((path, len(user_ts)))
+    return inventory
+
+
+class CompareArgError(ValueError):
+    """Raised by :func:`_resolve_compare_arg` when an arg can't be
+    resolved to one or more session paths.
+
+    Carries a user-facing message; the CLI catches this and prints
+    ``[error] <msg>`` then exits. Tests assert the message text.
+    """
+
+
+def _resolve_compare_arg(
+    arg: str,
+    slug: str,
+    *,
+    include_subagents: bool = False,
+    min_turns: int = 5,
+    use_cache: bool = True,
+) -> tuple[str, list[Path]]:
+    """Resolve a ``--compare`` arg to one or more session JSONL paths.
+
+    Accepts four forms:
+
+    - **Path**: absolute or relative ``.jsonl`` path. Returned as
+      ``("single", [path])`` if the file exists.
+    - **Session UUID**: a value matching
+      ``session_metrics._SESSION_RE``. Looked up under the current
+      project's slug dir (and as a fallback, any project dir under
+      ``CLAUDE_PROJECTS_DIR``).
+    - **``last-<family>``**: the most-recent session in the current
+      project whose dominant model family slug matches ``<family>``.
+      Skips sessions with fewer than ``min_turns`` user prompts.
+      Returns ``("single", [path])``.
+    - **``all-<family>``**: every session in the current project
+      whose dominant model family slug matches ``<family>``. No
+      min-turn filter (aggregates observational data; short sessions
+      still contribute). Returns ``("aggregate", [path, ...])``.
+
+    Raises :class:`CompareArgError` on any failure with a message
+    that tells the user *what* went wrong and, where possible,
+    *what alternatives are present* (e.g. listing the families
+    actually seen in the project for typo'd ``last-X`` tokens).
+    """
+    if not arg:
+        raise CompareArgError("compare arg is empty")
+
+    m = _main()
+
+    # Form 1: path. Must contain a path separator OR end in .jsonl
+    # to avoid mis-matching bare family slugs that happen to exist
+    # as cwd-relative paths.
+    if "/" in arg or arg.endswith(".jsonl"):
+        p = Path(arg).expanduser()
+        if p.exists() and p.is_file():
+            return ("single", [p.resolve()])
+        raise CompareArgError(f"path does not exist: {arg}")
+
+    # Forms 2 & 3: magic tokens. Checked BEFORE session-UUID because
+    # ``_SESSION_RE`` is permissive (any ``[A-Za-z0-9._-]{1,64}``) and
+    # would accept ``last-opus-4-7`` / ``all-opus-4-7`` as "UUIDs",
+    # masking the magic-token path.
+    if arg.startswith("last-") or arg.startswith("all-"):
+        kind, _, family = arg.partition("-")
+        family = family.strip()
+        if not family:
+            raise CompareArgError(
+                f"magic token {arg!r} is missing a family slug "
+                f"(expected e.g. 'last-opus-4-7')"
+            )
+        inventory = _project_family_inventory(
+            slug, include_subagents=include_subagents, use_cache=use_cache,
+        )
+        # Fuzzy family match: allow short forms like ``4-7`` when only
+        # one family in the project carries that suffix.
+        matched = _match_family_key(family, list(inventory.keys()))
+        if matched is None:
+            present = sorted(f for f in inventory if f)
+            if not present:
+                raise CompareArgError(
+                    f"no sessions with a recognized Claude model family "
+                    f"in project {slug!r}"
+                )
+            raise CompareArgError(
+                f"no sessions found for family {family!r} in project "
+                f"{slug!r}. Families present: {', '.join(present)}"
+            )
+        sessions = inventory[matched]
+        if kind == "last":
+            eligible = [(p, n) for p, n in sessions if n >= min_turns]
+            if not eligible:
+                raise CompareArgError(
+                    f"no session of family {matched!r} in project "
+                    f"{slug!r} has >={min_turns} user prompt(s) "
+                    f"(found {len(sessions)} with fewer turns - "
+                    f"override with --compare-min-turns)"
+                )
+            # _find_jsonl_files returns newest-first, preserved by
+            # _project_family_inventory; eligible[0] is newest.
+            return ("single", [eligible[0][0]])
+        # kind == "all"
+        return ("aggregate", [p for p, _n in sessions])
+
+    # Form 4: bare session UUID. ``_SESSION_RE`` accepts any
+    # ``[A-Za-z0-9._-]{1,64}`` so this branch runs only after the
+    # magic-token prefixes have been ruled out above.
+    if m._SESSION_RE.match(arg):
+        candidate = m._projects_dir() / slug / f"{arg}.jsonl"
+        if candidate.exists():
+            return ("single", [candidate.resolve()])
+        # Fallback: search across all project dirs.
+        for p in m._projects_dir().rglob(f"{arg}.jsonl"):
+            return ("single", [p.resolve()])
+        raise CompareArgError(f"session id not found: {arg}")
+
+    raise CompareArgError(
+        f"could not interpret compare arg {arg!r}. Expected a path, "
+        f"session UUID, or 'last-<family>' / 'all-<family>' token"
+    )
+
+
+def _match_family_key(query: str, candidates: list[str]) -> str | None:
+    """Match a family query string against present-family slugs.
+
+    Tries, in order:
+
+    1. Exact match (``opus-4-7`` → ``opus-4-7``).
+    2. Candidates that **end with** ``-<query>`` when exactly one
+       such candidate exists (``4-7`` → ``opus-4-7`` iff there's no
+       other ``*4-7`` present like ``sonnet-4-7``).
+
+    Returns the matched key or ``None``. ``None`` signals the caller
+    to produce a friendly error listing candidates.
+    """
+    real = [c for c in candidates if c]
+    if query in real:
+        return query
+    suffix_matches = [
+        c for c in real if c == query or c.endswith("-" + query)
+    ]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Compare-report builder (Mode 1 — controlled session pair)
+# ---------------------------------------------------------------------------
+
+# Threshold for the cache-read-share-of-input drift advisory. When two
+# sessions differ by more than this many percentage points, the header
+# flags it — cache warmth confounds tokenizer-ratio interpretation.
+_CACHE_SHARE_DRIFT_PP = 10.0
+
+
+def _context_tier_from_model_id(model_id: str) -> str:
+    """Extract a bracketed context-tier tag from a model id.
+
+    ``claude-opus-4-7[1m]`` → ``"1m"``; bare ``claude-opus-4-7`` → ``""``.
+    The lowercased inner token is returned so advisory text can say
+    "1m vs default" without caring about source-case drift.
+    """
+    if not model_id:
+        return ""
+    m = _CONTEXT_TIER_SUFFIX_RE.search(model_id)
+    if not m:
+        return ""
+    return m.group(0).strip("[]").lower()
+
+
+def _dominant_model_id(turns: list[dict]) -> str:
+    """Most-frequent raw ``message.model`` string across a session's turns.
+
+    Returns the full model id including any ``[1m]`` suffix — distinct
+    from :func:`_model_family_slug`, which strips that suffix. Used by
+    the compare report so the header can display the exact model id the
+    user ran, not a normalized slug.
+    """
+    counts: dict[str, int] = {}
+    for t in turns:
+        model = (t.get("message") or {}).get("model") or t.get("model") or ""
+        if model:
+            counts[model] = counts.get(model, 0) + 1
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float | None:
+    """Return ``numerator/denominator`` or ``None`` if denominator is 0.
+
+    Ratio math is everywhere in the compare report (b/a for tokens, cost,
+    chars-per-token). Zero-input turns are possible (tool-result-only
+    exchanges), so every division path funnels through this guard.
+    """
+    if not denominator:
+        return None
+    return numerator / denominator
+
+
+def _compute_ratios(a_rec: dict, b_rec: dict) -> dict:
+    """Per-turn b/a ratios for the four headline columns.
+
+    Returns a dict with ``input_tokens``, ``output_tokens``,
+    ``total_tokens``, ``cost_usd`` — each a float or ``None`` when the
+    A-side denominator is zero. Used to heatmap the turn table and to
+    feed the p50/p95 histogram in later HTML work.
+    """
+    return {
+        "input_tokens":  _safe_ratio(b_rec["input_tokens"], a_rec["input_tokens"]),
+        "output_tokens": _safe_ratio(b_rec["output_tokens"], a_rec["output_tokens"]),
+        "total_tokens":  _safe_ratio(b_rec["total_tokens"], a_rec["total_tokens"]),
+        "cost_usd":      _safe_ratio(b_rec["cost_usd"], a_rec["cost_usd"]),
+    }
+
+
+def _cache_read_share_pct(totals: dict) -> float:
+    """Cache reads as a percentage of total input-side tokens.
+
+    ``total_input`` is already computed by ``_totals_from_turns`` as the
+    sum of uncached input + cache reads + cache writes. Returns 0 when
+    a session has no input at all (degenerate but possible for
+    single-turn no-cache transcripts).
+    """
+    total_input = totals.get("total_input", 0) or 0
+    if not total_input:
+        return 0.0
+    return 100.0 * (totals.get("cache_read", 0) or 0) / total_input
+
+
+def _build_side_info(
+    session_id: str,
+    raw_turns: list[dict],
+    user_ts: list[int],
+    turn_records: list[dict],
+    tz_offset_hours: float,
+) -> dict:
+    """Compact per-side summary consumed by every compare renderer.
+
+    Carries both the raw model id (with any ``[1m]`` suffix, used for
+    the header banner) and the stripped family slug (used for
+    model-agnostic report copy).
+    """
+    m = _main()
+    dominant = _dominant_model_id(raw_turns)
+    totals = m._totals_from_turns(turn_records)
+    first_ts = raw_turns[0].get("timestamp", "") if raw_turns else ""
+    last_ts = raw_turns[-1].get("timestamp", "") if raw_turns else ""
+    return {
+        "session_id":        session_id,
+        "session_ids":       [session_id],   # Mode 2 will carry a list
+        "dominant_model_id": dominant,
+        "model_family":      _model_family_slug(dominant),
+        "context_tier":      _context_tier_from_model_id(dominant),
+        "turn_count":        len(turn_records),
+        "user_prompt_count": len(user_ts),
+        "first_ts":          first_ts,
+        "last_ts":           last_ts,
+        "first_ts_fmt":      m._fmt_ts(first_ts, tz_offset_hours) if first_ts else "",
+        "last_ts_fmt":       m._fmt_ts(last_ts, tz_offset_hours) if last_ts else "",
+        "totals":            totals,
+        "cache_read_share_of_input": _cache_read_share_pct(totals),
+    }
+
+
+def _build_aggregate_side_info(
+    sessions: list[tuple[str, list[dict], list[int], list[dict]]],
+    tz_offset_hours: float,
+) -> dict:
+    """Aggregate multiple sessions into a single compare side.
+
+    ``sessions`` is a list of ``(session_id, raw_turns, user_timestamps,
+    turn_records)`` tuples — one per session rolled into this side. The
+    returned dict carries the same keys as :func:`_build_side_info` plus:
+
+    - ``session_count``: number of sessions aggregated.
+    - ``session_ids``: the full list.
+    - ``avg_input_tokens_per_prompt``, ``avg_output_tokens_per_turn``: the
+      aggregate-only averages listed in the Phase 3 plan.
+    - ``tool_calls_per_turn`` and ``thinking_turn_pct``: mirrored out of
+      ``totals`` to the top level so the observational report can pull
+      them without digging into the totals sub-dict.
+
+    Mode 1 side_info is retained separately — flattening both shapes
+    into one entry point would make Mode 1 callers carry degenerate
+    single-session fields they don't use.
+    """
+    m = _main()
+
+    session_ids = [sid for sid, _r, _u, _rec in sessions]
+    flat_raw = [t for _sid, raw, _u, _rec in sessions for t in raw]
+    flat_records = [r for _sid, _raw, _u, recs in sessions for r in recs]
+    flat_user_ts = [ts for _sid, _raw, uts, _rec in sessions for ts in uts]
+
+    totals = m._totals_from_turns(flat_records)
+    dominant = _dominant_model_id(flat_raw)
+
+    all_timestamps = [t.get("timestamp", "") for t in flat_raw if t.get("timestamp")]
+    first_ts = min(all_timestamps) if all_timestamps else ""
+    last_ts = max(all_timestamps) if all_timestamps else ""
+
+    n_turns = len(flat_records)
+    n_prompts = len(flat_user_ts)
+
+    return {
+        "session_id":        session_ids[0] if len(session_ids) == 1 else "",
+        "session_ids":       session_ids,
+        "session_count":     len(session_ids),
+        "dominant_model_id": dominant,
+        "model_family":      _model_family_slug(dominant),
+        "context_tier":      _context_tier_from_model_id(dominant),
+        "turn_count":        n_turns,
+        "user_prompt_count": n_prompts,
+        "first_ts":          first_ts,
+        "last_ts":           last_ts,
+        "first_ts_fmt":      m._fmt_ts(first_ts, tz_offset_hours) if first_ts else "",
+        "last_ts_fmt":       m._fmt_ts(last_ts, tz_offset_hours) if last_ts else "",
+        "totals":            totals,
+        "cache_read_share_of_input":   _cache_read_share_pct(totals),
+        "avg_input_tokens_per_prompt": (
+            totals["input"] / n_prompts if n_prompts else 0.0
+        ),
+        "avg_output_tokens_per_turn":  (
+            totals["output"] / n_turns if n_turns else 0.0
+        ),
+        "tool_calls_per_turn":         totals.get("tool_call_avg_per_turn", 0.0),
+        "thinking_turn_pct":           totals.get("thinking_turn_pct", 0.0),
+    }
+
+
+def _build_advisories(
+    side_a: dict,
+    side_b: dict,
+    pairing: dict,
+) -> list[dict]:
+    """Header-banner advisories surfaced on top of the compare report.
+
+    Kinds:
+
+    - ``context-tier-mismatch``: one side is ``[1m]`` and the other
+      isn't. Any tokenizer ratio conflates tokenizer + window-tier.
+    - ``cache-share-drift``: cache-read share differs by more than
+      :data:`_CACHE_SHARE_DRIFT_PP` percentage points. Cache warmth
+      was different; read the cache column with skepticism.
+    - ``model-family-collision``: same family on both sides. Degenerate
+      compare — probably an A/B replay of one model. Still renders.
+    - ``no-fingerprint-matches``: fingerprint pairing produced 0 pairs.
+      Likely the two sessions didn't run the same prompts.
+    - ``empty-side``: one side has no turns.
+
+    Each advisory is ``{"kind": str, "severity": "warn"|"info",
+    "message": str}``. Renderers treat ``warn`` prominently; ``info``
+    is a footnote.
+    """
+    advisories: list[dict] = []
+
+    if side_a["context_tier"] != side_b["context_tier"]:
+        a_tier = side_a["context_tier"] or "default"
+        b_tier = side_b["context_tier"] or "default"
+        advisories.append({
+            "kind":     "context-tier-mismatch",
+            "severity": "warn",
+            "message": (
+                f"context-tier mismatch: side A is {a_tier!r}, side B is "
+                f"{b_tier!r} — any ratio conflates tokenizer + context-window"
+            ),
+        })
+
+    a_share = side_a["cache_read_share_of_input"]
+    b_share = side_b["cache_read_share_of_input"]
+    if abs(a_share - b_share) > _CACHE_SHARE_DRIFT_PP:
+        advisories.append({
+            "kind":     "cache-share-drift",
+            "severity": "warn",
+            "message": (
+                f"cache-read share differs by "
+                f"{abs(a_share - b_share):.1f} pp (A={a_share:.1f}%, "
+                f"B={b_share:.1f}%); cache warmth can skew the cache column"
+            ),
+        })
+
+    if (
+        side_a["model_family"]
+        and side_a["model_family"] == side_b["model_family"]
+        and side_a["dominant_model_id"] == side_b["dominant_model_id"]
+    ):
+        advisories.append({
+            "kind":     "model-family-collision",
+            "severity": "info",
+            "message": (
+                f"both sides use {side_a['dominant_model_id']!r}; ratios will "
+                f"reflect run-to-run variance rather than model deltas"
+            ),
+        })
+
+    if pairing["mode"] == "fingerprint" and not pairing["paired"]:
+        advisories.append({
+            "kind":     "no-fingerprint-matches",
+            "severity": "warn",
+            "message": (
+                "fingerprint pairing matched 0 turns; the two sessions likely "
+                "did not run the same prompts (try --pair-by ordinal)"
+            ),
+        })
+
+    if side_a["turn_count"] == 0 or side_b["turn_count"] == 0:
+        advisories.append({
+            "kind":     "empty-side",
+            "severity": "warn",
+            "message": "one or both sessions have no assistant turns with usage",
+        })
+
+    return advisories
+
+
+def _build_compare_summary(
+    side_a: dict,
+    side_b: dict,
+    paired: list[dict],
+    unmatched_a: list[dict],
+    unmatched_b: list[dict],
+) -> dict:
+    """Aggregate ratios used by every compare renderer's summary strip.
+
+    Ratios are side-total based (b/a), not mean-of-per-turn-ratios.
+    Mean-of-ratios is skewed by low-input turns; side-total is the
+    bottom-line number users care about (total cost delta).
+
+    Instruction-pass rates are computed over the subset of paired turns that
+    actually carry a predicate (``instruction_pass_a is not None``) so the
+    denominator reflects "suite turns evaluated", not "all paired turns".
+    """
+    a_t = side_a["totals"]
+    b_t = side_b["totals"]
+
+    # IFEval aggregate: only count turns where a predicate ran.
+    evaluated = [p for p in paired if p.get("instruction_pass_a") is not None]
+    if evaluated:
+        pass_a = sum(1 for p in evaluated if p["instruction_pass_a"])
+        pass_b = sum(1 for p in evaluated if p["instruction_pass_b"])
+        rate_a = pass_a / len(evaluated)
+        rate_b = pass_b / len(evaluated)
+        pass_delta_pp = 100.0 * (rate_b - rate_a)
+    else:
+        pass_a = pass_b = 0
+        rate_a = rate_b = None
+        pass_delta_pp = None
+
+    return {
+        "paired_count":             len(paired),
+        "unmatched_a_count":        len(unmatched_a),
+        "unmatched_b_count":        len(unmatched_b),
+        "input_tokens_ratio":       _safe_ratio(b_t["input"], a_t["input"]),
+        "output_tokens_ratio":      _safe_ratio(b_t["output"], a_t["output"]),
+        "total_tokens_ratio":       _safe_ratio(b_t["total"], a_t["total"]),
+        "cost_ratio":               _safe_ratio(b_t["cost"], a_t["cost"]),
+        "cache_read_share_delta_pp": (
+            side_b["cache_read_share_of_input"]
+            - side_a["cache_read_share_of_input"]
+        ),
+        "instruction_evaluated":   len(evaluated),
+        "instruction_pass_a":      pass_a,
+        "instruction_pass_b":      pass_b,
+        "instruction_pass_rate_a": rate_a,
+        "instruction_pass_rate_b": rate_b,
+        "instruction_pass_delta_pp": pass_delta_pp,
+    }
+
+
+class SuiteVersionMismatchError(ValueError):
+    """Raised when compared sessions carry different compare-suite versions.
+
+    Silent averaging across suite versions is the bug this guards against —
+    a v2 prompt set and a v1 prompt set will generally produce different
+    ratios for reasons unrelated to the model under test. The caller can
+    opt in with ``--allow-suite-mismatch``.
+    """
+
+
+def _resolve_suite_versions(
+    side_a_turns: list[dict],
+    side_b_turns: list[dict],
+    *,
+    allow_mismatch: bool,
+) -> tuple[set[int], set[int], list[dict]]:
+    """Check sentinel-version agreement and emit advisories.
+
+    Returns ``(versions_a, versions_b, advisories)``. Raises
+    :class:`SuiteVersionMismatchError` when the two sides disagree and
+    ``allow_mismatch`` is False.
+    """
+    va = _detect_suite_versions(side_a_turns)
+    vb = _detect_suite_versions(side_b_turns)
+    advisories: list[dict] = []
+
+    if not va and not vb:
+        # Neither side ran the canonical suite — not a mismatch, just
+        # a non-suite comparison. Upstream still supports this for
+        # ad-hoc paired sessions; the IFEval column simply stays blank.
+        return va, vb, advisories
+
+    if len(va) > 1 or len(vb) > 1:
+        # A single session carrying multiple suite versions is almost
+        # always a copy-paste error (user mixed prompts from different
+        # suites). Flag as a warning regardless of allow_mismatch.
+        advisories.append({
+            "kind":     "suite-version-intrasession-mix",
+            "severity": "warn",
+            "message": (
+                f"a session mixes multiple suite versions (A={sorted(va)}, "
+                f"B={sorted(vb)}); IFEval results may be inconsistent"
+            ),
+        })
+
+    if va and vb and va != vb:
+        msg = (
+            f"compare-suite versions differ between sides: A={sorted(va)}, "
+            f"B={sorted(vb)} — re-run both sides under the same suite, or "
+            f"pass --allow-suite-mismatch to proceed anyway"
+        )
+        if not allow_mismatch:
+            raise SuiteVersionMismatchError(msg)
+        advisories.append({
+            "kind":     "suite-version-mismatch",
+            "severity": "warn",
+            "message":  msg,
+        })
+
+    return va, vb, advisories
+
+
+def _build_compare_report(
+    side_a_session_id: str,
+    side_a_turns: list[dict],
+    side_a_user_ts: list[int],
+    side_b_session_id: str,
+    side_b_turns: list[dict],
+    side_b_user_ts: list[int],
+    *,
+    slug: str,
+    pair_by: str = "fingerprint",
+    tz_offset_hours: float = 0.0,
+    tz_label: str = "UTC",
+    prompt_suite: dict | None = None,
+    allow_suite_mismatch: bool = False,
+) -> dict:
+    """Build a Mode-1 (controlled, session-pair) compare report.
+
+    Returns a report dict whose ``mode`` is ``"compare"`` — the main
+    renderer branches (``render_text`` etc.) delegate to the compare
+    renderers in this module when they see this. Per-turn records are
+    built via the main module's :func:`_build_turn_record` so column
+    semantics match single-session reports.
+
+    ``prompt_suite`` lets callers (chiefly tests) inject a predicate
+    registry; production calls pass ``None`` to load the packaged suite
+    from disk. A missing suite dir silently yields an empty dict — the
+    compare still runs, the IFEval column stays blank.
+    """
+    m = _main()
+
+    if prompt_suite is None:
+        try:
+            prompt_suite = _load_prompt_suite()
+        except PromptSuiteError:
+            # A malformed local suite shouldn't sink the compare — log
+            # nothing, skip IFEval, let the user see a blank pass column.
+            prompt_suite = {}
+
+    suite_advisories: list[dict] = []
+    _va, _vb, suite_advisories = _resolve_suite_versions(
+        side_a_turns, side_b_turns, allow_mismatch=allow_suite_mismatch,
+    )
+
+    a_turn_records = [m._build_turn_record(i + 1, t, tz_offset_hours)
+                      for i, t in enumerate(side_a_turns)]
+    b_turn_records = [m._build_turn_record(i + 1, t, tz_offset_hours)
+                      for i, t in enumerate(side_b_turns)]
+
+    pairing = _pair_turns(side_a_turns, side_b_turns, mode=pair_by)
+
+    # Map raw-turn identity to the per-side turn record so pairing output
+    # (which references raw turns) can be translated back to records.
+    # id() is safe here because the raw turn dicts have well-defined
+    # lifetimes within this call.
+    a_rec_by_raw = {id(t): r for t, r in zip(side_a_turns, a_turn_records)}
+    b_rec_by_raw = {id(t): r for t, r in zip(side_b_turns, b_turn_records)}
+
+    paired: list[dict] = []
+    for a_raw, b_raw in pairing["paired"]:
+        a_rec = a_rec_by_raw[id(a_raw)]
+        b_rec = b_rec_by_raw[id(b_raw)]
+        fp_text = _user_prompt_fingerprint_text(
+            a_raw.get("_preceding_user_content"))
+
+        # IFEval wiring: look up each side's sentinel and run the suite
+        # predicate against the assistant's text output. Both sides
+        # ideally agree on the prompt (fingerprint pairing guarantees
+        # identical user text, so sentinels match); ordinal pairing can
+        # produce mismatches, which we handle by only evaluating when
+        # both sentinels agree.
+        a_sentinel = _primary_sentinel(
+            _user_prompt_fingerprint_text(a_raw.get("_preceding_user_content")))
+        b_sentinel = _primary_sentinel(
+            _user_prompt_fingerprint_text(b_raw.get("_preceding_user_content")))
+
+        suite_prompt_name: str | None = None
+        instruction_pass_a: bool | None = None
+        instruction_pass_b: bool | None = None
+        if a_sentinel and b_sentinel and a_sentinel[1] == b_sentinel[1]:
+            suite_prompt_name = a_sentinel[1]
+            prompt_entry = prompt_suite.get(suite_prompt_name)
+            if prompt_entry is not None:
+                check_fn = prompt_entry.get("check")
+                instruction_pass_a = _run_predicate(
+                    check_fn, _assistant_text(a_raw))
+                instruction_pass_b = _run_predicate(
+                    check_fn, _assistant_text(b_raw))
+
+        paired.append({
+            "a":                   a_rec,
+            "b":                   b_rec,
+            "fingerprint":         _user_prompt_fingerprint(fp_text) if fp_text else None,
+            "ratios":              _compute_ratios(a_rec, b_rec),
+            "suite_prompt_name":   suite_prompt_name,
+            "instruction_pass_a":  instruction_pass_a,
+            "instruction_pass_b":  instruction_pass_b,
+        })
+    unmatched_a_recs = [a_rec_by_raw[id(t)] for t in pairing["unmatched_a"]]
+    unmatched_b_recs = [b_rec_by_raw[id(t)] for t in pairing["unmatched_b"]]
+
+    side_a_info = _build_side_info(
+        side_a_session_id, side_a_turns, side_a_user_ts,
+        a_turn_records, tz_offset_hours,
+    )
+    side_b_info = _build_side_info(
+        side_b_session_id, side_b_turns, side_b_user_ts,
+        b_turn_records, tz_offset_hours,
+    )
+    advisories = _build_advisories(side_a_info, side_b_info, pairing)
+    advisories.extend(suite_advisories)
+    summary = _build_compare_summary(
+        side_a_info, side_b_info, paired, unmatched_a_recs, unmatched_b_recs,
+    )
+    return {
+        "mode":            "compare",
+        "compare_mode":    "controlled",
+        "slug":            slug,
+        "generated_at":    datetime.now(timezone.utc).isoformat(),
+        "tz_offset_hours": tz_offset_hours,
+        "tz_label":        tz_label,
+        "pair_by":         pair_by,
+        "side_a":          side_a_info,
+        "side_b":          side_b_info,
+        "paired":          paired,
+        "unmatched_a":     unmatched_a_recs,
+        "unmatched_b":     unmatched_b_recs,
+        "warnings":        pairing["warnings"],
+        "advisories":      advisories,
+        "summary":         summary,
+    }
+
+
+def _build_aggregate_advisories(side_a: dict, side_b: dict) -> list[dict]:
+    """Mode-2-specific advisories.
+
+    Observational reports need every Mode-1 warning *except* the two
+    that assume paired turns (``no-fingerprint-matches`` is pairing-
+    specific) and always carry the banner that reminds users this is a
+    drift summary — the ratios conflate tokenizer shift with prompt-
+    distribution shift between the two families.
+    """
+    advisories: list[dict] = [{
+        "kind":     "observational-not-controlled",
+        "severity": "warn",
+        "message": (
+            "observational compare — ratios reflect aggregate usage across "
+            "differing prompt distributions. For attribution (tokenizer vs "
+            "prompt mix), run the controlled suite via "
+            "'session-metrics --compare-prep'"
+        ),
+    }]
+
+    if side_a["context_tier"] != side_b["context_tier"]:
+        a_tier = side_a["context_tier"] or "default"
+        b_tier = side_b["context_tier"] or "default"
+        advisories.append({
+            "kind":     "context-tier-mismatch",
+            "severity": "warn",
+            "message": (
+                f"context-tier mismatch: side A is {a_tier!r}, side B is "
+                f"{b_tier!r} — any ratio conflates tokenizer + context-window"
+            ),
+        })
+
+    a_share = side_a["cache_read_share_of_input"]
+    b_share = side_b["cache_read_share_of_input"]
+    if abs(a_share - b_share) > _CACHE_SHARE_DRIFT_PP:
+        advisories.append({
+            "kind":     "cache-share-drift",
+            "severity": "warn",
+            "message": (
+                f"cache-read share differs by "
+                f"{abs(a_share - b_share):.1f} pp (A={a_share:.1f}%, "
+                f"B={b_share:.1f}%); cache warmth can skew the cache column"
+            ),
+        })
+
+    if (
+        side_a["model_family"]
+        and side_a["model_family"] == side_b["model_family"]
+    ):
+        advisories.append({
+            "kind":     "model-family-collision",
+            "severity": "info",
+            "message": (
+                f"both sides are family {side_a['model_family']!r}; this is "
+                f"an A/B within one model, not a cross-model compare"
+            ),
+        })
+
+    if side_a["turn_count"] == 0 or side_b["turn_count"] == 0:
+        advisories.append({
+            "kind":     "empty-side",
+            "severity": "warn",
+            "message": (
+                "one side has no assistant turns with usage — "
+                f"A={side_a['turn_count']}, B={side_b['turn_count']}"
+            ),
+        })
+
+    return advisories
+
+
+def _build_aggregate_summary(side_a: dict, side_b: dict) -> dict:
+    """Side-total ratios for the observational report's summary strip.
+
+    Identical keys to :func:`_build_compare_summary` so renderers can
+    share the ratio-printing codepath, but without the paired/unmatched
+    counters (no pairing happens in Mode 2). The ``avg_*_ratio`` keys
+    surface the aggregate-only averages that only Mode 2 can populate.
+    """
+    a_t = side_a["totals"]
+    b_t = side_b["totals"]
+    return {
+        "input_tokens_ratio":  _safe_ratio(b_t["input"], a_t["input"]),
+        "output_tokens_ratio": _safe_ratio(b_t["output"], a_t["output"]),
+        "total_tokens_ratio":  _safe_ratio(b_t["total"], a_t["total"]),
+        "cost_ratio":          _safe_ratio(b_t["cost"], a_t["cost"]),
+        "cache_read_share_delta_pp": (
+            side_b["cache_read_share_of_input"]
+            - side_a["cache_read_share_of_input"]
+        ),
+        "avg_input_per_prompt_ratio": _safe_ratio(
+            side_b["avg_input_tokens_per_prompt"],
+            side_a["avg_input_tokens_per_prompt"],
+        ),
+        "avg_output_per_turn_ratio": _safe_ratio(
+            side_b["avg_output_tokens_per_turn"],
+            side_a["avg_output_tokens_per_turn"],
+        ),
+        "tool_calls_per_turn_ratio": _safe_ratio(
+            side_b["tool_calls_per_turn"],
+            side_a["tool_calls_per_turn"],
+        ),
+    }
+
+
+def _build_compare_aggregate_report(
+    side_a_sessions: list[tuple[str, list[dict], list[int]]],
+    side_b_sessions: list[tuple[str, list[dict], list[int]]],
+    *,
+    slug: str,
+    tz_offset_hours: float = 0.0,
+    tz_label: str = "UTC",
+) -> dict:
+    """Build a Mode-2 (observational, project-aggregate) compare report.
+
+    ``side_a_sessions`` / ``side_b_sessions`` carry
+    ``(session_id, raw_turns, user_timestamps)`` tuples per session.
+    Per-turn records are built via the main module's
+    :func:`_build_turn_record` — column semantics match single-session
+    and controlled-compare reports.
+
+    The returned dict has ``mode="compare"``, ``compare_mode=
+    "observational"``, no ``paired``/``unmatched`` fields (pairing
+    isn't meaningful when prompts differ across sessions), and the
+    same header/summary/advisory/totals shape Mode 1 uses — so
+    renderers can reuse most of the Mode 1 helpers.
+    """
+    m = _main()
+
+    def _per_side(sessions):
+        prepared = []
+        for sid, raw_turns, user_ts in sessions:
+            records = [m._build_turn_record(i + 1, t, tz_offset_hours)
+                       for i, t in enumerate(raw_turns)]
+            prepared.append((sid, raw_turns, user_ts, records))
+        return _build_aggregate_side_info(prepared, tz_offset_hours)
+
+    side_a_info = _per_side(side_a_sessions)
+    side_b_info = _per_side(side_b_sessions)
+    advisories = _build_aggregate_advisories(side_a_info, side_b_info)
+    summary = _build_aggregate_summary(side_a_info, side_b_info)
+    return {
+        "mode":            "compare",
+        "compare_mode":    "observational",
+        "slug":            slug,
+        "generated_at":    datetime.now(timezone.utc).isoformat(),
+        "tz_offset_hours": tz_offset_hours,
+        "tz_label":        tz_label,
+        "side_a":          side_a_info,
+        "side_b":          side_b_info,
+        "warnings":        [],
+        "advisories":      advisories,
+        "summary":         summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Prompt suite (Phase 4) — sentinel detection + predicate loader
+# ---------------------------------------------------------------------------
+
+# Version of the canonical prompt suite shipped with this release. Bump when
+# prompt bodies or predicates change in a way that would skew ratios across
+# older vs newer captures — the suite-version-mismatch refusal keys off this
+# integer so old captures don't get silently averaged against new ones.
+_SUITE_VERSION = 1
+
+# Directory the prompt files live in. Resolved relative to this script so the
+# suite loads correctly whether the skill is running from the dev repo, the
+# plugin cache, or a project-local copy.
+_PROMPT_SUITE_DIR = (
+    Path(__file__).resolve().parent.parent
+    / "references" / "model-compare" / "prompts"
+)
+
+# Sentinel regex: matches ``[session-metrics:compare-suite:v<N>:prompt=<name>]``
+# anywhere in a user prompt. Plain brackets (not HTML comments) because HTML
+# comments get mangled in some Claude-Code paste paths; the bracket form
+# survives CR/LF normalization and markdown quoting round-trips.
+_SENTINEL_RE = re.compile(
+    r"\[session-metrics:compare-suite:v(\d+):prompt=([a-z0-9_]+)\]"
+)
+
+
+def _extract_sentinels(text: str) -> list[tuple[int, str]]:
+    """All ``(version, prompt_name)`` sentinels in a user prompt.
+
+    Returns every match so we can detect the rare case of multiple sentinels
+    pasted into one prompt (malformed capture — caller refuses). Returns an
+    empty list for non-suite prompts, which the predicate-eval path skips.
+    """
+    return [(int(v), name) for v, name in _SENTINEL_RE.findall(text or "")]
+
+
+def _primary_sentinel(text: str) -> tuple[int, str] | None:
+    """First sentinel in the text, or None.
+
+    Used when the caller only needs to know which suite prompt (if any) a
+    turn belongs to — multi-sentinel anomalies are surfaced separately by
+    :func:`_extract_sentinels`.
+    """
+    hits = _extract_sentinels(text)
+    return hits[0] if hits else None
+
+
+def _parse_simple_yaml(text: str) -> dict:
+    """Minimal ``key: value`` YAML parser for prompt-file frontmatter.
+
+    Only supports flat ``key: value`` lines (no nesting, no lists, no
+    multi-line strings). Values are stripped of wrapping single / double
+    quotes. Comment lines starting with ``#`` are ignored.
+
+    Staying stdlib-only is a hard constraint for this skill, so we don't
+    import PyYAML — and the frontmatter schema is under our control, which
+    keeps this parser honest.
+    """
+    out: dict = {}
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if ":" not in s:
+            continue
+        key, _, value = s.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+# Fenced predicate block: four-backtick fence prefixed by ``python``. Chose a
+# 4-tick fence because prompts themselves routinely contain 3-tick Python /
+# diff / CSV snippets — a 3-tick predicate fence would collide with those.
+_PREDICATE_MARKER = "<!-- PREDICATE -->"
+_PREDICATE_FENCE_RE = re.compile(
+    r"````python\s*\n(.*?)\n````",
+    flags=re.DOTALL,
+)
+
+
+class PromptSuiteError(ValueError):
+    """Raised when a prompt file is malformed or the suite can't load."""
+
+
+def _parse_prompt_file(path: Path) -> dict:
+    """Parse one prompt file into ``{name, metadata, body, check}``.
+
+    File layout is fixed:
+
+    - YAML-like frontmatter between ``---`` fences at the top.
+    - Prompt body (what the user pastes into Claude Code).
+    - A ``<!-- PREDICATE -->`` HTML-comment marker.
+    - A 4-backtick ``python`` fenced block defining ``check(text) -> bool``.
+
+    ``check`` may be ``None`` (prompt intentionally has no IFEval predicate
+    — see ``05_tool_heavy_task.md``). The returned dict carries the body
+    *without* the predicate section so ``--compare-prep`` can paste the
+    body directly. Predicates are executed once at load time in an
+    isolated namespace so each prompt's ``check`` doesn't pollute the next.
+    """
+    raw = path.read_text(encoding="utf-8")
+    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", raw, flags=re.DOTALL)
+    if not fm_match:
+        raise PromptSuiteError(
+            f"{path.name}: missing YAML frontmatter (expected leading '---' fence)"
+        )
+    fm_text, rest = fm_match.groups()
+    metadata = _parse_simple_yaml(fm_text)
+    name = metadata.get("name") or path.stem.lstrip("0123456789_")
+    if not name:
+        raise PromptSuiteError(f"{path.name}: frontmatter missing 'name' field")
+
+    if _PREDICATE_MARKER in rest:
+        body, _, pred_block = rest.partition(_PREDICATE_MARKER)
+    else:
+        body, pred_block = rest, ""
+
+    check_fn = None
+    if pred_block:
+        mm = _PREDICATE_FENCE_RE.search(pred_block)
+        if mm:
+            src = mm.group(1)
+            ns: dict = {}
+            try:
+                exec(src, ns)   # trusted skill-shipped code — no sandbox
+            except Exception as exc:  # noqa: BLE001
+                raise PromptSuiteError(
+                    f"{path.name}: predicate failed to exec — {exc!r}"
+                ) from exc
+            candidate = ns.get("check")
+            if candidate is not None and not callable(candidate):
+                raise PromptSuiteError(
+                    f"{path.name}: 'check' must be callable or None"
+                )
+            check_fn = candidate
+
+    return {
+        "name":     name,
+        "metadata": metadata,
+        "body":     body.strip("\n"),
+        "check":    check_fn,
+        "path":     path,
+    }
+
+
+def _load_prompt_suite(
+    suite_dir: Path | None = None,
+) -> dict[str, dict]:
+    """Return ``{prompt_name: parsed_dict}`` for every ``.md`` in the suite dir.
+
+    Falls back to the packaged suite dir when ``suite_dir`` is None. Files are
+    sorted by filename so numeric prefixes (``01_``, ``02_``) control the
+    canonical order the suite emits in ``--compare-prep`` output.
+    """
+    d = suite_dir if suite_dir is not None else _PROMPT_SUITE_DIR
+    if not d.exists() or not d.is_dir():
+        return {}
+    suite: dict[str, dict] = {}
+    for path in sorted(d.glob("*.md")):
+        parsed = _parse_prompt_file(path)
+        if parsed["name"] in suite:
+            raise PromptSuiteError(
+                f"duplicate prompt name {parsed['name']!r} in {d}"
+            )
+        suite[parsed["name"]] = parsed
+    return suite
+
+
+def _assistant_text(raw_turn: dict) -> str:
+    """Concatenate the assistant's text-block content for one turn.
+
+    Content blocks that aren't ``text`` (``thinking``, ``tool_use``) are
+    skipped — IFEval predicates are structural checks on the model's
+    natural-language output, not its internal reasoning or tool calls.
+    """
+    msg = raw_turn.get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            t = block.get("text") or ""
+            if t:
+                parts.append(t)
+    return "".join(parts).strip()
+
+
+def _detect_suite_versions(raw_turns: list[dict]) -> set[int]:
+    """All sentinel versions found across a session's user prompts."""
+    versions: set[int] = set()
+    for t in raw_turns:
+        text = _user_prompt_fingerprint_text(t.get("_preceding_user_content"))
+        for v, _name in _extract_sentinels(text):
+            versions.add(v)
+    return versions
+
+
+def _run_predicate(check_fn, text: str) -> bool | None:
+    """Evaluate a predicate safely — any exception collapses to ``False``.
+
+    Returns ``None`` when ``check_fn`` is ``None`` (prompt has no predicate,
+    e.g. the tool-heavy task). A predicate that raises is treated as a
+    fail, not a crash, so one broken check doesn't sink a whole compare run.
+    """
+    if check_fn is None:
+        return None
+    try:
+        return bool(check_fn(text))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Compare renderers (text / md / json / csv)
+# ---------------------------------------------------------------------------
+
+def _fmt_ratio(value: float | None, precision: int = 2) -> str:
+    """Format a b/a ratio like ``1.32×`` — or ``n/a`` when undefined."""
+    if value is None:
+        return "n/a"
+    return f"{value:.{precision}f}×"
+
+
+def _fmt_delta_pp(value: float, precision: int = 1) -> str:
+    """Format a percentage-point delta with sign — e.g. ``+4.2 pp``."""
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{value:.{precision}f} pp"
+
+
+def _fmt_pass(value: bool | None) -> str:
+    """Format an IFEval pass/fail cell — ``✓``, ``✗``, or em-dash."""
+    if value is None:
+        return "—"
+    return "✓" if value else "✗"
+
+
+def _fmt_cost_delta(side_a: dict, side_b: dict) -> str:
+    """Render the cost delta as an absolute-dollar string.
+
+    Always shows side B minus side A (so a positive value means B cost
+    more). Used by both the text and Markdown summary strips.
+    """
+    a_cost = side_a["totals"].get("cost", 0.0) or 0.0
+    b_cost = side_b["totals"].get("cost", 0.0) or 0.0
+    delta = b_cost - a_cost
+    sign = "+" if delta >= 0 else ""
+    return f"{sign}${delta:.4f}"
+
+
+def _side_label(side: dict, fallback: str) -> str:
+    """Short human-readable label for a compare side.
+
+    Prefers the session-id prefix; falls back to the model family when
+    the id is empty (Mode-2 aggregates will exercise this later).
+    """
+    sid = side.get("session_id") or ""
+    if sid:
+        return f"{sid[:8]}…"
+    family = side.get("model_family") or ""
+    return family or fallback
+
+
+def render_compare_text(report: dict) -> str:
+    """Render the compare report as plain-text for stdout.
+
+    Dispatches on ``compare_mode``: observational (Mode 2) and
+    controlled (Mode 1) share the summary-line vocabulary but differ
+    on per-turn table vs aggregate cards.
+    """
+    if report.get("compare_mode") == "observational":
+        return _render_aggregate_text(report)
+    return _render_controlled_text(report)
+
+
+def _render_controlled_text(report: dict) -> str:
+    """Render the Mode-1 compare report as plain-text for stdout."""
+    out = io.StringIO()
+
+    def p(*args, **kw):
+        print(*args, **kw, file=out)
+
+    a = report["side_a"]
+    b = report["side_b"]
+    s = report["summary"]
+    tz_label = report.get("tz_label", "UTC")
+
+    p("=" * 82)
+    p(f"COMPARE (controlled)  slug={report['slug']}  pair-by={report['pair_by']}  tz={tz_label}")
+    p("=" * 82)
+    p(f"  A  {_side_label(a, 'a'):<14} model={a['dominant_model_id'] or '?':<28} "
+      f"turns={a['turn_count']:<4} cost=${a['totals']['cost']:.4f}")
+    p(f"  B  {_side_label(b, 'b'):<14} model={b['dominant_model_id'] or '?':<28} "
+      f"turns={b['turn_count']:<4} cost=${b['totals']['cost']:.4f}")
+    p()
+
+    if report["advisories"]:
+        p("ADVISORIES")
+        for adv in report["advisories"]:
+            tag = "[WARN]" if adv["severity"] == "warn" else "[info]"
+            p(f"  {tag} {adv['message']}")
+        p()
+
+    if report["warnings"]:
+        p("PAIRING WARNINGS")
+        for w in report["warnings"]:
+            p(f"  - {w}")
+        p()
+
+    p("SUMMARY (B vs A)")
+    p(f"  input-token ratio   : {_fmt_ratio(s['input_tokens_ratio'])}")
+    p(f"  output-token ratio  : {_fmt_ratio(s['output_tokens_ratio'])}")
+    p(f"  total-token ratio   : {_fmt_ratio(s['total_tokens_ratio'])}")
+    p(f"  cost ratio          : {_fmt_ratio(s['cost_ratio'])}  "
+      f"(abs delta {_fmt_cost_delta(a, b)})")
+    p(f"  cache-read share Δ  : {_fmt_delta_pp(s['cache_read_share_delta_pp'])}")
+    p(f"  paired turns        : {s['paired_count']} "
+      f"(unmatched A={s['unmatched_a_count']}, B={s['unmatched_b_count']})")
+    if s.get("instruction_evaluated"):
+        p(f"  IFEval pass         : "
+          f"A {s['instruction_pass_a']}/{s['instruction_evaluated']} "
+          f"({(s['instruction_pass_rate_a'] or 0) * 100:.0f}%), "
+          f"B {s['instruction_pass_b']}/{s['instruction_evaluated']} "
+          f"({(s['instruction_pass_rate_b'] or 0) * 100:.0f}%), "
+          f"Δ {_fmt_delta_pp(s['instruction_pass_delta_pp'] or 0)}")
+    p()
+
+    if report["paired"]:
+        has_instruction = any(
+            row.get("instruction_pass_a") is not None
+            or row.get("instruction_pass_b") is not None
+            for row in report["paired"]
+        )
+        p("PAIRED TURNS (A → B)")
+        extras = "  A✓  B✓  prompt" if has_instruction else ""
+        hdr = (f"  {'#':>3}  {'A input':>8} {'B input':>8} {'Δin':>6}   "
+               f"{'A out':>7} {'B out':>7} {'Δout':>6}   "
+               f"{'A cost':>9} {'B cost':>9} {'Δcost':>6}{extras}")
+        p(hdr)
+        p("  " + "-" * (len(hdr) - 2))
+        for i, row in enumerate(report["paired"], 1):
+            ar, br, r = row["a"], row["b"], row["ratios"]
+            extra_cols = ""
+            if has_instruction:
+                extra_cols = (
+                    f"  {_fmt_pass(row.get('instruction_pass_a'))}  "
+                    f"{_fmt_pass(row.get('instruction_pass_b'))}  "
+                    f"{row.get('suite_prompt_name') or '—'}"
+                )
+            p(f"  {i:>3}  "
+              f"{ar['input_tokens']:>8} {br['input_tokens']:>8} {_fmt_ratio(r['input_tokens']):>6}   "
+              f"{ar['output_tokens']:>7} {br['output_tokens']:>7} {_fmt_ratio(r['output_tokens']):>6}   "
+              f"${ar['cost_usd']:>8.4f} ${br['cost_usd']:>8.4f} {_fmt_ratio(r['cost_usd']):>6}"
+              f"{extra_cols}")
+        p()
+
+    if report["unmatched_a"] or report["unmatched_b"]:
+        p("UNMATCHED")
+        p(f"  A-only turns: {len(report['unmatched_a'])}")
+        p(f"  B-only turns: {len(report['unmatched_b'])}")
+        p()
+
+    p("NOTE  compare mode is a tokenizer/behaviour study, not a quality score.")
+    p("      cost deltas with identical pricing are tokenizer-driven.")
+    return out.getvalue()
+
+
+def render_compare_md(report: dict) -> str:
+    """Render the compare report as GitHub-flavored Markdown.
+
+    Observational (Mode 2) swaps the per-turn table for aggregate cards;
+    otherwise renderer shape is identical.
+    """
+    if report.get("compare_mode") == "observational":
+        return _render_aggregate_md(report)
+    return _render_controlled_md(report)
+
+
+def _render_controlled_md(report: dict) -> str:
+    """Render the Mode-1 compare report as GitHub-flavored Markdown."""
+    out = io.StringIO()
+
+    def p(*args, **kw):
+        print(*args, **kw, file=out)
+
+    a = report["side_a"]
+    b = report["side_b"]
+    s = report["summary"]
+
+    p(f"# Model Compare — {report['slug']}")
+    p()
+    p(f"- Mode: **{report['compare_mode']}**")
+    p(f"- Pair-by: `{report['pair_by']}`")
+    p(f"- Generated: {report['generated_at']}")
+    p()
+    p("## Sides")
+    p()
+    p("| Side | Session | Model | Turns | Cost |")
+    p("|------|---------|-------|------:|-----:|")
+    for tag, side in (("A", a), ("B", b)):
+        p(f"| {tag} | `{_side_label(side, tag.lower())}` | "
+          f"`{side['dominant_model_id'] or '?'}` | "
+          f"{side['turn_count']} | ${side['totals']['cost']:.4f} |")
+    p()
+
+    if report["advisories"]:
+        p("## Advisories")
+        p()
+        for adv in report["advisories"]:
+            tag = "⚠️" if adv["severity"] == "warn" else "ℹ️"
+            p(f"- {tag} {adv['message']}")
+        p()
+
+    if report["warnings"]:
+        p("## Pairing warnings")
+        p()
+        for w in report["warnings"]:
+            p(f"- {w}")
+        p()
+
+    p("## Summary (B vs A)")
+    p()
+    p("| Metric | Value |")
+    p("|--------|------:|")
+    p(f"| Input-token ratio | {_fmt_ratio(s['input_tokens_ratio'])} |")
+    p(f"| Output-token ratio | {_fmt_ratio(s['output_tokens_ratio'])} |")
+    p(f"| Total-token ratio | {_fmt_ratio(s['total_tokens_ratio'])} |")
+    p(f"| Cost ratio | {_fmt_ratio(s['cost_ratio'])} |")
+    p(f"| Cost Δ (absolute) | {_fmt_cost_delta(a, b)} |")
+    p(f"| Cache-read share Δ | {_fmt_delta_pp(s['cache_read_share_delta_pp'])} |")
+    p(f"| Paired turns | {s['paired_count']} "
+      f"(unmatched A={s['unmatched_a_count']}, B={s['unmatched_b_count']}) |")
+    if s.get("instruction_evaluated"):
+        p(f"| IFEval pass (A) | "
+          f"{s['instruction_pass_a']}/{s['instruction_evaluated']} "
+          f"({(s['instruction_pass_rate_a'] or 0) * 100:.0f}%) |")
+        p(f"| IFEval pass (B) | "
+          f"{s['instruction_pass_b']}/{s['instruction_evaluated']} "
+          f"({(s['instruction_pass_rate_b'] or 0) * 100:.0f}%) |")
+        p(f"| IFEval Δ | {_fmt_delta_pp(s['instruction_pass_delta_pp'] or 0)} |")
+    p()
+
+    if report["paired"]:
+        has_instruction = any(
+            row.get("instruction_pass_a") is not None
+            or row.get("instruction_pass_b") is not None
+            for row in report["paired"]
+        )
+        p("## Paired turns")
+        p()
+        if has_instruction:
+            p("| # | A input | B input | Δ input | A output | B output | Δ output | "
+              "A cost | B cost | Δ cost | A✓ | B✓ | Prompt |")
+            p("|--:|--------:|--------:|--------:|---------:|---------:|---------:|"
+              "-------:|-------:|-------:|:--:|:--:|:-------|")
+        else:
+            p("| # | A input | B input | Δ input | A output | B output | Δ output | "
+              "A cost | B cost | Δ cost |")
+            p("|--:|--------:|--------:|--------:|---------:|---------:|---------:|"
+              "-------:|-------:|-------:|")
+        for i, row in enumerate(report["paired"], 1):
+            ar, br, r = row["a"], row["b"], row["ratios"]
+            tail = ""
+            if has_instruction:
+                tail = (
+                    f" {_fmt_pass(row.get('instruction_pass_a'))} | "
+                    f"{_fmt_pass(row.get('instruction_pass_b'))} | "
+                    f"{row.get('suite_prompt_name') or '—'} |"
+                )
+            p(f"| {i} | {ar['input_tokens']} | {br['input_tokens']} | "
+              f"{_fmt_ratio(r['input_tokens'])} | "
+              f"{ar['output_tokens']} | {br['output_tokens']} | "
+              f"{_fmt_ratio(r['output_tokens'])} | "
+              f"${ar['cost_usd']:.4f} | ${br['cost_usd']:.4f} | "
+              f"{_fmt_ratio(r['cost_usd'])} |{tail}")
+        p()
+
+    return out.getvalue()
+
+
+def render_compare_json(report: dict) -> str:
+    """Dump the compare report as indented JSON.
+
+    No transforms needed — the compare report is already JSON-safe
+    (no raw epoch-seconds lists; timestamps are ISO-8601 strings).
+    Shape differs between Mode 1 (paired/unmatched) and Mode 2
+    (aggregate) — consumers should branch on ``compare_mode``.
+    """
+    return json.dumps(report, indent=2)
+
+
+def render_compare_csv(report: dict) -> str:
+    """Render the compare report as CSV.
+
+    Dispatches on ``compare_mode`` — Mode 1 emits a paired-turn table
+    plus summary/ratios blocks; Mode 2 emits a single-row per-side
+    aggregate table plus the same summary/ratios blocks.
+    """
+    if report.get("compare_mode") == "observational":
+        return _render_aggregate_csv(report)
+    return _render_controlled_csv(report)
+
+
+def _render_controlled_csv(report: dict) -> str:
+    """Render the Mode-1 compare report as CSV.
+
+    Layout:
+
+    - Header row + one row per paired turn with A/B columns and ratios.
+    - Blank row, then a ``# SUMMARY`` section with side-level totals.
+    - Blank row, then a ``# ADVISORIES`` section (empty if none).
+    - Blank row, then a ``# UNMATCHED`` section noting counts per side.
+    """
+    out = io.StringIO()
+    w = csv_mod.writer(out)
+    w.writerow([
+        "pair_index", "fingerprint", "suite_prompt_name",
+        "a_model", "a_input_tokens", "a_output_tokens",
+        "a_cache_read_tokens", "a_cache_write_tokens",
+        "a_total_tokens", "a_cost_usd", "a_instruction_pass",
+        "b_model", "b_input_tokens", "b_output_tokens",
+        "b_cache_read_tokens", "b_cache_write_tokens",
+        "b_total_tokens", "b_cost_usd", "b_instruction_pass",
+        "input_ratio", "output_ratio", "total_ratio", "cost_ratio",
+    ])
+
+    def _pass_cell(v):
+        if v is None:
+            return ""
+        return "True" if v else "False"
+
+    for i, row in enumerate(report["paired"], 1):
+        ar, br, r = row["a"], row["b"], row["ratios"]
+        w.writerow([
+            i, row.get("fingerprint") or "", row.get("suite_prompt_name") or "",
+            ar["model"], ar["input_tokens"], ar["output_tokens"],
+            ar["cache_read_tokens"], ar["cache_write_tokens"],
+            ar["total_tokens"], f"{ar['cost_usd']:.6f}",
+            _pass_cell(row.get("instruction_pass_a")),
+            br["model"], br["input_tokens"], br["output_tokens"],
+            br["cache_read_tokens"], br["cache_write_tokens"],
+            br["total_tokens"], f"{br['cost_usd']:.6f}",
+            _pass_cell(row.get("instruction_pass_b")),
+            "" if r["input_tokens"]  is None else f"{r['input_tokens']:.4f}",
+            "" if r["output_tokens"] is None else f"{r['output_tokens']:.4f}",
+            "" if r["total_tokens"]  is None else f"{r['total_tokens']:.4f}",
+            "" if r["cost_usd"]      is None else f"{r['cost_usd']:.4f}",
+        ])
+
+    s = report["summary"]
+    a = report["side_a"]
+    b = report["side_b"]
+    w.writerow([])
+    w.writerow(["# SUMMARY"])
+    w.writerow(["side", "session_id", "model_family", "context_tier",
+                "turn_count", "input", "output", "cache_read", "cache_write",
+                "total_tokens", "cost_usd", "cache_read_share_pct"])
+    for tag, side in (("A", a), ("B", b)):
+        t = side["totals"]
+        w.writerow([
+            tag, side["session_id"], side["model_family"], side["context_tier"],
+            side["turn_count"], t["input"], t["output"],
+            t["cache_read"], t["cache_write"], t["total"],
+            f"{t['cost']:.6f}", f"{side['cache_read_share_of_input']:.2f}",
+        ])
+    w.writerow([])
+    w.writerow(["# RATIOS (B vs A)"])
+    w.writerow(["metric", "value"])
+    w.writerow(["input_tokens_ratio",
+                "" if s["input_tokens_ratio"]  is None else f"{s['input_tokens_ratio']:.4f}"])
+    w.writerow(["output_tokens_ratio",
+                "" if s["output_tokens_ratio"] is None else f"{s['output_tokens_ratio']:.4f}"])
+    w.writerow(["total_tokens_ratio",
+                "" if s["total_tokens_ratio"]  is None else f"{s['total_tokens_ratio']:.4f}"])
+    w.writerow(["cost_ratio",
+                "" if s["cost_ratio"]          is None else f"{s['cost_ratio']:.4f}"])
+    w.writerow(["cache_read_share_delta_pp",   f"{s['cache_read_share_delta_pp']:.4f}"])
+    w.writerow(["paired_count",                s["paired_count"]])
+    w.writerow(["unmatched_a_count",           s["unmatched_a_count"]])
+    w.writerow(["unmatched_b_count",           s["unmatched_b_count"]])
+    # IFEval aggregates — blank when no predicates ran.
+    w.writerow(["instruction_evaluated",       s.get("instruction_evaluated", 0)])
+    w.writerow(["instruction_pass_a",          s.get("instruction_pass_a", 0)])
+    w.writerow(["instruction_pass_b",          s.get("instruction_pass_b", 0)])
+    rate_a = s.get("instruction_pass_rate_a")
+    rate_b = s.get("instruction_pass_rate_b")
+    w.writerow(["instruction_pass_rate_a",
+                "" if rate_a is None else f"{rate_a:.4f}"])
+    w.writerow(["instruction_pass_rate_b",
+                "" if rate_b is None else f"{rate_b:.4f}"])
+    delta_pp = s.get("instruction_pass_delta_pp")
+    w.writerow(["instruction_pass_delta_pp",
+                "" if delta_pp is None else f"{delta_pp:.4f}"])
+
+    if report["advisories"]:
+        w.writerow([])
+        w.writerow(["# ADVISORIES"])
+        w.writerow(["kind", "severity", "message"])
+        for adv in report["advisories"]:
+            w.writerow([adv["kind"], adv["severity"], adv["message"]])
+
+    return out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Aggregate (Mode 2) renderer bodies
+# ---------------------------------------------------------------------------
+
+def _aggregate_side_label(side: dict) -> str:
+    """Short label for a Mode-2 side — family + session count when aggregated."""
+    family = side.get("model_family") or "?"
+    n = side.get("session_count", 1)
+    if n > 1:
+        return f"{family} ({n} sessions)"
+    return family
+
+
+def _render_aggregate_text(report: dict) -> str:
+    """Mode-2 plain-text renderer — aggregate cards, no per-turn table."""
+    out = io.StringIO()
+
+    def p(*args, **kw):
+        print(*args, **kw, file=out)
+
+    a = report["side_a"]
+    b = report["side_b"]
+    s = report["summary"]
+    tz_label = report.get("tz_label", "UTC")
+
+    p("=" * 82)
+    p(f"COMPARE (observational)  slug={report['slug']}  tz={tz_label}")
+    p("=" * 82)
+    p(f"  A  {_aggregate_side_label(a):<28} model={a['dominant_model_id'] or '?':<28} "
+      f"turns={a['turn_count']:<4} cost=${a['totals']['cost']:.4f}")
+    p(f"  B  {_aggregate_side_label(b):<28} model={b['dominant_model_id'] or '?':<28} "
+      f"turns={b['turn_count']:<4} cost=${b['totals']['cost']:.4f}")
+    p()
+
+    if report["advisories"]:
+        p("ADVISORIES")
+        for adv in report["advisories"]:
+            tag = "[WARN]" if adv["severity"] == "warn" else "[info]"
+            p(f"  {tag} {adv['message']}")
+        p()
+
+    p("SUMMARY (B vs A, aggregate)")
+    p(f"  input-token ratio          : {_fmt_ratio(s['input_tokens_ratio'])}")
+    p(f"  output-token ratio         : {_fmt_ratio(s['output_tokens_ratio'])}")
+    p(f"  total-token ratio          : {_fmt_ratio(s['total_tokens_ratio'])}")
+    p(f"  cost ratio                 : {_fmt_ratio(s['cost_ratio'])}  "
+      f"(abs delta {_fmt_cost_delta(a, b)})")
+    p(f"  avg input / user prompt    : {_fmt_ratio(s['avg_input_per_prompt_ratio'])}")
+    p(f"  avg output / turn          : {_fmt_ratio(s['avg_output_per_turn_ratio'])}")
+    p(f"  tool-calls / turn          : {_fmt_ratio(s['tool_calls_per_turn_ratio'])}")
+    p(f"  cache-read share Δ         : {_fmt_delta_pp(s['cache_read_share_delta_pp'])}")
+    p()
+
+    p("AGGREGATE DETAIL")
+    hdr = (f"  {'side':<5} {'sessions':>8} {'turns':>6} {'prompts':>8} "
+           f"{'input':>10} {'output':>9} {'cost':>10} {'cache%':>7} "
+           f"{'tool/t':>7} {'think%':>7}")
+    p(hdr)
+    p("  " + "-" * (len(hdr) - 2))
+    for tag, side in (("A", a), ("B", b)):
+        t = side["totals"]
+        p(f"  {tag:<5} {side['session_count']:>8} {side['turn_count']:>6} "
+          f"{side['user_prompt_count']:>8} {t['input']:>10} {t['output']:>9} "
+          f"${t['cost']:>9.4f} {side['cache_read_share_of_input']:>6.1f}% "
+          f"{side['tool_calls_per_turn']:>7.2f} {side['thinking_turn_pct']:>6.1f}%")
+    p()
+
+    p("NOTE  observational compare is a drift summary, NOT a controlled benchmark.")
+    p("      Prompt distributions differ between sides; ratios conflate tokenizer")
+    p("      shift with workload shift. Run 'session-metrics --compare-prep' for a")
+    p("      controlled suite that isolates tokenizer effects.")
+    return out.getvalue()
+
+
+def _render_aggregate_md(report: dict) -> str:
+    """Mode-2 Markdown renderer — aggregate cards, no per-turn table."""
+    out = io.StringIO()
+
+    def p(*args, **kw):
+        print(*args, **kw, file=out)
+
+    a = report["side_a"]
+    b = report["side_b"]
+    s = report["summary"]
+
+    p(f"# Model Compare — {report['slug']}")
+    p()
+    p(f"- Mode: **{report['compare_mode']}**")
+    p(f"- Generated: {report['generated_at']}")
+    p()
+    p("> **Observational, not controlled.** Ratios below conflate tokenizer")
+    p("> shift with prompt-distribution shift between the two families. Run")
+    p("> `session-metrics --compare-prep` for an attribution-grade benchmark.")
+    p()
+    p("## Sides")
+    p()
+    p("| Side | Family | Sessions | Model | Turns | Prompts | Cost |")
+    p("|------|--------|---------:|-------|------:|--------:|-----:|")
+    for tag, side in (("A", a), ("B", b)):
+        p(f"| {tag} | `{side['model_family'] or '?'}` | "
+          f"{side['session_count']} | "
+          f"`{side['dominant_model_id'] or '?'}` | "
+          f"{side['turn_count']} | {side['user_prompt_count']} | "
+          f"${side['totals']['cost']:.4f} |")
+    p()
+
+    if report["advisories"]:
+        p("## Advisories")
+        p()
+        for adv in report["advisories"]:
+            tag = "⚠️" if adv["severity"] == "warn" else "ℹ️"
+            p(f"- {tag} {adv['message']}")
+        p()
+
+    p("## Summary (B vs A, aggregate)")
+    p()
+    p("| Metric | Value |")
+    p("|--------|------:|")
+    p(f"| Input-token ratio | {_fmt_ratio(s['input_tokens_ratio'])} |")
+    p(f"| Output-token ratio | {_fmt_ratio(s['output_tokens_ratio'])} |")
+    p(f"| Total-token ratio | {_fmt_ratio(s['total_tokens_ratio'])} |")
+    p(f"| Cost ratio | {_fmt_ratio(s['cost_ratio'])} |")
+    p(f"| Cost Δ (absolute) | {_fmt_cost_delta(a, b)} |")
+    p(f"| Avg input / user prompt | {_fmt_ratio(s['avg_input_per_prompt_ratio'])} |")
+    p(f"| Avg output / turn | {_fmt_ratio(s['avg_output_per_turn_ratio'])} |")
+    p(f"| Tool-calls / turn | {_fmt_ratio(s['tool_calls_per_turn_ratio'])} |")
+    p(f"| Cache-read share Δ | {_fmt_delta_pp(s['cache_read_share_delta_pp'])} |")
+    p()
+
+    p("## Aggregate detail")
+    p()
+    p("| Side | Sessions | Turns | Prompts | Input | Output | Cache read | "
+      "Cost | Cache % | Tool/turn | Think-turn % |")
+    p("|------|---------:|------:|--------:|------:|-------:|-----------:|"
+      "-----:|--------:|----------:|-------------:|")
+    for tag, side in (("A", a), ("B", b)):
+        t = side["totals"]
+        p(f"| {tag} | {side['session_count']} | {side['turn_count']} | "
+          f"{side['user_prompt_count']} | {t['input']} | {t['output']} | "
+          f"{t['cache_read']} | ${t['cost']:.4f} | "
+          f"{side['cache_read_share_of_input']:.1f}% | "
+          f"{side['tool_calls_per_turn']:.2f} | "
+          f"{side['thinking_turn_pct']:.1f}% |")
+    p()
+
+    return out.getvalue()
+
+
+def _render_aggregate_csv(report: dict) -> str:
+    """Mode-2 CSV renderer — two aggregate rows + summary + advisories."""
+    out = io.StringIO()
+    w = csv_mod.writer(out)
+
+    w.writerow([
+        "side", "model_family", "dominant_model_id", "context_tier",
+        "session_count", "turn_count", "user_prompt_count",
+        "input_tokens", "output_tokens", "cache_read_tokens",
+        "cache_write_tokens", "total_tokens", "cost_usd",
+        "cache_read_share_pct", "avg_input_per_prompt",
+        "avg_output_per_turn", "tool_calls_per_turn", "thinking_turn_pct",
+    ])
+    for tag, side in (("A", report["side_a"]), ("B", report["side_b"])):
+        t = side["totals"]
+        w.writerow([
+            tag, side["model_family"], side["dominant_model_id"],
+            side["context_tier"], side["session_count"], side["turn_count"],
+            side["user_prompt_count"], t["input"], t["output"], t["cache_read"],
+            t["cache_write"], t["total"], f"{t['cost']:.6f}",
+            f"{side['cache_read_share_of_input']:.2f}",
+            f"{side['avg_input_tokens_per_prompt']:.2f}",
+            f"{side['avg_output_tokens_per_turn']:.2f}",
+            f"{side['tool_calls_per_turn']:.4f}",
+            f"{side['thinking_turn_pct']:.2f}",
+        ])
+
+    s = report["summary"]
+    w.writerow([])
+    w.writerow(["# RATIOS (B vs A)"])
+    w.writerow(["metric", "value"])
+    for key in (
+        "input_tokens_ratio", "output_tokens_ratio", "total_tokens_ratio",
+        "cost_ratio", "avg_input_per_prompt_ratio", "avg_output_per_turn_ratio",
+        "tool_calls_per_turn_ratio",
+    ):
+        val = s[key]
+        w.writerow([key, "" if val is None else f"{val:.4f}"])
+    w.writerow(["cache_read_share_delta_pp", f"{s['cache_read_share_delta_pp']:.4f}"])
+
+    if report["advisories"]:
+        w.writerow([])
+        w.writerow(["# ADVISORIES"])
+        w.writerow(["kind", "severity", "message"])
+        for adv in report["advisories"]:
+            w.writerow([adv["kind"], adv["severity"], adv["message"]])
+
+    return out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# HTML renderer — variant="compare" (Phase 6)
+# ---------------------------------------------------------------------------
+#
+# Deliberately emits one self-contained HTML file (no dashboard/detail
+# split): the compare report is already concise, and every section
+# (summary strip, advisories, per-turn table, quality-vs-cost card) is
+# interdependent. Splitting would fragment the story users came for.
+#
+# The renderer imports ``html`` lazily inside the function so the main
+# module's pricing/cost path isn't forced to pull it just for the
+# compare codepath.
+
+
+def _html_escape(s: object) -> str:
+    """Small wrapper so the module stays import-cheap — defers to
+    ``html.escape`` at call time. Accepts any object (stringifies)
+    because report fields include numeric tokens that end up inside
+    tooltips."""
+    import html as _h
+    return _h.escape("" if s is None else str(s))
+
+
+def _fmt_ratio_html(value: float | None, precision: int = 2) -> str:
+    """Ratio as ``"1.23×"`` or ``"—"``. Shared by every summary card."""
+    if value is None:
+        return "&mdash;"
+    return f"{value:.{precision}f}&times;"
+
+
+def _ratio_tint_class(value: float | None) -> str:
+    """CSS class for a heatmap cell based on a ratio vs 1.0.
+
+    Keeps thresholds modest — tokenizer deltas on real workloads cluster
+    between 1.0 and 1.5×. Symmetric negative band surfaces the (rare)
+    B-side-wins case without drowning out the common direction.
+    """
+    if value is None:
+        return "ratio-na"
+    if value >= 1.45:
+        return "ratio-hot"
+    if value >= 1.20:
+        return "ratio-warm"
+    if value >= 1.05:
+        return "ratio-mild"
+    if value <= 0.85:
+        return "ratio-cool"
+    if value <= 0.95:
+        return "ratio-coolish"
+    return "ratio-neutral"
+
+
+def _advisory_banners_html(advisories: list[dict]) -> str:
+    """Top-of-page banners for every advisory on the report.
+
+    Severity ``warn`` gets the amber rule; ``info`` the blue muted strip.
+    Each banner renders as a ``<div class="advisory {severity}">``.
+    """
+    if not advisories:
+        return ""
+    rows = []
+    for adv in advisories:
+        sev = adv.get("severity", "info")
+        icon = "&#9888;" if sev == "warn" else "&#8505;"  # ⚠ / ℹ
+        msg = _html_escape(adv.get("message", ""))
+        kind = _html_escape(adv.get("kind", ""))
+        rows.append(
+            f'  <div class="advisory {sev}" data-kind="{kind}">'
+            f'<span class="advisory-icon">{icon}</span>'
+            f'<span class="advisory-msg">{msg}</span>'
+            f'</div>'
+        )
+    return '<div class="advisories">\n' + "\n".join(rows) + "\n</div>"
+
+
+def _summary_card(label: str, value: str, sub: str = "",
+                  accent: str = "") -> str:
+    """One KPI card — identical visual shape to the main dashboard
+    cards, but built locally so compare output doesn't depend on the
+    main module's renderer being imported."""
+    cls = f"card {accent}".strip()
+    sub_html = f'<div class="sub">{_html_escape(sub)}</div>' if sub else ""
+    return (f'  <div class="{cls}"><div class="val">{value}</div>'
+            f'<div class="lbl">{_html_escape(label)}</div>{sub_html}</div>')
+
+
+def _reproducibility_stamp(report: dict, side_a: dict, side_b: dict) -> str:
+    """Fine-print footer line showing exactly which inputs produced the
+    report. Present on every variant — ``--compare`` output is meant to
+    be shared, and the stamp lets readers verify claims without the
+    original JSONLs."""
+    parts = [
+        f"Generated {_html_escape(report.get('generated_at', ''))}",
+        f"slug {_html_escape(report.get('slug', ''))}",
+        f"A {_html_escape(side_a.get('dominant_model_id') or '?')}",
+        f"B {_html_escape(side_b.get('dominant_model_id') or '?')}",
+    ]
+    pair_by = report.get("pair_by")
+    if pair_by:
+        parts.append(f"pair-by {_html_escape(pair_by)}")
+    return " &middot; ".join(parts)
+
+
+def _paired_prompt_label(row: dict, *, redact: bool) -> str:
+    """Short label for the per-turn table's `Prompt` column.
+
+    If a suite sentinel matched, show the suite prompt name (canonical,
+    safe to share). Otherwise show either the fingerprint-derived hash
+    (a peek at pairing, harmless) or a redaction marker when
+    ``--redact-user-prompts`` is set on the CLI.
+    """
+    name = row.get("suite_prompt_name")
+    if name:
+        return f'<span class="prompt-suite">{_html_escape(name)}</span>'
+    fp = row.get("fingerprint") or ""
+    if redact:
+        return '<span class="prompt-redacted">[redacted]</span>'
+    if fp:
+        return f'<span class="prompt-fp" title="Fingerprint">{_html_escape(fp[:8])}&hellip;</span>'
+    return '<span class="muted">&mdash;</span>'
+
+
+def _render_histogram_card(paired: list[dict]) -> str:
+    """Tiny inline histogram of per-turn input-token ratios.
+
+    Bins ratios into 6 buckets covering the observed range. Pure HTML +
+    CSS (no charting library) because compare HTML is meant to be a
+    shareable single file; dragging in Highcharts just for this would
+    bloat the output for one card.
+    """
+    ratios = [
+        p["ratios"]["input_tokens"] for p in paired
+        if p.get("ratios") and p["ratios"].get("input_tokens") is not None
+    ]
+    if not ratios:
+        return ""
+    bins = [
+        ("< 0.90", lambda r: r < 0.90),
+        ("0.90-1.00", lambda r: 0.90 <= r < 1.00),
+        ("1.00-1.10", lambda r: 1.00 <= r < 1.10),
+        ("1.10-1.25", lambda r: 1.10 <= r < 1.25),
+        ("1.25-1.45", lambda r: 1.25 <= r < 1.45),
+        (">= 1.45", lambda r: r >= 1.45),
+    ]
+    counts = [sum(1 for r in ratios if pred(r)) for _label, pred in bins]
+    max_count = max(counts) or 1
+    ratios_sorted = sorted(ratios)
+    mean = sum(ratios) / len(ratios)
+    p50 = ratios_sorted[len(ratios_sorted) // 2]
+    p95_idx = max(0, int(round(0.95 * (len(ratios_sorted) - 1))))
+    p95 = ratios_sorted[p95_idx]
+    bar_rows = []
+    for (label, _pred), count in zip(bins, counts):
+        pct = 100.0 * count / max_count
+        bar_rows.append(
+            f'      <div class="hist-row">'
+            f'<div class="hist-label">{_html_escape(label)}</div>'
+            f'<div class="hist-bar-wrap">'
+            f'<div class="hist-bar" style="width:{pct:.1f}%"></div>'
+            f'<div class="hist-count">{count}</div>'
+            f'</div></div>'
+        )
+    return (
+        '<section class="compare-card histogram">\n'
+        '  <h2>Per-turn input-token ratio distribution</h2>\n'
+        f'  <p class="meta-small">mean {mean:.2f}&times; &middot; p50 '
+        f'{p50:.2f}&times; &middot; p95 {p95:.2f}&times; &middot; '
+        f'n={len(ratios)}</p>\n'
+        '  <div class="hist">\n'
+        + "\n".join(bar_rows)
+        + '\n  </div>\n'
+        '</section>'
+    )
+
+
+def _render_quality_vs_cost_card(summary: dict) -> str:
+    """Explicit juxtaposition of cost delta and quality delta.
+
+    Without this card, readers see a red "+30% cost" number and draw the
+    wrong conclusion. IFEval delta (when evaluated) prevents the naive
+    "more expensive == worse" read by showing the trade-off directly.
+    """
+    cost = summary.get("cost_ratio")
+    ifeval = summary.get("instruction_pass_delta_pp")
+    evaluated = summary.get("instruction_evaluated") or 0
+    if cost is None and not evaluated:
+        return ""
+    cost_txt = _fmt_ratio_html(cost) if cost is not None else "&mdash;"
+    if evaluated:
+        sign = "+" if (ifeval or 0) >= 0 else ""
+        ifeval_txt = f"{sign}{ifeval:.1f} pp"
+        if ifeval and ifeval > 0 and cost and cost > 1.05:
+            verdict = ("higher cost bought higher instruction compliance "
+                       "&mdash; read as a quality/cost trade-off")
+        elif ifeval and ifeval < 0 and cost and cost > 1.05:
+            verdict = ("higher cost with lower compliance &mdash; weak "
+                       "pair on this suite")
+        elif cost and cost <= 1.05 and ifeval and ifeval > 0:
+            verdict = "quality up with no meaningful cost hit"
+        else:
+            verdict = "cost roughly flat; quality delta shown at right"
+    else:
+        ifeval_txt = "no suite predicates evaluated"
+        verdict = ("no IFEval measurement; cost delta alone doesn't tell "
+                   "you whether quality changed")
+    return (
+        '<section class="compare-card qvsc">\n'
+        '  <h2>Quality vs cost</h2>\n'
+        '  <div class="qvsc-row">\n'
+        f'    <div class="qvsc-cell"><div class="val">{cost_txt}</div>'
+        f'<div class="lbl">cost ratio (B vs A)</div></div>\n'
+        f'    <div class="qvsc-cell"><div class="val">{ifeval_txt}</div>'
+        f'<div class="lbl">IFEval &Delta; (B minus A)</div></div>\n'
+        '  </div>\n'
+        f'  <p class="qvsc-verdict">{_html_escape(verdict)}</p>\n'
+        '</section>'
+    )
+
+
+def _render_compare_html_controlled(
+    report: dict,
+    *,
+    redact_user_prompts: bool = False,
+) -> str:
+    """Mode-1 compare HTML renderer.
+
+    Produces one self-contained dark-themed page. Sections:
+    advisories → sides bar → KPI summary strip → quality-vs-cost card →
+    (when evaluated) IFEval summary → per-turn table with heatmap tint
+    → histogram card → unmatched turns → methodology footer.
+    """
+    a = report["side_a"]
+    b = report["side_b"]
+    s = report["summary"]
+    slug = report.get("slug", "")
+    pair_by = report.get("pair_by", "?")
+    tz_label = report.get("tz_label", "UTC")
+
+    advisories_html = _advisory_banners_html(report.get("advisories", []) or [])
+
+    sides_html = (
+        '<section class="sides">\n'
+        f'  <div class="side-card side-a">\n'
+        f'    <div class="side-tag">A</div>\n'
+        f'    <div class="side-model">{_html_escape(a.get("dominant_model_id") or "?")}</div>\n'
+        f'    <div class="side-meta">'
+        f'<code>{_html_escape((a.get("session_id") or "")[:16])}&hellip;</code>'
+        f' &middot; {a.get("turn_count", 0)} turns'
+        f' &middot; ${a.get("totals", {}).get("cost", 0):.4f}'
+        f'</div>\n'
+        f'  </div>\n'
+        f'  <div class="side-card side-b">\n'
+        f'    <div class="side-tag">B</div>\n'
+        f'    <div class="side-model">{_html_escape(b.get("dominant_model_id") or "?")}</div>\n'
+        f'    <div class="side-meta">'
+        f'<code>{_html_escape((b.get("session_id") or "")[:16])}&hellip;</code>'
+        f' &middot; {b.get("turn_count", 0)} turns'
+        f' &middot; ${b.get("totals", {}).get("cost", 0):.4f}'
+        f'</div>\n'
+        f'  </div>\n'
+        '</section>'
+    )
+
+    cost_delta_abs = b.get("totals", {}).get("cost", 0) - a.get("totals", {}).get("cost", 0)
+    cost_delta_sign = "+" if cost_delta_abs >= 0 else "&minus;"
+    cost_delta_txt = f"{cost_delta_sign}${abs(cost_delta_abs):.4f}"
+
+    cards = [
+        _summary_card("Input tokens ratio",
+                      _fmt_ratio_html(s.get("input_tokens_ratio")),
+                      "B vs A, side totals"),
+        _summary_card("Output tokens ratio",
+                      _fmt_ratio_html(s.get("output_tokens_ratio"))),
+        _summary_card("Total tokens ratio",
+                      _fmt_ratio_html(s.get("total_tokens_ratio"))),
+        _summary_card("Cost ratio",
+                      _fmt_ratio_html(s.get("cost_ratio")),
+                      cost_delta_txt,
+                      accent="amber"),
+        _summary_card("Paired turns",
+                      str(s.get("paired_count", 0)),
+                      f"unmatched A={s.get('unmatched_a_count', 0)}, "
+                      f"B={s.get('unmatched_b_count', 0)}"),
+        _summary_card("Cache-read share &Delta;",
+                      _fmt_delta_pp(s.get("cache_read_share_delta_pp", 0)),
+                      accent="green" if (s.get("cache_read_share_delta_pp") or 0) >= 0 else ""),
+    ]
+    if s.get("instruction_evaluated"):
+        rate_a = (s.get("instruction_pass_rate_a") or 0) * 100
+        rate_b = (s.get("instruction_pass_rate_b") or 0) * 100
+        delta_pp = s.get("instruction_pass_delta_pp") or 0
+        delta_accent = "green" if delta_pp >= 0 else "amber"
+        cards.append(_summary_card(
+            "IFEval pass rate (B)",
+            f"{rate_b:.0f}%",
+            f"A {rate_a:.0f}% &middot; {_fmt_delta_pp(delta_pp)}",
+            accent=delta_accent,
+        ))
+    cards_html = '<div class="cards">\n' + "\n".join(cards) + '\n</div>'
+
+    qvsc_html = _render_quality_vs_cost_card(s)
+    hist_html = _render_histogram_card(report.get("paired", []) or [])
+
+    # ---- Per-turn table ----------------------------------------------------
+    paired = report.get("paired", []) or []
+    has_instruction = any(
+        row.get("instruction_pass_a") is not None
+        or row.get("instruction_pass_b") is not None
+        for row in paired
+    )
+
+    def _pass_cell(v):
+        if v is True:
+            return '<td class="pass pass-ok">&#10003;</td>'
+        if v is False:
+            return '<td class="pass pass-fail">&#10007;</td>'
+        return '<td class="pass muted">&mdash;</td>'
+
+    def _ratio_cell(v, precision=2):
+        cls = _ratio_tint_class(v)
+        if v is None:
+            return f'<td class="num {cls}">&mdash;</td>'
+        return f'<td class="num {cls}">{v:.{precision}f}&times;</td>'
+
+    table_rows = []
+    for i, row in enumerate(paired, 1):
+        ar = row.get("a", {})
+        br = row.get("b", {})
+        r = row.get("ratios", {}) or {}
+        prompt_html = _paired_prompt_label(row, redact=redact_user_prompts)
+        cells = [
+            f'<td class="idx">{i}</td>',
+            f'<td class="num">{ar.get("input_tokens", 0):,}</td>',
+            f'<td class="num">{br.get("input_tokens", 0):,}</td>',
+            _ratio_cell(r.get("input_tokens")),
+            f'<td class="num">{ar.get("output_tokens", 0):,}</td>',
+            f'<td class="num">{br.get("output_tokens", 0):,}</td>',
+            _ratio_cell(r.get("output_tokens")),
+            f'<td class="num cost">${ar.get("cost_usd", 0):.4f}</td>',
+            f'<td class="num cost">${br.get("cost_usd", 0):.4f}</td>',
+            _ratio_cell(r.get("cost_usd")),
+        ]
+        if has_instruction:
+            cells.append(_pass_cell(row.get("instruction_pass_a")))
+            cells.append(_pass_cell(row.get("instruction_pass_b")))
+            cells.append(f'<td class="prompt">{prompt_html}</td>')
+        else:
+            cells.append(f'<td class="prompt">{prompt_html}</td>')
+        table_rows.append("    <tr>" + "".join(cells) + "</tr>")
+
+    headers_base = [
+        ("#", "idx"),
+        ("A input", "num"), ("B input", "num"), ("&Delta; input", "num"),
+        ("A output", "num"), ("B output", "num"), ("&Delta; output", "num"),
+        ("A cost", "num"), ("B cost", "num"), ("&Delta; cost", "num"),
+    ]
+    if has_instruction:
+        headers = headers_base + [("A&#10003;", "pass"), ("B&#10003;", "pass"),
+                                  ("Prompt", "prompt")]
+    else:
+        headers = headers_base + [("Prompt", "prompt")]
+    thead = "".join(f'<th class="{cls}">{name}</th>' for name, cls in headers)
+
+    if paired:
+        table_html = (
+            '<section class="compare-card">\n'
+            '  <h2>Paired turns</h2>\n'
+            '  <table class="compare-table">\n'
+            f'    <thead><tr>{thead}</tr></thead>\n'
+            '    <tbody>\n'
+            + "\n".join(table_rows)
+            + '\n    </tbody>\n  </table>\n</section>'
+        )
+    else:
+        table_html = (
+            '<section class="compare-card empty">\n'
+            '  <h2>Paired turns</h2>\n'
+            '  <p class="meta">No paired turns &mdash; see advisories.</p>\n'
+            '</section>'
+        )
+
+    unmatched_a = len(report.get("unmatched_a", []) or [])
+    unmatched_b = len(report.get("unmatched_b", []) or [])
+    unmatched_html = ""
+    if unmatched_a or unmatched_b:
+        unmatched_html = (
+            '<section class="compare-card unmatched">\n'
+            '  <h2>Unmatched turns</h2>\n'
+            f'  <p>A-only turns: <strong>{unmatched_a}</strong></p>\n'
+            f'  <p>B-only turns: <strong>{unmatched_b}</strong></p>\n'
+            '  <p class="meta-small">These turns ran on one side but found '
+            'no counterpart on the other &mdash; typically a prompt appeared '
+            'only once in the paste sequence.</p>\n'
+            '</section>'
+        )
+
+    stamp = _reproducibility_stamp(report, a, b)
+    methodology = (
+        '<section class="compare-card methodology">\n'
+        '  <h2>Methodology</h2>\n'
+        '  <p>Compare mode is a tokenizer / behaviour study, not a quality '
+        'score. When pricing is identical (e.g. between '
+        '<code>claude-opus-4-6</code> and <code>claude-opus-4-7</code>), '
+        'cost ratio equals tokenizer + output-length ratio. IFEval is a '
+        'strict per-prompt predicate &mdash; near-misses fail by design.</p>\n'
+        '  <p class="meta-small">Full methodology and caveats: '
+        '<code>references/model-compare.md</code> in the skill tree.</p>\n'
+        '</section>'
+    )
+
+    return _compare_html_shell(
+        title=f"Compare &mdash; {_html_escape(slug)}",
+        subheading=(f'mode <strong>controlled</strong> &middot; '
+                    f'pair-by <strong>{_html_escape(pair_by)}</strong> '
+                    f'&middot; tz <strong>{_html_escape(tz_label)}</strong>'),
+        body="\n".join(filter(None, [
+            advisories_html,
+            sides_html,
+            cards_html,
+            qvsc_html,
+            hist_html,
+            table_html,
+            unmatched_html,
+            methodology,
+        ])),
+        stamp=stamp,
+    )
+
+
+def _render_compare_html_aggregate(
+    report: dict,
+    *,
+    redact_user_prompts: bool = False,  # noqa: ARG001 — unused, API parity
+) -> str:
+    """Mode-2 compare HTML renderer.
+
+    Same visual shell as Mode 1, but replaces the per-turn table with
+    aggregate side cards and the observational-not-controlled banner
+    always fires from the advisories list so users don't mistake this
+    for attribution-grade output.
+    """
+    a = report["side_a"]
+    b = report["side_b"]
+    s = report["summary"]
+    slug = report.get("slug", "")
+    tz_label = report.get("tz_label", "UTC")
+
+    advisories_html = _advisory_banners_html(report.get("advisories", []) or [])
+
+    def _side_block(tag: str, side: dict, cls: str) -> str:
+        t = side.get("totals", {})
+        return (
+            f'  <div class="side-card {cls}">\n'
+            f'    <div class="side-tag">{tag}</div>\n'
+            f'    <div class="side-model">'
+            f'{_html_escape(side.get("dominant_model_id") or "?")}</div>\n'
+            f'    <div class="side-meta">'
+            f'family <code>{_html_escape(side.get("model_family") or "?")}</code>'
+            f' &middot; {side.get("session_count", 1)} session(s)'
+            f' &middot; {side.get("turn_count", 0)} turns'
+            f' &middot; ${t.get("cost", 0):.4f}'
+            f'</div>\n'
+            f'  </div>'
+        )
+    sides_html = (
+        '<section class="sides">\n'
+        + _side_block("A", a, "side-a") + "\n"
+        + _side_block("B", b, "side-b") + "\n"
+        + '</section>'
+    )
+
+    cost_delta_abs = b.get("totals", {}).get("cost", 0) - a.get("totals", {}).get("cost", 0)
+    cost_delta_sign = "+" if cost_delta_abs >= 0 else "&minus;"
+    cost_delta_txt = f"{cost_delta_sign}${abs(cost_delta_abs):.4f}"
+
+    cards = [
+        _summary_card("Input tokens ratio",
+                      _fmt_ratio_html(s.get("input_tokens_ratio")),
+                      "B vs A, side totals"),
+        _summary_card("Output tokens ratio",
+                      _fmt_ratio_html(s.get("output_tokens_ratio"))),
+        _summary_card("Total tokens ratio",
+                      _fmt_ratio_html(s.get("total_tokens_ratio"))),
+        _summary_card("Cost ratio",
+                      _fmt_ratio_html(s.get("cost_ratio")),
+                      cost_delta_txt,
+                      accent="amber"),
+        _summary_card("Avg input / prompt",
+                      _fmt_ratio_html(s.get("avg_input_per_prompt_ratio"))),
+        _summary_card("Avg output / turn",
+                      _fmt_ratio_html(s.get("avg_output_per_turn_ratio"))),
+        _summary_card("Tool calls / turn",
+                      _fmt_ratio_html(s.get("tool_calls_per_turn_ratio"))),
+        _summary_card("Cache-read share &Delta;",
+                      _fmt_delta_pp(s.get("cache_read_share_delta_pp", 0))),
+    ]
+    cards_html = '<div class="cards">\n' + "\n".join(cards) + '\n</div>'
+
+    # Aggregate detail table — one row per side.
+    def _detail_row(tag, side):
+        t = side.get("totals", {})
+        return (
+            '    <tr>'
+            f'<td class="idx">{tag}</td>'
+            f'<td class="num">{side.get("session_count", 1)}</td>'
+            f'<td class="num">{side.get("turn_count", 0):,}</td>'
+            f'<td class="num">{side.get("user_prompt_count", 0):,}</td>'
+            f'<td class="num">{t.get("input", 0):,}</td>'
+            f'<td class="num">{t.get("output", 0):,}</td>'
+            f'<td class="num">{t.get("cache_read", 0):,}</td>'
+            f'<td class="num cost">${t.get("cost", 0):.4f}</td>'
+            f'<td class="num">{side.get("cache_read_share_of_input", 0):.1f}%</td>'
+            f'<td class="num">{side.get("tool_calls_per_turn", 0):.2f}</td>'
+            f'<td class="num">{side.get("thinking_turn_pct", 0):.1f}%</td>'
+            '</tr>'
+        )
+    detail_html = (
+        '<section class="compare-card">\n'
+        '  <h2>Aggregate detail</h2>\n'
+        '  <table class="compare-table">\n'
+        '    <thead><tr>'
+        '<th class="idx">Side</th><th class="num">Sessions</th>'
+        '<th class="num">Turns</th><th class="num">Prompts</th>'
+        '<th class="num">Input</th><th class="num">Output</th>'
+        '<th class="num">Cache read</th><th class="num">Cost</th>'
+        '<th class="num">Cache %</th><th class="num">Tool/turn</th>'
+        '<th class="num">Think-turn %</th>'
+        '</tr></thead>\n'
+        '    <tbody>\n'
+        + _detail_row("A", a) + "\n"
+        + _detail_row("B", b) + "\n"
+        + '    </tbody>\n  </table>\n</section>'
+    )
+
+    stamp = _reproducibility_stamp(report, a, b)
+    methodology = (
+        '<section class="compare-card methodology">\n'
+        '  <h2>Methodology</h2>\n'
+        '  <p><strong>Observational, not controlled.</strong> These ratios '
+        'compare aggregate behaviour across sessions with different prompt '
+        'distributions. They conflate tokenizer shift, workload shift, and '
+        'cache warmth. For attribution run '
+        '<code>session-metrics --compare-prep</code> and capture two fresh '
+        'sessions running the canonical suite.</p>\n'
+        '  <p class="meta-small">Full methodology: '
+        '<code>references/model-compare.md</code>.</p>\n'
+        '</section>'
+    )
+
+    return _compare_html_shell(
+        title=f"Compare &mdash; {_html_escape(slug)}",
+        subheading=(f'mode <strong>observational</strong> &middot; '
+                    f'tz <strong>{_html_escape(tz_label)}</strong>'),
+        body="\n".join(filter(None, [
+            advisories_html,
+            sides_html,
+            cards_html,
+            detail_html,
+            methodology,
+        ])),
+        stamp=stamp,
+    )
+
+
+def _compare_html_shell(*, title: str, subheading: str, body: str,
+                        stamp: str) -> str:
+    """Outer HTML document scaffolding shared by Mode 1 and Mode 2.
+
+    CSS is inlined — compare HTML is meant to be a single self-contained
+    file users can share via attachment or static hosting without a
+    separate stylesheet fetch. Palette mirrors the main dashboard so the
+    two outputs feel related when opened side by side.
+    """
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Session Metrics &mdash; {title}</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0d1117; color: #e6edf3; font-size: 13px; padding: 24px;
+         line-height: 1.5; }}
+  h1 {{ font-size: 20px; font-weight: 600; margin-bottom: 4px; color: #f0f6fc; }}
+  h2 {{ font-size: 14px; font-weight: 600; color: #f0f6fc; margin: 0 0 10px; }}
+  .subhead {{ color: #8b949e; font-size: 12px; margin-bottom: 20px; }}
+  .subhead strong {{ color: #c9d1d9; font-weight: 600; }}
+  .advisories {{ display: flex; flex-direction: column; gap: 6px;
+                 margin-bottom: 20px; }}
+  .advisory {{ padding: 9px 14px; border-radius: 6px; font-size: 12px;
+               display: flex; gap: 10px; align-items: flex-start;
+               border: 1px solid transparent; }}
+  .advisory.warn {{ background: #2e1f0d; border-color: #9c7a2f;
+                    color: #f7c773; }}
+  .advisory.info {{ background: #0d2237; border-color: #1f4e79;
+                    color: #79c0ff; }}
+  .advisory-icon {{ flex: 0 0 auto; font-weight: 700; }}
+  .advisory-msg {{ flex: 1 1 auto; color: #c9d1d9; }}
+  .sides {{ display: flex; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }}
+  .side-card {{ flex: 1 1 300px; background: #161b22; border: 1px solid #30363d;
+                border-radius: 8px; padding: 14px 18px; position: relative; }}
+  .side-card.side-a {{ border-left: 3px solid #58a6ff; }}
+  .side-card.side-b {{ border-left: 3px solid #d29922; }}
+  .side-tag {{ position: absolute; top: 10px; right: 12px;
+               font-size: 11px; color: #8b949e; font-weight: 600; }}
+  .side-model {{ font-size: 14px; color: #f0f6fc; font-weight: 600;
+                 font-family: "SF Mono", Menlo, Consolas, monospace; }}
+  .side-meta {{ font-size: 11px; color: #8b949e; margin-top: 4px; }}
+  .side-meta code {{ color: #a5d6ff; }}
+  .cards {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }}
+  .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+           padding: 12px 16px; min-width: 150px; flex: 1 1 150px; }}
+  .card .val {{ font-size: 22px; font-weight: 700; color: #58a6ff;
+                font-variant-numeric: tabular-nums; }}
+  .card .lbl {{ font-size: 11px; color: #8b949e; margin-top: 2px; }}
+  .card .sub {{ font-size: 10px; color: #6e7681; margin-top: 2px;
+                font-variant-numeric: tabular-nums; }}
+  .card.green .val {{ color: #3fb950; }}
+  .card.amber .val {{ color: #d29922; }}
+  section.compare-card {{ background: #161b22; border: 1px solid #30363d;
+                           border-radius: 8px; padding: 16px 20px;
+                           margin-bottom: 18px; }}
+  section.compare-card.qvsc .qvsc-row {{ display: flex; gap: 18px;
+                                          margin: 10px 0; }}
+  section.compare-card.qvsc .qvsc-cell {{ flex: 1 1 160px;
+                           background: #0d1117; border: 1px solid #30363d;
+                           border-radius: 6px; padding: 12px 14px; }}
+  section.compare-card.qvsc .qvsc-cell .val {{ font-size: 20px;
+                           font-weight: 700; color: #f0f6fc;
+                           font-variant-numeric: tabular-nums; }}
+  section.compare-card.qvsc .qvsc-cell .lbl {{ font-size: 11px;
+                           color: #8b949e; margin-top: 2px; }}
+  .qvsc-verdict {{ color: #c9d1d9; font-size: 12px; font-style: italic;
+                   margin-top: 6px; }}
+  section.compare-card.histogram .hist {{ display: flex;
+                           flex-direction: column; gap: 4px; margin-top: 6px; }}
+  .hist-row {{ display: flex; gap: 10px; align-items: center; }}
+  .hist-label {{ flex: 0 0 80px; font-size: 11px; color: #8b949e;
+                 font-variant-numeric: tabular-nums; text-align: right; }}
+  .hist-bar-wrap {{ flex: 1 1 auto; display: flex; align-items: center;
+                    gap: 8px; }}
+  .hist-bar {{ height: 14px; background: linear-gradient(to right,
+                           #1f6feb 0%, #58a6ff 100%);
+                           border-radius: 3px; min-width: 2px; }}
+  .hist-count {{ font-size: 11px; color: #c9d1d9;
+                 font-variant-numeric: tabular-nums; }}
+  .meta-small {{ font-size: 11px; color: #8b949e; margin: 4px 0; }}
+  table.compare-table {{ width: 100%; border-collapse: collapse;
+                          font-size: 12px; }}
+  table.compare-table th {{ background: #0d1117; color: #8b949e;
+                             font-weight: 500; text-align: left;
+                             padding: 6px 10px;
+                             border-bottom: 1px solid #30363d;
+                             white-space: nowrap; }}
+  table.compare-table th.num, table.compare-table td.num {{ text-align: right;
+                           font-variant-numeric: tabular-nums; }}
+  table.compare-table th.pass, table.compare-table td.pass {{
+                           text-align: center; width: 42px; }}
+  table.compare-table td {{ padding: 4px 10px;
+                             border-bottom: 1px solid #21262d;
+                             vertical-align: middle; }}
+  table.compare-table tr:hover td {{ background: #1c2128; }}
+  td.cost {{ color: #c9d1d9; white-space: nowrap; }}
+  td.idx {{ color: #6e7681; text-align: right; width: 36px; }}
+  td.prompt {{ color: #8b949e; font-size: 11px; }}
+  td.prompt .prompt-suite {{ color: #a5d6ff;
+                             font-family: "SF Mono", Menlo, Consolas, monospace; }}
+  td.prompt .prompt-fp {{ color: #6e7681;
+                          font-family: "SF Mono", Menlo, Consolas, monospace; }}
+  td.prompt .prompt-redacted {{ color: #6e7681; font-style: italic; }}
+  .pass-ok {{ color: #3fb950; font-weight: 700; }}
+  .pass-fail {{ color: #f85149; font-weight: 700; }}
+  .muted {{ color: #484f58; }}
+  .ratio-hot {{ background: rgba(248, 81, 73, 0.18); color: #ff7b72; }}
+  .ratio-warm {{ background: rgba(210, 153, 34, 0.18); color: #e3b341; }}
+  .ratio-mild {{ background: rgba(210, 153, 34, 0.08); color: #d29922; }}
+  .ratio-neutral {{ color: #8b949e; }}
+  .ratio-coolish {{ color: #3fb950; }}
+  .ratio-cool {{ background: rgba(63, 185, 80, 0.18); color: #3fb950; }}
+  .ratio-na {{ color: #484f58; }}
+  .stamp {{ margin-top: 22px; padding: 10px 0; font-size: 10px;
+            color: #484f58; border-top: 1px solid #21262d;
+            font-family: "SF Mono", Menlo, Consolas, monospace; }}
+  code {{ font-family: "SF Mono", Menlo, Consolas, monospace;
+          color: #a5d6ff; background: #0d1117; padding: 0 4px;
+          border-radius: 3px; border: 1px solid #30363d; font-size: 11px; }}
+</style>
+</head>
+<body>
+<h1>Session Metrics &mdash; {title}</h1>
+<p class="subhead">{subheading}</p>
+{body}
+<p class="stamp">{stamp}</p>
+</body>
+</html>
+"""
+
+
+def render_compare_html(report: dict, *,
+                        redact_user_prompts: bool = False) -> str:
+    """Entry point for compare HTML rendering.
+
+    Dispatches on ``compare_mode``; both branches return a single
+    self-contained HTML document. ``redact_user_prompts`` masks freeform
+    prompt fingerprints in the per-turn table (Mode 1 only) for
+    shareable output &mdash; sentinel-tagged suite prompts are canonical
+    and stay visible.
+    """
+    if report.get("compare_mode") == "observational":
+        return _render_compare_html_aggregate(
+            report, redact_user_prompts=redact_user_prompts,
+        )
+    return _render_compare_html_controlled(
+        report, redact_user_prompts=redact_user_prompts,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Driver — CLI dispatch entrypoint
+# ---------------------------------------------------------------------------
+
+def _check_compare_scope(
+    scope: str,
+    a_kind: str,
+    b_kind: str,
+) -> str:
+    """Reconcile ``--compare-scope`` against the resolver's per-arg kind.
+
+    Returns the effective compare_mode slug:
+
+    - ``"controlled"`` — both args are single sessions (Mode 1).
+    - ``"observational"`` — at least one arg is an aggregate; the report
+      rolls up every session in each side's family without per-turn
+      pairing.
+
+    Raises :class:`CompareArgError` when the requested scope is
+    incompatible with what the args resolved to. Scope ``"auto"``
+    picks observational iff either side is an aggregate; ``"session"``
+    forces controlled (refuses aggregates); ``"project"`` forces
+    observational (accepts single sessions as degenerate 1-session
+    aggregates so the user can pin Mode 2 unambiguously even when
+    passing two UUIDs or paths).
+    """
+    has_aggregate = a_kind == "aggregate" or b_kind == "aggregate"
+
+    if scope == "session":
+        if has_aggregate:
+            raise CompareArgError(
+                "--compare-scope=session requires two single sessions, but an "
+                "arg resolved to a project aggregate ('all-<family>')"
+            )
+        return "controlled"
+
+    if scope == "project":
+        return "observational"
+
+    # scope == "auto"
+    if has_aggregate:
+        return "observational"
+    return "controlled"
+
+
+def _load_sessions(
+    paths: list[Path],
+    include_subagents: bool,
+    use_cache: bool,
+) -> list[tuple[str, list[dict], list[int]]]:
+    """Load every JSONL in ``paths`` via the main module's ``_load_session``.
+
+    Small helper so ``_run_compare`` can materialize a side's worth of
+    sessions in one call — aggregate sides (``all-<family>``) have N
+    paths; single sides have 1.
+    """
+    m = _main()
+    out: list[tuple[str, list[dict], list[int]]] = []
+    for p in paths:
+        sid, turns, user_ts = m._load_session(
+            p, include_subagents, use_cache=use_cache,
+        )
+        out.append((sid, turns, user_ts))
+    return out
+
+
+def _confirm_aggregate_or_exit(
+    side_a_sessions: list[tuple[str, list[dict], list[int]]],
+    side_b_sessions: list[tuple[str, list[dict], list[int]]],
+    assume_yes: bool,
+) -> None:
+    """Show an aggregate-scope preview and ask for y/N unless ``assume_yes``.
+
+    Prints session counts + total-turn counts per side to stderr so the
+    dashboard output on stdout stays clean, then reads one line from
+    stdin. Any response that doesn't start with ``y`` (case-insensitive)
+    exits 0 with a message. Non-TTY stdin (e.g. piped input) and
+    ``--yes`` both skip the prompt — piped invocations never block.
+
+    Called only when ``compare_mode == "observational"``; the
+    controlled path has no confirmation gate because a session pair
+    is a small, predictable scope.
+    """
+    def _count(sessions):
+        turns = sum(len(t) for _sid, t, _u in sessions)
+        prompts = sum(len(u) for _sid, _t, u in sessions)
+        return len(sessions), turns, prompts
+
+    a_n, a_turns, a_prompts = _count(side_a_sessions)
+    b_n, b_turns, b_prompts = _count(side_b_sessions)
+
+    print("Mode 2 (observational) aggregate preview:", file=sys.stderr)
+    print(f"  A: {a_n} session(s), {a_turns} turn(s), {a_prompts} user prompt(s)",
+          file=sys.stderr)
+    print(f"  B: {b_n} session(s), {b_turns} turn(s), {b_prompts} user prompt(s)",
+          file=sys.stderr)
+
+    if assume_yes:
+        print("(--yes given; proceeding)", file=sys.stderr)
+        return
+    if not sys.stdin.isatty():
+        # Non-interactive invocation — require explicit --yes to proceed.
+        print("[error] aggregate compare requires --yes when stdin is not a TTY "
+              "(prevents accidental large rollups in scripts)", file=sys.stderr)
+        sys.exit(1)
+    try:
+        answer = input("Proceed? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n(aborted)", file=sys.stderr)
+        sys.exit(0)
+    if not answer.startswith("y"):
+        print("(aborted)", file=sys.stderr)
+        sys.exit(0)
+
+
+def _run_compare(
+    arg_a: str,
+    arg_b: str,
+    *,
+    slug: str,
+    pair_by: str = "fingerprint",
+    compare_scope: str = "auto",
+    min_turns: int = 5,
+    formats: list[str] | None = None,
+    tz_offset: float = 0.0,
+    tz_label: str = "UTC",
+    include_subagents: bool = False,
+    use_cache: bool = True,
+    single_page: bool = False,
+    chart_lib: str = "highcharts",
+    assume_yes: bool = False,
+    prompt_suite_dir: Path | None = None,
+    allow_suite_mismatch: bool = False,
+    redact_user_prompts: bool = False,
+) -> None:
+    """Entrypoint the CLI calls after argument parsing.
+
+    Resolves both ``--compare`` args to JSONL paths, enforces scope
+    against what the args resolved to, builds either a Mode-1
+    (controlled, session pair) or Mode-2 (observational, project
+    aggregate) report, then hands off to the main module's
+    ``_dispatch`` for format output.
+
+    ``assume_yes`` skips the Mode-2 aggregate confirmation gate. Mode 1
+    never prompts.
+    """
+    m = _main()
+    formats = formats or []
+
+    try:
+        a_kind, a_paths = _resolve_compare_arg(
+            arg_a, slug,
+            include_subagents=include_subagents,
+            min_turns=min_turns,
+            use_cache=use_cache,
+        )
+        b_kind, b_paths = _resolve_compare_arg(
+            arg_b, slug,
+            include_subagents=include_subagents,
+            min_turns=min_turns,
+            use_cache=use_cache,
+        )
+        compare_mode = _check_compare_scope(compare_scope, a_kind, b_kind)
+    except CompareArgError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        side_a_sessions = _load_sessions(a_paths, include_subagents, use_cache)
+        side_b_sessions = _load_sessions(b_paths, include_subagents, use_cache)
+    except OSError as exc:
+        print(f"[error] failed to load compare session: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if compare_mode == "observational":
+        _confirm_aggregate_or_exit(
+            side_a_sessions, side_b_sessions, assume_yes=assume_yes,
+        )
+
+        a_preview = f"{len(side_a_sessions)} session(s)"
+        b_preview = f"{len(side_b_sessions)} session(s)"
+        print(f"Compare : A={a_preview}  B={b_preview}", file=sys.stderr)
+        print(f"Slug    : {slug}", file=sys.stderr)
+        print(f"Scope   : observational", file=sys.stderr)
+        print(f"TZ      : {tz_label}", file=sys.stderr)
+        print(file=sys.stderr)
+
+        if not side_a_sessions or not side_b_sessions:
+            print("[info] one or both sides have no sessions; compare report "
+                  "will be empty", file=sys.stderr)
+
+        report = _build_compare_aggregate_report(
+            side_a_sessions, side_b_sessions,
+            slug=slug,
+            tz_offset_hours=tz_offset,
+            tz_label=tz_label,
+        )
+        m._dispatch(report, formats, single_page=single_page,
+                    chart_lib=chart_lib,
+                    redact_user_prompts=redact_user_prompts)
+        return
+
+    # compare_mode == "controlled" — Mode 1
+    a_sid, a_turns, a_user_ts = side_a_sessions[0]
+    b_sid, b_turns, b_user_ts = side_b_sessions[0]
+    a_path = a_paths[0]
+    b_path = b_paths[0]
+
+    print(f"Compare : A={a_path.name}  B={b_path.name}", file=sys.stderr)
+    print(f"Slug    : {slug}", file=sys.stderr)
+    print(f"Pair-by : {pair_by}", file=sys.stderr)
+    print(f"TZ      : {tz_label}", file=sys.stderr)
+    print(file=sys.stderr)
+
+    if not a_turns or not b_turns:
+        print("[info] one or both sessions have no assistant turns with "
+              "usage data; compare report will be empty", file=sys.stderr)
+
+    # Load suite predicates once per invocation. A user-supplied
+    # ``--compare-prompts DIR`` overrides the packaged suite; the
+    # builder accepts the pre-loaded dict so tests can inject too.
+    try:
+        prompt_suite = _load_prompt_suite(prompt_suite_dir)
+    except PromptSuiteError as exc:
+        print(f"[error] prompt suite: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        report = _build_compare_report(
+            a_sid, a_turns, a_user_ts,
+            b_sid, b_turns, b_user_ts,
+            slug=slug,
+            pair_by=pair_by,
+            tz_offset_hours=tz_offset,
+            tz_label=tz_label,
+            prompt_suite=prompt_suite,
+            allow_suite_mismatch=allow_suite_mismatch,
+        )
+    except SuiteVersionMismatchError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        sys.exit(1)
+    m._dispatch(report, formats, single_page=single_page,
+                chart_lib=chart_lib,
+                redact_user_prompts=redact_user_prompts)
+
+
+# ---------------------------------------------------------------------------
+# Capture protocol helper — ``--compare-prep`` (Phase 4)
+# ---------------------------------------------------------------------------
+
+def _compare_prep_protocol(model_a: str, model_b: str) -> str:
+    """Capture-protocol header for ``--compare-prep`` output.
+
+    Explains the model-switch dance, the prep steps that minimise
+    confounds, and the `/model` verification step. Kept as a single
+    string so it emits as one coherent block before the prompt list.
+    """
+    return (
+        f"=== Compare capture protocol ({model_a} vs {model_b}) ===\n"
+        f"\n"
+        f"PREP — minimise confounds:\n"
+        f"  - Run in a fresh, empty scratch directory (no large CLAUDE.md,\n"
+        f"    no pre-existing project memory).\n"
+        f"  - Ensure the same tool set is enabled in both sessions\n"
+        f"    (Bash, Read, Write, etc.) — mismatches skew the tool-call ratio.\n"
+        f"  - Do not resume sessions; start fresh each time.\n"
+        f"\n"
+        f"CAPTURE:\n"
+        f"  1. Start a fresh Claude Code session.\n"
+        f"  2. Run:     /model {model_a}\n"
+        f"     Verify:  /model          (expect: {model_a!r})\n"
+        f"  3. Paste each of the {_SUITE_VERSION_PROMPT_COUNT} prompts below in order;\n"
+        f"     let each complete before pasting the next.\n"
+        f"  4. Exit. Start a NEW fresh session.\n"
+        f"  5. Run:     /model {model_b}\n"
+        f"     Verify:  /model          (expect: {model_b!r} or {model_b + '[1m]'!r})\n"
+        f"  6. Paste the same prompts in the same order.\n"
+        f"  7. Exit. Then run:\n"
+        f"        session-metrics --compare last-<family-A> last-<family-B> --output md\n"
+        f"\n"
+        f"Suite version: v{_SUITE_VERSION}\n"
+    )
+
+
+# Number of prompts shipped in the canonical suite. Read once at module load
+# from the suite dir so the protocol block stays honest when prompts are
+# added or removed. Falls back to 10 (the Phase 4 design count) if the dir
+# is missing — users without the packaged suite still get a sensible header.
+def _count_suite_prompts() -> int:
+    try:
+        return len(_load_prompt_suite())
+    except Exception:  # noqa: BLE001
+        return 10
+
+
+_SUITE_VERSION_PROMPT_COUNT = _count_suite_prompts()
+
+
+def _run_compare_prep(
+    models: list[str] | None,
+    *,
+    suite_dir: Path | None = None,
+    out=None,
+) -> None:
+    """Emit the compare capture protocol + prompt suite to stdout.
+
+    ``models`` may be empty (use defaults), have one entry (override A,
+    keep default B), or two entries (override both). Prints the protocol,
+    then each prompt's body wrapped with a ``>>> PROMPT n of N`` header so
+    users can see progress while pasting into Claude Code.
+
+    ``out`` defaults to ``sys.stdout``; tests pass a ``StringIO`` to
+    capture output without spawning a subprocess.
+    """
+    if out is None:
+        out = sys.stdout
+    models = list(models) if models else []
+    if len(models) == 0:
+        model_a, model_b = "claude-opus-4-6", "claude-opus-4-7"
+    elif len(models) == 1:
+        model_a, model_b = models[0], "claude-opus-4-7"
+    elif len(models) == 2:
+        model_a, model_b = models[0], models[1]
+    else:
+        print(
+            "[error] --compare-prep takes at most two model IDs",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        suite = _load_prompt_suite(suite_dir)
+    except PromptSuiteError as exc:
+        print(f"[error] prompt suite: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if not suite:
+        print("[error] prompt suite is empty or missing (expected under "
+              f"{suite_dir or _PROMPT_SUITE_DIR})", file=sys.stderr)
+        sys.exit(1)
+
+    out.write(_compare_prep_protocol(model_a, model_b))
+    out.write("\n")
+    out.write(f"=== PROMPT SUITE (v{_SUITE_VERSION}, {len(suite)} prompts) ===\n")
+    out.write("\n")
+
+    # Preserve filename order (numeric prefixes on disk drive the canonical
+    # sequence; _load_prompt_suite returns them sorted by stem).
+    for i, (name, entry) in enumerate(suite.items(), 1):
+        desc = entry["metadata"].get("description", "")
+        out.write(f">>> PROMPT {i} of {len(suite)}: {name} <<<\n")
+        if desc:
+            out.write(f"({desc})\n")
+        out.write("\n")
+        out.write(entry["body"])
+        out.write("\n\n")
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — count_tokens API mode
+# ---------------------------------------------------------------------------
+#
+# Inference-free tokenizer comparison: hit POST /v1/messages/count_tokens for
+# every prompt × model pair and compare input-token counts. Complements
+# ``--compare`` (which needs two real sessions) with a shortcut that only
+# needs an API key. Outputs are input-only by design — no inference runs,
+# so output length and total cost cannot be measured this way.
+
+_COUNT_TOKENS_URL = "https://api.anthropic.com/v1/messages/count_tokens"
+_ANTHROPIC_API_VERSION = "2023-06-01"
+
+
+class CountTokensError(Exception):
+    """Raised by :func:`_count_tokens_request` for any non-success path.
+
+    Carries the HTTP status / network error / malformed-body detail
+    so the caller can decide between probe fallback (first-call 4xx on
+    model A) and a hard error (repeated failure or transport error).
+    """
+
+
+def _count_tokens_request(
+    model: str,
+    prompt: str,
+    *,
+    api_key: str,
+    url: str = _COUNT_TOKENS_URL,
+    timeout: float = 30.0,
+    urlopen=None,
+) -> int:
+    """POST /v1/messages/count_tokens for one ``(model, prompt)`` pair.
+
+    Returns the server-reported ``input_tokens`` integer. Raises
+    :class:`CountTokensError` on any non-2xx status, network error, or
+    malformed response body — preserving enough detail for the probe
+    fallback in :func:`_run_count_tokens_only` to distinguish
+    model-unavailable from infra errors.
+
+    ``urlopen`` override exists so tests inject a mock without global
+    monkey-patching; defaults to ``urllib.request.urlopen``.
+    """
+    import urllib.error  # stdlib-only; lazy-imported so non-API-mode
+    import urllib.request  # invocations don't pay the import cost.
+
+    if urlopen is None:
+        urlopen = urllib.request.urlopen
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    body_bytes = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body_bytes,
+        method="POST",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": _ANTHROPIC_API_VERSION,
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            response_bytes = resp.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            detail = ""
+        raise CountTokensError(
+            f"HTTP {exc.code} calling count_tokens for model={model!r}: "
+            f"{detail[:400]}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise CountTokensError(
+            f"network error calling count_tokens for model={model!r}: "
+            f"{exc.reason}"
+        ) from exc
+    if status >= 400:
+        raise CountTokensError(
+            f"HTTP {status} calling count_tokens for model={model!r}"
+        )
+    try:
+        data = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CountTokensError(
+            f"malformed count_tokens response for model={model!r}: {exc}"
+        ) from exc
+    tokens = data.get("input_tokens")
+    if not isinstance(tokens, int):
+        raise CountTokensError(
+            f"missing 'input_tokens' in count_tokens response for "
+            f"model={model!r}: got keys {sorted(data.keys())}"
+        )
+    return tokens
+
+
+def _confirm_count_tokens_or_exit(
+    models: list[str],
+    prompt_count: int,
+    *,
+    assume_yes: bool,
+    stdin=None,
+) -> None:
+    """Gate count-tokens mode behind explicit confirmation.
+
+    Prints the total API-call count and waits for ``y`` unless
+    ``assume_yes``. Non-TTY stdin without ``--yes`` is refused so
+    scripted invocations don't silently burn rate-limit quota.
+
+    ``stdin`` injection exists for tests; None means ``sys.stdin``.
+    """
+    if stdin is None:
+        stdin = sys.stdin
+    total_calls = len(models) * prompt_count
+    print(
+        f"About to call count_tokens: {prompt_count} prompt(s) × "
+        f"{len(models)} model(s) = {total_calls} API call(s).",
+        file=sys.stderr,
+    )
+    print(
+        "count_tokens requests don't incur per-token charges, but each call "
+        "counts against the account's request rate limit.",
+        file=sys.stderr,
+    )
+    if assume_yes:
+        print("(--yes given; proceeding)", file=sys.stderr)
+        return
+    if not getattr(stdin, "isatty", lambda: False)():
+        print(
+            "[error] --count-tokens-only requires --yes when stdin is not a "
+            "TTY (prevents accidental rate-limit burn in scripts)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        answer = input("Proceed? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n(aborted)", file=sys.stderr)
+        sys.exit(0)
+    if not answer.startswith("y"):
+        print("(aborted)", file=sys.stderr)
+        sys.exit(0)
+
+
+def _render_count_tokens_text(
+    results: list[dict],
+    models: list[str],
+    *,
+    out,
+    fallback_from: str | None = None,
+) -> None:
+    """Render the tokens-only comparison to ``out``.
+
+    One row per prompt, one column per effective model, plus a ratio
+    column (B/A) when exactly two models resolved. Footer carries the
+    ratio summary (mean / p50 / p95) and the input-only disclaimer so
+    the user doesn't misread this as a full cost comparison.
+
+    ``fallback_from`` is set when the probe rejected the first model
+    and counting collapsed to a single model — surfaced in the footer
+    so the empty column isn't mysterious.
+    """
+    if not results:
+        out.write("(no prompts in suite — nothing to count)\n")
+        return
+
+    is_pair = len(models) == 2
+
+    prompt_col = max(
+        max(len(r["name"]) for r in results),
+        len("Prompt"),
+    )
+    col_width = 22
+
+    header = f"{'Prompt':<{prompt_col}}"
+    for m in models:
+        header += "  " + f"{m:>{col_width}}"
+    if is_pair:
+        header += "  " + f"{'Ratio B/A':>12}"
+    out.write(header + "\n")
+    out.write("-" * len(header) + "\n")
+
+    ratios: list[float] = []
+    for r in results:
+        row = f"{r['name']:<{prompt_col}}"
+        for m in models:
+            val = r["tokens_by_model"].get(m)
+            cell = str(val) if val is not None else "—"
+            row += "  " + f"{cell:>{col_width}}"
+        if is_pair:
+            a = r["tokens_by_model"].get(models[0])
+            b = r["tokens_by_model"].get(models[1])
+            if a is not None and b is not None and a > 0:
+                ratio = b / a
+                ratios.append(ratio)
+                row += "  " + f"{ratio:>11.2f}×"
+            else:
+                row += "  " + f"{'—':>12}"
+        out.write(row + "\n")
+
+    out.write("\n")
+    if is_pair and ratios:
+        n = len(ratios)
+        rsorted = sorted(ratios)
+        mean = sum(rsorted) / n
+        p50 = rsorted[n // 2]
+        # For short suites (<20 prompts) fall back to max as the p95
+        # proxy — the true 95th percentile on 10 samples is ill-defined.
+        p95 = rsorted[-1] if n < 20 else rsorted[int(round(n * 0.95)) - 1]
+        out.write(
+            f"Ratio summary (B/A): mean={mean:.2f}×  p50={p50:.2f}×  "
+            f"p95={p95:.2f}×\n"
+        )
+    elif fallback_from is not None:
+        out.write(
+            f"[info] counted against {models[0]!r} only — {fallback_from!r} "
+            "was rejected by the API. Ratios not computable from this mode; "
+            "run --compare against two actual sessions for a full comparison.\n"
+        )
+
+    out.write("\n")
+    out.write(
+        "NOTE: count_tokens measures INPUT tokens only. No inference runs, "
+        "so output length and total cost cannot be compared this way. "
+        "For a full cost comparison, run --compare against two actual "
+        "Claude Code sessions.\n"
+    )
+
+
+def _run_count_tokens_only(
+    models: list[str] | None,
+    *,
+    suite_dir: Path | None = None,
+    assume_yes: bool = False,
+    api_key: str | None = None,
+    urlopen=None,
+    stdin=None,
+    out=None,
+) -> None:
+    """Entrypoint for ``--count-tokens-only``.
+
+    Calls ``POST /v1/messages/count_tokens`` for every prompt in the
+    canonical suite against each of the (up to two) models in
+    ``models``. Prints a tokens-only table to ``out`` (stdout).
+
+    Probe fallback: attempts the first model with the first prompt.
+    If that call fails, the mode collapses to counting the second
+    model only and emits a friendly explanation pointing at
+    ``--compare`` as the alternative. This handles the common case
+    of a deprecated baseline (``claude-opus-4-6``) no longer being
+    accessible via the API even though the reference suite names it.
+
+    Requires ``ANTHROPIC_API_KEY`` env var unless ``api_key`` is
+    injected (tests). Missing key → clear error, exit 1.
+
+    ``urlopen`` / ``stdin`` / ``out`` / ``api_key`` are test seams —
+    production callers leave them ``None``.
+    """
+    import os
+
+    if out is None:
+        out = sys.stdout
+    if api_key is None:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print(
+            "[error] --count-tokens-only requires ANTHROPIC_API_KEY env var "
+            "(the /v1/messages/count_tokens endpoint needs an API key). Set "
+            "it and re-run, or use --compare against two real sessions for a "
+            "cost-aware comparison.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    models = list(models) if models else []
+    if len(models) == 0:
+        models = ["claude-opus-4-6", "claude-opus-4-7"]
+    elif len(models) == 1:
+        print(
+            f"[info] only one model provided ({models[0]}); ratios will not "
+            "be computed.",
+            file=sys.stderr,
+        )
+    elif len(models) > 2:
+        print(
+            "[error] --compare-models takes at most two model IDs",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        suite = _load_prompt_suite(suite_dir)
+    except PromptSuiteError as exc:
+        print(f"[error] prompt suite: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if not suite:
+        print(
+            "[error] prompt suite is empty or missing (expected under "
+            f"{suite_dir or _PROMPT_SUITE_DIR})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    _confirm_count_tokens_or_exit(
+        models, len(suite), assume_yes=assume_yes, stdin=stdin,
+    )
+
+    effective_models = list(models)
+    fallback_from: str | None = None
+
+    # Probe model A with the first prompt. If it fails, fall back to
+    # counting B only (assuming we had a pair — single-model invocations
+    # skip probing since there's nothing to fall back to).
+    if len(effective_models) == 2:
+        first_name = next(iter(suite))
+        first_body = suite[first_name]["body"]
+        try:
+            _count_tokens_request(
+                effective_models[0], first_body,
+                api_key=api_key, urlopen=urlopen,
+            )
+        except CountTokensError as exc:
+            print(
+                f"[info] model {effective_models[0]!r} is not accessible to "
+                f"this API key (probe failed: {exc}).",
+                file=sys.stderr,
+            )
+            print(
+                f"[info] falling back to counting tokens against "
+                f"{effective_models[1]!r} only. For a full baseline "
+                "comparison, run --compare against two actual sessions.",
+                file=sys.stderr,
+            )
+            fallback_from = effective_models[0]
+            effective_models = [effective_models[1]]
+
+    results: list[dict] = []
+    for name, entry in suite.items():
+        tokens_by_model: dict[str, int] = {}
+        for m in effective_models:
+            try:
+                tokens_by_model[m] = _count_tokens_request(
+                    m, entry["body"], api_key=api_key, urlopen=urlopen,
+                )
+            except CountTokensError as exc:
+                print(
+                    f"[warn] count_tokens failed for prompt={name!r} "
+                    f"model={m!r}: {exc}",
+                    file=sys.stderr,
+                )
+        results.append({
+            "name": name,
+            "tokens_by_model": tokens_by_model,
+        })
+
+    _render_count_tokens_text(
+        results, effective_models, out=out, fallback_from=fallback_from,
+    )

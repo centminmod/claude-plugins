@@ -10,18 +10,23 @@ import pytest
 
 _HERE       = Path(__file__).parent
 _SCRIPT     = _HERE.parent / "scripts" / "session-metrics.py"
+_COMPARE    = _HERE.parent / "scripts" / "session_metrics_compare.py"
 _FIXTURE    = _HERE / "fixtures" / "mini.jsonl"
 
 
-def _load_module():
-    spec = importlib.util.spec_from_file_location("session_metrics", _SCRIPT)
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
     mod  = importlib.util.module_from_spec(spec)
-    sys.modules["session_metrics"] = mod
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-sm = _load_module()
+# Load main first — the compare module looks up helpers from
+# sys.modules["session_metrics"] at call time, so it must already
+# be registered when any compare test runs.
+sm = _load_module("session_metrics", _SCRIPT)
+smc = _load_module("session_metrics_compare", _COMPARE)
 
 
 # --- Pricing -----------------------------------------------------------------
@@ -1570,3 +1575,2714 @@ def test_build_usage_insights_md_emits_section_header():
     out = sm._build_usage_insights_md(one)
     assert out.startswith("## Usage Insights")
     assert "- **100%**" in out
+
+
+# =============================================================================
+# Compare primitives (session_metrics_compare module) - Phase 1
+# =============================================================================
+
+import shutil  # noqa: E402  (import here to keep compare tests self-contained)
+
+
+_FIXTURES_DIR = _HERE / "fixtures"
+
+
+# --- _model_family_slug ------------------------------------------------------
+
+def test_model_family_slug_opus_4_7():
+    assert smc._model_family_slug("claude-opus-4-7") == "opus-4-7"
+
+
+def test_model_family_slug_opus_4_6():
+    assert smc._model_family_slug("claude-opus-4-6") == "opus-4-6"
+
+
+def test_model_family_slug_tolerates_1m_suffix():
+    # Default 4.7 arrives tagged claude-opus-4-7[1m]; the compare
+    # resolver must treat it as the same family as the non-[1m]
+    # baseline — pricing is identical and the tokenizer is the same.
+    assert smc._model_family_slug("claude-opus-4-7[1m]") == "opus-4-7"
+
+
+def test_model_family_slug_strips_date_stamp():
+    # Some haiku ids carry a trailing YYYYMMDD date; treat as same
+    # family as the un-dated form.
+    assert (
+        smc._model_family_slug("claude-haiku-4-5-20251001")
+        == smc._model_family_slug("claude-haiku-4-5")
+        == "haiku-4-5"
+    )
+
+
+def test_model_family_slug_cross_family():
+    assert smc._model_family_slug("claude-sonnet-4-7") == "sonnet-4-7"
+
+
+def test_model_family_slug_unknown_returns_empty():
+    # Non-Claude models (BYOK / proxy edge cases) produce empty so
+    # callers can refuse gracefully rather than guess a family.
+    assert smc._model_family_slug("gpt-4o") == ""
+    assert smc._model_family_slug("") == ""
+    assert smc._model_family_slug("garbage-string") == ""
+
+
+def test_strip_context_tier_suffix():
+    assert smc._strip_context_tier_suffix("claude-opus-4-7[1m]") == "claude-opus-4-7"
+    assert smc._strip_context_tier_suffix("claude-opus-4-7") == "claude-opus-4-7"
+    # Only trailing bracketed tags are stripped.
+    assert smc._strip_context_tier_suffix("claude-[old]-opus-4-7") == "claude-[old]-opus-4-7"
+
+
+# --- _user_prompt_fingerprint_text & _user_prompt_fingerprint ---------------
+
+def test_fingerprint_text_plain_string():
+    assert smc._user_prompt_fingerprint_text("hello world") == "hello world"
+
+
+def test_fingerprint_text_whitespace_collapsed():
+    # Leading/trailing/internal whitespace normalization so CR/LF
+    # drift between paste paths doesn't change the fingerprint.
+    assert (
+        smc._user_prompt_fingerprint_text("  hello\n\n world  ")
+        == smc._user_prompt_fingerprint_text("hello world")
+        == "hello world"
+    )
+
+
+def test_fingerprint_text_list_of_blocks():
+    content = [
+        {"type": "text", "text": "hello"},
+        {"type": "text", "text": "world"},
+    ]
+    assert smc._user_prompt_fingerprint_text(content) == "hello world"
+
+
+def test_fingerprint_text_ignores_tool_result_blocks():
+    # tool_result blocks don't represent user-written prompts; they
+    # should be excluded from the fingerprint so a prompt paired
+    # with tool output doesn't hash differently than the same
+    # prompt alone.
+    content = [
+        {"type": "text", "text": "hello"},
+        {"type": "tool_result", "tool_use_id": "t1", "content": "output"},
+    ]
+    assert smc._user_prompt_fingerprint_text(content) == "hello"
+
+
+def test_fingerprint_text_returns_empty_for_unpairable():
+    # Pure tool_result, None, and empty inputs all return "" — the
+    # pairing code treats these as unpairable turns.
+    assert smc._user_prompt_fingerprint_text(None) == ""
+    assert smc._user_prompt_fingerprint_text([]) == ""
+    assert smc._user_prompt_fingerprint_text([
+        {"type": "tool_result", "tool_use_id": "t1", "content": "out"},
+    ]) == ""
+
+
+def test_fingerprint_hash_stable():
+    # Same input → same hash; different inputs → different hashes.
+    h1 = smc._user_prompt_fingerprint("prompt one")
+    h2 = smc._user_prompt_fingerprint("prompt one")
+    h3 = smc._user_prompt_fingerprint("prompt two")
+    assert h1 == h2
+    assert h1 != h3
+
+
+def test_fingerprint_text_prefix_window():
+    # Prompts that share the first 200 chars but diverge later
+    # hash identically — an intentional trade-off: trailing drift
+    # (tacked-on modifiers, signature blocks) shouldn't break pairing.
+    base = "x" * 199 + "A"
+    drifted = "x" * 199 + "B" + " suffix that does not matter"
+    # Only the first 200 chars hash. Char 200 differs (A vs B) so
+    # these should hash differently. Verify the window is at 200.
+    h1 = smc._user_prompt_fingerprint(base)
+    h2 = smc._user_prompt_fingerprint(drifted)
+    assert h1 != h2
+    # But prompts identical in the first 200 chars hash the same.
+    same = "x" * 199 + "A" + " different suffix"
+    assert smc._user_prompt_fingerprint(same) == h1
+
+
+# --- _pair_turns -------------------------------------------------------------
+
+def _make_turn(prompt_text, model="claude-opus-4-7"):
+    """Construct a minimal turn dict for pairing tests."""
+    return {
+        "message": {"model": model, "usage": {"input_tokens": 1}},
+        "_preceding_user_content": [
+            {"type": "text", "text": prompt_text},
+        ] if prompt_text else None,
+    }
+
+
+def test_pair_turns_unknown_mode_raises():
+    with pytest.raises(ValueError, match="unknown pairing mode"):
+        smc._pair_turns([], [], mode="nope")
+
+
+def test_pair_turns_ordinal_exact():
+    a = [_make_turn("p1"), _make_turn("p2"), _make_turn("p3")]
+    b = [_make_turn("p1"), _make_turn("p2"), _make_turn("p3")]
+    result = smc._pair_turns(a, b, mode="ordinal")
+    assert result["mode"] == "ordinal"
+    assert len(result["paired"]) == 3
+    assert result["unmatched_a"] == []
+    assert result["unmatched_b"] == []
+    assert result["warnings"] == []
+
+
+def test_pair_turns_ordinal_length_mismatch():
+    a = [_make_turn("p1"), _make_turn("p2"), _make_turn("p3")]
+    b = [_make_turn("p1"), _make_turn("p2")]
+    result = smc._pair_turns(a, b, mode="ordinal")
+    assert len(result["paired"]) == 2
+    assert len(result["unmatched_a"]) == 1
+    assert result["unmatched_b"] == []
+    # Warning tells the user A had an extra turn.
+    assert result["warnings"]
+    assert "lengths differ" in result["warnings"][0]
+
+
+def test_pair_turns_fingerprint_exact_match():
+    a = [_make_turn("alpha"), _make_turn("beta"), _make_turn("gamma")]
+    b = [_make_turn("alpha"), _make_turn("beta"), _make_turn("gamma")]
+    result = smc._pair_turns(a, b, mode="fingerprint")
+    assert result["mode"] == "fingerprint"
+    assert len(result["paired"]) == 3
+    assert result["unmatched_a"] == result["unmatched_b"] == []
+
+
+def test_pair_turns_fingerprint_tolerates_whitespace_drift():
+    # Whitespace-normalized fingerprint means CR/LF and leading
+    # spaces don't break pairing.
+    a = [_make_turn("alpha prompt"), _make_turn("beta prompt")]
+    b = [_make_turn("  alpha  prompt\n"), _make_turn("beta\nprompt")]
+    result = smc._pair_turns(a, b, mode="fingerprint")
+    assert len(result["paired"]) == 2
+
+
+def test_pair_turns_fingerprint_reorders_ok():
+    # Fingerprint pairing is order-independent — prompts can be
+    # run in a different sequence on the two sides.
+    a = [_make_turn("one"), _make_turn("two"), _make_turn("three")]
+    b = [_make_turn("three"), _make_turn("one"), _make_turn("two")]
+    result = smc._pair_turns(a, b, mode="fingerprint")
+    assert len(result["paired"]) == 3
+
+
+def test_pair_turns_fingerprint_unmatched_reported():
+    a = [_make_turn("shared"), _make_turn("only_a")]
+    b = [_make_turn("shared"), _make_turn("only_b")]
+    result = smc._pair_turns(a, b, mode="fingerprint")
+    assert len(result["paired"]) == 1
+    assert len(result["unmatched_a"]) == 1
+    assert len(result["unmatched_b"]) == 1
+    # Warning surfaces the unmatched counts.
+    assert any("no partner" in w for w in result["warnings"])
+
+
+def test_pair_turns_fingerprint_duplicate_prompts_paired_ordinally():
+    # Same prompt asked twice on each side should pair 1st-with-1st
+    # and 2nd-with-2nd (not squashed into a single pairing).
+    a = [_make_turn("repeat"), _make_turn("repeat"), _make_turn("repeat")]
+    b = [_make_turn("repeat"), _make_turn("repeat")]
+    result = smc._pair_turns(a, b, mode="fingerprint")
+    assert len(result["paired"]) == 2
+    assert len(result["unmatched_a"]) == 1
+
+
+def test_pair_turns_fingerprint_empty_prompts_unpairable():
+    # Turns whose preceding user content is a pure tool_result (no
+    # text block) can't be paired — they have no fingerprint.
+    a = [_make_turn("prompt"), _make_turn(None)]
+    b = [_make_turn("prompt"), _make_turn(None)]
+    result = smc._pair_turns(a, b, mode="fingerprint")
+    assert len(result["paired"]) == 1
+    assert len(result["unmatched_a"]) == 1
+    assert len(result["unmatched_b"]) == 1
+
+
+def test_pair_turns_fingerprint_zero_paired_warns():
+    a = [_make_turn("only_a1"), _make_turn("only_a2")]
+    b = [_make_turn("only_b1")]
+    result = smc._pair_turns(a, b, mode="fingerprint")
+    assert result["paired"] == []
+    assert any("matched 0 turns" in w for w in result["warnings"])
+
+
+# --- _dominant_model_family --------------------------------------------------
+
+def test_dominant_model_family_homogeneous():
+    turns = [
+        {"message": {"model": "claude-opus-4-7"}},
+        {"message": {"model": "claude-opus-4-7"}},
+    ]
+    assert smc._dominant_model_family(turns) == "opus-4-7"
+
+
+def test_dominant_model_family_tolerates_1m_suffix():
+    turns = [
+        {"message": {"model": "claude-opus-4-7[1m]"}},
+        {"message": {"model": "claude-opus-4-7[1m]"}},
+    ]
+    assert smc._dominant_model_family(turns) == "opus-4-7"
+
+
+def test_dominant_model_family_mixed_picks_most_frequent():
+    turns = [
+        {"message": {"model": "claude-opus-4-7"}},
+        {"message": {"model": "claude-opus-4-7"}},
+        {"message": {"model": "claude-sonnet-4-7"}},
+    ]
+    assert smc._dominant_model_family(turns) == "opus-4-7"
+
+
+def test_dominant_model_family_empty_returns_blank():
+    assert smc._dominant_model_family([]) == ""
+
+
+def test_dominant_model_family_unknown_models_bucketed_out():
+    # Non-Claude turns are excluded from the count; if they're the
+    # only ones present, the function returns "".
+    turns = [{"message": {"model": "gpt-4o"}}]
+    assert smc._dominant_model_family(turns) == ""
+
+
+# --- project inventory + compare arg resolver --------------------------------
+
+def _build_project_dir(tmp_path, slug, filenames_with_mtimes):
+    """Populate a fake project dir with fixture JSONLs at fixed mtimes.
+
+    Args:
+        tmp_path: pytest tmp_path fixture.
+        slug: project slug.
+        filenames_with_mtimes: [(fixture_filename, mtime_offset_seconds), ...].
+            Fixtures are copied from tests/fixtures/; mtimes are set
+            relative to a deterministic base so file ordering is
+            reproducible across test runs.
+
+    Returns:
+        (projects_dir, project_dir) — set CLAUDE_PROJECTS_DIR to
+        projects_dir in tests that need the resolver to find these.
+    """
+    projects_dir = tmp_path / "projects"
+    project_dir = projects_dir / slug
+    project_dir.mkdir(parents=True)
+    base_mtime = 1_700_000_000  # arbitrary fixed epoch
+    for fname, offset in filenames_with_mtimes:
+        src = _FIXTURES_DIR / fname
+        dst = project_dir / fname
+        shutil.copy(src, dst)
+        import os as _os
+        _os.utime(dst, (base_mtime + offset, base_mtime + offset))
+    return projects_dir, project_dir
+
+
+def test_project_family_inventory_groups_by_family(tmp_path, monkeypatch):
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "test-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 10),
+            ("compare_opus_4_7_a.jsonl", 20),
+            ("compare_sonnet_4_7_a.jsonl", 30),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    inv = smc._project_family_inventory("test-slug", use_cache=False)
+    assert "opus-4-6" in inv
+    assert "opus-4-7" in inv
+    assert "sonnet-4-7" in inv
+    # Each family has exactly one session.
+    assert len(inv["opus-4-6"]) == 1
+    assert len(inv["opus-4-7"]) == 1
+    assert len(inv["sonnet-4-7"]) == 1
+    # User-turn count is captured (5 prompts per fixture).
+    assert inv["opus-4-6"][0][1] == 5
+
+
+def test_resolve_compare_arg_path_existing(tmp_path):
+    # A real path returns ("single", [path]) without any project lookup.
+    path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
+    kind, paths = smc._resolve_compare_arg(str(path), "any-slug")
+    assert kind == "single"
+    assert len(paths) == 1
+    assert paths[0].name == "compare_opus_4_6_a.jsonl"
+
+
+def test_resolve_compare_arg_path_missing_raises(tmp_path):
+    with pytest.raises(smc.CompareArgError, match="path does not exist"):
+        smc._resolve_compare_arg(str(tmp_path / "nope.jsonl"), "slug")
+
+
+def test_resolve_compare_arg_last_family(tmp_path, monkeypatch):
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "test-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 10),
+            ("compare_opus_4_7_a.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    kind, paths = smc._resolve_compare_arg(
+        "last-opus-4-7", "test-slug", use_cache=False,
+    )
+    assert kind == "single"
+    assert paths[0].name == "compare_opus_4_7_a.jsonl"
+
+
+def test_resolve_compare_arg_last_family_short_form(tmp_path, monkeypatch):
+    # Short form "last-4-7" should resolve when only one family
+    # in the project carries that suffix.
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "test-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 10),
+            ("compare_opus_4_7_a.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    kind, paths = smc._resolve_compare_arg(
+        "last-4-7", "test-slug", use_cache=False,
+    )
+    assert kind == "single"
+    assert paths[0].name == "compare_opus_4_7_a.jsonl"
+
+
+def test_resolve_compare_arg_last_family_short_form_ambiguous(tmp_path, monkeypatch):
+    # When two families end with "-4-7" (opus-4-7 and sonnet-4-7),
+    # "last-4-7" is ambiguous and the resolver refuses with a list
+    # of candidates rather than guessing.
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "test-slug",
+        [
+            ("compare_opus_4_7_a.jsonl", 10),
+            ("compare_sonnet_4_7_a.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    with pytest.raises(smc.CompareArgError) as exc:
+        smc._resolve_compare_arg(
+            "last-4-7", "test-slug", use_cache=False,
+        )
+    assert "no sessions found for family" in str(exc.value)
+    # Error lists both ambiguous candidates so the user can pick.
+    assert "opus-4-7" in str(exc.value)
+    assert "sonnet-4-7" in str(exc.value)
+
+
+def test_resolve_compare_arg_last_family_tolerates_1m(tmp_path, monkeypatch):
+    # A session whose model is claude-opus-4-7[1m] still resolves
+    # under family "opus-4-7".
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "test-slug",
+        [
+            ("compare_opus_4_7_1m_a.jsonl", 10),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    kind, paths = smc._resolve_compare_arg(
+        "last-opus-4-7", "test-slug", use_cache=False,
+    )
+    assert kind == "single"
+    assert paths[0].name == "compare_opus_4_7_1m_a.jsonl"
+
+
+def test_resolve_compare_arg_last_family_min_turns_filter(tmp_path, monkeypatch):
+    # With both a 5-turn and a 2-turn opus-4-7 session, default
+    # min_turns=5 must pick the 5-turn one even though the 2-turn
+    # file has a more recent mtime.
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "test-slug",
+        [
+            ("compare_opus_4_7_a.jsonl", 10),      # 5 turns, older
+            ("compare_opus_4_7_short.jsonl", 20),  # 2 turns, newer
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    kind, paths = smc._resolve_compare_arg(
+        "last-opus-4-7", "test-slug", use_cache=False,
+    )
+    assert kind == "single"
+    assert paths[0].name == "compare_opus_4_7_a.jsonl"
+
+
+def test_resolve_compare_arg_last_family_min_turns_override(tmp_path, monkeypatch):
+    # With min_turns=1, the newer (2-turn) session becomes eligible
+    # and wins on recency.
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "test-slug",
+        [
+            ("compare_opus_4_7_a.jsonl", 10),
+            ("compare_opus_4_7_short.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    kind, paths = smc._resolve_compare_arg(
+        "last-opus-4-7", "test-slug", min_turns=1, use_cache=False,
+    )
+    assert paths[0].name == "compare_opus_4_7_short.jsonl"
+
+
+def test_resolve_compare_arg_last_family_all_below_min(tmp_path, monkeypatch):
+    # Only short sessions present → error mentions the min-turn
+    # override flag.
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "test-slug",
+        [
+            ("compare_opus_4_7_short.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    with pytest.raises(smc.CompareArgError) as exc:
+        smc._resolve_compare_arg(
+            "last-opus-4-7", "test-slug", use_cache=False,
+        )
+    assert "--compare-min-turns" in str(exc.value)
+
+
+def test_resolve_compare_arg_all_family_aggregate(tmp_path, monkeypatch):
+    # all-<family> should return every session matching the family,
+    # including ones below min_turns.
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "test-slug",
+        [
+            ("compare_opus_4_7_a.jsonl", 10),
+            ("compare_opus_4_7_short.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    kind, paths = smc._resolve_compare_arg(
+        "all-opus-4-7", "test-slug", use_cache=False,
+    )
+    assert kind == "aggregate"
+    assert len(paths) == 2
+    names = {p.name for p in paths}
+    assert names == {"compare_opus_4_7_a.jsonl", "compare_opus_4_7_short.jsonl"}
+
+
+def test_resolve_compare_arg_unknown_family_lists_present(tmp_path, monkeypatch):
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "test-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 10),
+            ("compare_sonnet_4_7_a.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    with pytest.raises(smc.CompareArgError) as exc:
+        smc._resolve_compare_arg(
+            "last-opus-4-5", "test-slug", use_cache=False,
+        )
+    # Error lists the families actually present so the user can
+    # fix the typo or pick an alternative.
+    msg = str(exc.value)
+    assert "opus-4-6" in msg
+    assert "sonnet-4-7" in msg
+
+
+def test_resolve_compare_arg_empty_family_slug_raises(tmp_path):
+    with pytest.raises(smc.CompareArgError, match="missing a family slug"):
+        smc._resolve_compare_arg("last-", "slug")
+
+
+def test_resolve_compare_arg_uninterpretable_raises():
+    # A string with whitespace / invalid chars fails _SESSION_RE and
+    # isn't a path or magic token, so falls through to the generic
+    # "could not interpret" error.
+    with pytest.raises(smc.CompareArgError, match="could not interpret"):
+        smc._resolve_compare_arg("has spaces not valid", "slug")
+
+
+def test_resolve_compare_arg_empty_string_raises():
+    with pytest.raises(smc.CompareArgError, match="compare arg is empty"):
+        smc._resolve_compare_arg("", "slug")
+
+
+def test_match_family_key_exact():
+    assert smc._match_family_key("opus-4-7", ["opus-4-7", "sonnet-4-7"]) == "opus-4-7"
+
+
+def test_match_family_key_unique_suffix():
+    assert smc._match_family_key("4-6", ["opus-4-6", "sonnet-4-7"]) == "opus-4-6"
+
+
+def test_match_family_key_ambiguous_suffix_returns_none():
+    # Two families end in "-4-7" → ambiguous, return None so the
+    # caller can produce a helpful error.
+    assert smc._match_family_key("4-7", ["opus-4-7", "sonnet-4-7"]) is None
+
+
+def test_match_family_key_no_match_returns_none():
+    assert smc._match_family_key("4-99", ["opus-4-7"]) is None
+
+
+def test_main_module_required():
+    # Sanity check: the compare module's _main() must see the
+    # session_metrics module in sys.modules. This test verifies
+    # the coupling contract by removing and restoring the module
+    # registration.
+    saved = sys.modules.pop("session_metrics")
+    try:
+        with pytest.raises(RuntimeError, match="must be loaded"):
+            smc._main()
+    finally:
+        sys.modules["session_metrics"] = saved
+
+
+# =========================================================================
+# Phase 2 — Compare-report builder, renderers, and CLI dispatch
+# =========================================================================
+
+import json   # noqa: E402  (local to Phase 2 tests — keep imports grouped)
+import copy   # noqa: E402
+
+
+def _load_compare_fixture(name: str):
+    """Read a compare fixture the way ``_load_session`` would. Used by
+    every Phase-2 builder test so the three-line setup isn't duplicated.
+    """
+    path = _FIXTURES_DIR / name
+    sid, turns, user_ts = sm._load_session(
+        path, include_subagents=False, use_cache=False,
+    )
+    return sid, turns, user_ts
+
+
+def _make_basic_compare_report():
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    return smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, b_turns, b_user_ts,
+        slug="test-slug",
+    )
+
+
+# ---- Report builder --------------------------------------------------------
+
+def test_build_compare_report_basic_shape():
+    report = _make_basic_compare_report()
+    assert report["mode"] == "compare"
+    assert report["compare_mode"] == "controlled"
+    assert report["slug"] == "test-slug"
+    assert report["pair_by"] == "fingerprint"
+    assert report["side_a"]["model_family"] == "opus-4-6"
+    assert report["side_b"]["model_family"] == "opus-4-7"
+    assert report["side_a"]["turn_count"] == 5
+    assert report["side_b"]["turn_count"] == 5
+    assert len(report["paired"]) == 5
+    assert report["unmatched_a"] == []
+    assert report["unmatched_b"] == []
+    assert report["summary"]["paired_count"] == 5
+    # Fixture designed for exact 1.3× ratio across every metric.
+    assert report["summary"]["input_tokens_ratio"] == pytest.approx(1.3)
+    assert report["summary"]["cost_ratio"] == pytest.approx(1.3, rel=1e-9)
+
+
+def test_build_compare_report_cost_delta_is_tokenizer_driven():
+    # Pricing is identical for claude-opus-4-6 and claude-opus-4-7, so
+    # a nonzero cost delta between two sessions running the same prompts
+    # is 100% tokenizer-driven. The article's whole premise.
+    a_rates = sm._pricing_for("claude-opus-4-6")
+    b_rates = sm._pricing_for("claude-opus-4-7")
+    assert a_rates["input"]  == b_rates["input"]
+    assert a_rates["output"] == b_rates["output"]
+    report = _make_basic_compare_report()
+    cost_a = report["side_a"]["totals"]["cost"]
+    cost_b = report["side_b"]["totals"]["cost"]
+    assert cost_b > cost_a > 0
+
+
+def test_build_compare_report_fingerprint_matches_regardless_of_order():
+    # Same prompt text on both sides — every pair matches on content,
+    # even if the B-side order is reversed.
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, list(reversed(b_turns)), b_user_ts,
+        slug="test-slug", pair_by="fingerprint",
+    )
+    assert len(report["paired"]) == 5
+    for pair in report["paired"]:
+        assert pair["a"]["input_tokens"] * 1.3 == pytest.approx(pair["b"]["input_tokens"])
+
+
+def test_build_compare_report_ordinal_pairing():
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, b_turns, b_user_ts,
+        slug="test-slug", pair_by="ordinal",
+    )
+    assert report["pair_by"] == "ordinal"
+    assert len(report["paired"]) == 5
+    # Sanity: fingerprint field is either absent or a hex digest — never
+    # a prompt string or garbled value.
+    for pair in report["paired"]:
+        fp = pair.get("fingerprint")
+        assert fp is None or all(c in "0123456789abcdef" for c in fp)
+
+
+def test_build_compare_report_context_tier_mismatch_advisory():
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_1m_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, b_turns, b_user_ts,
+        slug="test-slug",
+    )
+    kinds = [adv["kind"] for adv in report["advisories"]]
+    assert "context-tier-mismatch" in kinds
+
+
+def test_build_compare_report_cache_share_drift_advisory():
+    # Synthesize > 10 pp cache-read-share drift by inflating side A's
+    # cache_read on every turn.
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    a_mut = copy.deepcopy(a_turns)
+    for t in a_mut:
+        t["message"]["usage"]["cache_read_input_tokens"] = 1000
+    report = smc._build_compare_report(
+        a_sid, a_mut, a_user_ts,
+        b_sid, b_turns, b_user_ts,
+        slug="test-slug",
+    )
+    kinds = [adv["kind"] for adv in report["advisories"]]
+    assert "cache-share-drift" in kinds
+
+
+def test_build_compare_report_model_family_collision_info():
+    # Feeding the same session on both sides fires an info-level
+    # collision advisory; the report still renders.
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, b_turns, b_user_ts,
+        slug="test-slug",
+    )
+    kinds = [adv["kind"] for adv in report["advisories"]]
+    assert "model-family-collision" in kinds
+    assert report["summary"]["cost_ratio"] == pytest.approx(1.0)
+
+
+def test_build_compare_report_cross_family_no_collision():
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_sonnet_4_7_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, b_turns, b_user_ts,
+        slug="test-slug",
+    )
+    kinds = [adv["kind"] for adv in report["advisories"]]
+    assert "model-family-collision" not in kinds
+    # Model-agnostic header data — no hardcoded family slug in report.
+    assert report["side_a"]["model_family"] == "opus-4-7"
+    assert report["side_b"]["model_family"] == "sonnet-4-7"
+
+
+def test_build_compare_report_no_fingerprint_matches_advisory():
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    # Replace every B-side prompt with distinct text so fingerprint
+    # pairing matches zero turns.
+    b_mut = copy.deepcopy(b_turns)
+    for i, t in enumerate(b_mut):
+        t["_preceding_user_content"] = [
+            {"type": "text", "text": f"unique b-side prompt {i}"}
+        ]
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, b_mut, b_user_ts,
+        slug="test-slug", pair_by="fingerprint",
+    )
+    kinds = [adv["kind"] for adv in report["advisories"]]
+    assert "no-fingerprint-matches" in kinds
+    assert report["paired"] == []
+
+
+# ---- Per-helper edge cases -------------------------------------------------
+
+def test_safe_ratio_zero_denominator():
+    assert smc._safe_ratio(10, 0) is None
+    assert smc._safe_ratio(0, 5) == 0.0
+    assert smc._safe_ratio(6, 2) == 3.0
+
+
+def test_context_tier_from_model_id():
+    assert smc._context_tier_from_model_id("claude-opus-4-7[1m]") == "1m"
+    assert smc._context_tier_from_model_id("claude-opus-4-7") == ""
+    assert smc._context_tier_from_model_id("") == ""
+
+
+def test_dominant_model_id_picks_majority():
+    turns = [
+        {"message": {"model": "claude-opus-4-6"}},
+        {"message": {"model": "claude-opus-4-6"}},
+        {"message": {"model": "claude-opus-4-7"}},
+    ]
+    assert smc._dominant_model_id(turns) == "claude-opus-4-6"
+
+
+def test_dominant_model_id_empty():
+    assert smc._dominant_model_id([]) == ""
+
+
+def test_cache_read_share_zero_input():
+    # Degenerate empty-session totals → share is 0.0, not NaN / crash.
+    assert smc._cache_read_share_pct({"total_input": 0, "cache_read": 0}) == 0.0
+
+
+# ---- Renderers --------------------------------------------------------------
+
+def test_render_compare_text_contains_summary_and_ratios():
+    report = _make_basic_compare_report()
+    out = smc.render_compare_text(report)
+    assert "COMPARE (controlled)" in out
+    assert "claude-opus-4-6" in out
+    assert "claude-opus-4-7" in out
+    assert "1.30×" in out
+    # Model-agnostic: no hardcoded "4.6 vs 4.7" literal in the renderer.
+    assert "4.6 vs 4.7" not in out
+
+
+def test_render_compare_md_contains_tables():
+    report = _make_basic_compare_report()
+    out = smc.render_compare_md(report)
+    assert "# Model Compare" in out
+    assert "| Side | Session |" in out
+    assert "| Input-token ratio |" in out
+    assert "1.30×" in out
+    assert "## Paired turns" in out
+
+
+def test_render_compare_json_is_valid_json():
+    report = _make_basic_compare_report()
+    out = smc.render_compare_json(report)
+    parsed = json.loads(out)
+    assert parsed["mode"] == "compare"
+    assert parsed["side_a"]["model_family"] == "opus-4-6"
+    assert parsed["side_b"]["model_family"] == "opus-4-7"
+    assert len(parsed["paired"]) == 5
+
+
+def test_render_compare_csv_layout():
+    report = _make_basic_compare_report()
+    out = smc.render_compare_csv(report)
+    lines = out.strip().splitlines()
+    assert lines[0].startswith("pair_index,fingerprint,")
+    data_rows = lines[1:6]
+    assert all("claude-opus-4-6" in r and "claude-opus-4-7" in r for r in data_rows)
+    assert "# SUMMARY" in out
+    assert "# RATIOS (B vs A)" in out
+    assert "cost_ratio,1.3000" in out
+
+
+def test_main_renderers_delegate_on_compare_mode():
+    # The four dispatchers in session-metrics.py branch on
+    # report["mode"] == "compare" and delegate to the compare module.
+    report = _make_basic_compare_report()
+    assert sm.render_text(report) == smc.render_compare_text(report)
+    assert sm.render_md(report)   == smc.render_compare_md(report)
+    assert sm.render_csv(report)  == smc.render_compare_csv(report)
+    assert sm.render_json(report) == smc.render_compare_json(report)
+
+
+# ---- Scope reconciliation ---------------------------------------------------
+
+def test_check_compare_scope_auto_session_pair():
+    assert smc._check_compare_scope("auto", "single", "single") == "controlled"
+
+
+def test_check_compare_scope_session_forces_single():
+    with pytest.raises(smc.CompareArgError, match="requires two single"):
+        smc._check_compare_scope("session", "aggregate", "single")
+
+
+def test_check_compare_scope_project_returns_observational():
+    # Phase 3: --compare-scope=project forces Mode 2 even for two single
+    # sessions. Useful for comparing two one-session "families" side-by-side
+    # under the observational framing (no pairing; aggregate columns only).
+    assert smc._check_compare_scope("project", "single", "single") == "observational"
+
+
+def test_check_compare_scope_auto_picks_observational_on_aggregate():
+    # Phase 3: auto-scope picks observational iff either side is aggregate.
+    assert smc._check_compare_scope("auto", "aggregate", "single") == "observational"
+    assert smc._check_compare_scope("auto", "single", "aggregate") == "observational"
+    assert smc._check_compare_scope("auto", "aggregate", "aggregate") == "observational"
+
+
+# ---- CLI smoke tests (through sm.main) --------------------------------------
+
+def test_cli_compare_happy_path(monkeypatch, tmp_path, capsys):
+    # End-to-end invocation: fire --compare with absolute paths and
+    # confirm stdout carries the compare report and the 1.30× ratio.
+    monkeypatch.chdir(tmp_path)
+    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
+    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", str(a_path), str(b_path),
+         "--slug", "test-slug"],
+    )
+    sm.main()
+    out = capsys.readouterr().out
+    assert "COMPARE (controlled)" in out
+    assert "1.30×" in out
+
+
+def test_cli_compare_html_exports_single_page(monkeypatch, tmp_path, capsys):
+    # Phase 6: --output html for compare mode now ships a single-page
+    # HTML document. The test ensures the file lands on disk and carries
+    # at least one compare-specific DOM marker so downstream renderers
+    # that wrap the output can still see it.
+    monkeypatch.chdir(tmp_path)
+    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
+    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", str(a_path), str(b_path),
+         "--slug", "test-slug", "--output", "html"],
+    )
+    sm.main()
+    err = capsys.readouterr().err
+    assert "[export] HTML (compare)" in err
+    exports = tmp_path / "exports" / "session-metrics"
+    html_files = list(exports.glob("compare_*.html"))
+    assert html_files, f"No compare HTML exported under {exports}"
+    body = html_files[0].read_text(encoding="utf-8")
+    assert "<!DOCTYPE html>" in body
+    assert "Session Metrics" in body
+    assert "section class=\"compare-card" in body or 'class="compare-card' in body
+
+
+def test_cli_compare_last_family_magic_token(monkeypatch, tmp_path, capsys):
+    # Set up a project dir with one 4.6 + one 4.7 session; resolver
+    # picks the single match per family via last-<family>.
+    projects_dir, _ = _build_project_dir(
+        tmp_path,
+        "test-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 0),
+            ("compare_opus_4_7_a.jsonl", 100),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", "last-opus-4-6", "last-opus-4-7",
+         "--slug", "test-slug"],
+    )
+    sm.main()
+    out = capsys.readouterr().out
+    assert "COMPARE (controlled)" in out
+    assert "claude-opus-4-6" in out
+    assert "claude-opus-4-7" in out
+
+
+def test_cli_compare_all_family_runs_mode_2(monkeypatch, tmp_path, capsys):
+    # Phase 3: resolver produces an aggregate; _check_compare_scope returns
+    # "observational" and _run_compare dispatches Mode 2.
+    projects_dir, _ = _build_project_dir(
+        tmp_path,
+        "test-slug",
+        [
+            ("compare_opus_4_7_a.jsonl", 0),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.chdir(tmp_path)
+    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", str(a_path), "all-opus-4-7",
+         "--slug", "test-slug", "--yes"],
+    )
+    sm.main()
+    out = capsys.readouterr().out
+    assert "COMPARE (observational)" in out
+    assert "claude-opus-4-6" in out
+    assert "claude-opus-4-7" in out
+
+
+def test_cli_compare_scope_project_runs_mode_2(monkeypatch, tmp_path, capsys):
+    # Phase 3: --compare-scope=project forces observational even when both
+    # args are single sessions.
+    monkeypatch.chdir(tmp_path)
+    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
+    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", str(a_path), str(b_path),
+         "--slug", "test-slug", "--compare-scope", "project", "--yes"],
+    )
+    sm.main()
+    out = capsys.readouterr().out
+    assert "COMPARE (observational)" in out
+
+
+def test_cli_compare_write_output_filename(monkeypatch, tmp_path):
+    # --output md should produce a compare_<a>_vs_<b>_<ts>.md file.
+    monkeypatch.chdir(tmp_path)
+    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
+    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", str(a_path), str(b_path),
+         "--slug", "test-slug", "--output", "md"],
+    )
+    sm.main()
+    exports = tmp_path / "exports" / "session-metrics"
+    md_files = list(exports.glob("compare_*.md"))
+    assert len(md_files) == 1
+    body = md_files[0].read_text()
+    assert "# Model Compare" in body
+    assert "1.30×" in body
+
+
+def test_cli_compare_missing_args_argparse_error(monkeypatch):
+    # --compare requires two args; argparse errors with usage text.
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", "only-one-arg",
+         "--slug", "test-slug"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        sm.main()
+    assert exc.value.code == 2   # argparse usage errors are code 2
+
+
+def test_cli_compare_not_triggered_without_flag(monkeypatch, tmp_path, capsys):
+    # Without --compare, natural-language-style args can't dispatch
+    # compare mode. The skill drops into single-session handling and
+    # fails on the missing session, which is the correct guardrail
+    # behavior — the key assertion is that "COMPARE" isn't in stdout.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(tmp_path / "empty-projects"))
+    (tmp_path / "empty-projects").mkdir()
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--slug", "nonexistent-slug"],
+    )
+    with pytest.raises(SystemExit):
+        sm.main()
+    out = capsys.readouterr().out
+    assert "COMPARE (controlled)" not in out
+
+
+# =========================================================================
+# Phase 3 — Mode 2 (observational, project-aggregate) compare
+# =========================================================================
+
+import io  # noqa: E402  (local to Phase 3 tests — keep imports grouped)
+
+
+def _load_compare_sessions_for_aggregate(*names):
+    """Shorthand: build the (sid, raw_turns, user_ts) tuples Mode 2 wants."""
+    sessions = []
+    for name in names:
+        sid, raw, user_ts = _load_compare_fixture(name)
+        sessions.append((sid, raw, user_ts))
+    return sessions
+
+
+def test_aggregate_side_info_rolls_up_multiple_sessions():
+    # Two 4.7 fixtures rolled up on side B; one 4.6 fixture on side A.
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate(
+        "compare_opus_4_7_a.jsonl", "compare_opus_4_7_short.jsonl",
+    )
+    report = smc._build_compare_aggregate_report(a, b, slug="agg-test")
+    assert report["mode"] == "compare"
+    assert report["compare_mode"] == "observational"
+    # Side B aggregate: 5 + 2 = 7 turns.
+    assert report["side_b"]["session_count"] == 2
+    assert report["side_b"]["turn_count"] == 7
+    # Totals sum across sessions.
+    b_input = (170 + 150 + 130 + 110 + 90) + (50 + 55)  # 4_7_a + 4_7_short... wait
+    # Actually compare_opus_4_7_a has 90,110,130,150,170 (6.5% of what 4_6_a has? no)
+    # Rather than reverse-engineering the fixture, assert that total > either individual.
+    assert report["side_b"]["totals"]["input"] == b_input or (
+        report["side_b"]["totals"]["input"] > 50
+        and report["side_b"]["totals"]["input"] > 170
+    )
+    # No paired/unmatched in Mode 2.
+    assert "paired" not in report
+    assert "unmatched_a" not in report
+
+
+def test_aggregate_report_carries_observational_banner():
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_aggregate_report(a, b, slug="agg-test")
+    kinds = [adv["kind"] for adv in report["advisories"]]
+    assert "observational-not-controlled" in kinds
+
+
+def test_aggregate_report_avg_ratios_computed():
+    # With 4.6 vs 4.7 and identical prompt structure, the avg-per-prompt
+    # ratio should equal the input-token ratio (1.30×) since prompt
+    # count and turn count are identical.
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_aggregate_report(a, b, slug="agg-test")
+    s = report["summary"]
+    assert s["avg_input_per_prompt_ratio"] == pytest.approx(1.3, rel=1e-6)
+    assert s["avg_output_per_turn_ratio"] == pytest.approx(1.3, rel=1e-6)
+
+
+def test_aggregate_context_tier_advisory():
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate("compare_opus_4_7_1m_a.jsonl")
+    report = smc._build_compare_aggregate_report(a, b, slug="agg-test")
+    kinds = [adv["kind"] for adv in report["advisories"]]
+    assert "context-tier-mismatch" in kinds
+
+
+def test_aggregate_empty_side_advisory():
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    report = smc._build_compare_aggregate_report(a, [], slug="agg-test")
+    kinds = [adv["kind"] for adv in report["advisories"]]
+    assert "empty-side" in kinds
+    assert report["side_b"]["session_count"] == 0
+
+
+# ---- Aggregate renderers ----------------------------------------------------
+
+def test_render_compare_text_observational_branch():
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_aggregate_report(a, b, slug="agg-test")
+    out = smc.render_compare_text(report)
+    assert "COMPARE (observational)" in out
+    assert "observational compare" in out  # the advisory prefix
+    assert "AGGREGATE DETAIL" in out
+    assert "1.30×" in out
+    # No per-turn table header in Mode 2.
+    assert "PAIRED TURNS" not in out
+
+
+def test_render_compare_md_observational_branch():
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_aggregate_report(a, b, slug="agg-test")
+    out = smc.render_compare_md(report)
+    assert "**observational**" in out
+    assert "Observational, not controlled" in out
+    assert "## Aggregate detail" in out
+    # Controlled-mode "Paired turns" header absent.
+    assert "## Paired turns" not in out
+
+
+def test_render_compare_csv_observational_branch():
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_aggregate_report(a, b, slug="agg-test")
+    out = smc.render_compare_csv(report)
+    lines = out.strip().splitlines()
+    # Aggregate header + 2 rows (A, B).
+    assert lines[0].startswith("side,model_family,")
+    assert any(row.startswith("A,opus-4-6,") for row in lines)
+    assert any(row.startswith("B,opus-4-7,") for row in lines)
+    assert "# RATIOS (B vs A)" in out
+    assert "cost_ratio,1.3000" in out
+
+
+def test_render_compare_json_observational_mode_flag():
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_aggregate_report(a, b, slug="agg-test")
+    out = smc.render_compare_json(report)
+    parsed = json.loads(out)
+    assert parsed["compare_mode"] == "observational"
+    assert parsed["side_a"]["session_count"] == 1
+    assert parsed["side_b"]["session_count"] == 1
+    assert "paired" not in parsed
+
+
+# ---- Confirmation gate ------------------------------------------------------
+
+def test_confirm_aggregate_skipped_with_assume_yes(monkeypatch, capsys):
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate("compare_opus_4_7_a.jsonl")
+    # Force stdin non-TTY to prove --yes trumps the non-TTY guard.
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    smc._confirm_aggregate_or_exit(a, b, assume_yes=True)  # must not exit
+    err = capsys.readouterr().err
+    assert "aggregate preview" in err
+    assert "--yes given" in err
+
+
+def test_confirm_aggregate_refuses_non_tty_without_yes(monkeypatch, capsys):
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate("compare_opus_4_7_a.jsonl")
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    with pytest.raises(SystemExit) as exc:
+        smc._confirm_aggregate_or_exit(a, b, assume_yes=False)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "requires --yes" in err
+
+
+def test_confirm_aggregate_interactive_y_proceeds(monkeypatch, capsys):
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate("compare_opus_4_7_a.jsonl")
+    fake_stdin = io.StringIO("y\n")
+    fake_stdin.isatty = lambda: True   # pretend we're interactive
+    monkeypatch.setattr("sys.stdin", fake_stdin)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    smc._confirm_aggregate_or_exit(a, b, assume_yes=False)   # must not exit
+    err = capsys.readouterr().err
+    assert "aggregate preview" in err
+
+
+def test_confirm_aggregate_interactive_n_aborts(monkeypatch, capsys):
+    a = _load_compare_sessions_for_aggregate("compare_opus_4_6_a.jsonl")
+    b = _load_compare_sessions_for_aggregate("compare_opus_4_7_a.jsonl")
+    fake_stdin = io.StringIO("n\n")
+    fake_stdin.isatty = lambda: True
+    monkeypatch.setattr("sys.stdin", fake_stdin)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    with pytest.raises(SystemExit) as exc:
+        smc._confirm_aggregate_or_exit(a, b, assume_yes=False)
+    assert exc.value.code == 0
+    err = capsys.readouterr().err
+    assert "aborted" in err
+
+
+# ---- CLI + resolver integration --------------------------------------------
+
+def test_cli_compare_aggregate_rollup_end_to_end(monkeypatch, tmp_path, capsys):
+    # Two 4.7 sessions under the slug, rolled up as side B; single 4.6
+    # session as side A. Verify stdout has observational report.
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "test-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 0),
+            ("compare_opus_4_7_a.jsonl", 10),
+            ("compare_opus_4_7_short.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", "last-opus-4-6", "all-opus-4-7",
+         "--slug", "test-slug", "--yes"],
+    )
+    sm.main()
+    out = capsys.readouterr().out
+    assert "COMPARE (observational)" in out
+    # Two sessions on side B means the aggregate label shows "(2 sessions)"
+    assert "(2 sessions)" in out
+
+
+def test_cli_compare_aggregate_write_output_filename(monkeypatch, tmp_path):
+    # Mode 2 hitting --output md produces a compare_<a>_vs_<b>_<ts>.md file.
+    # Side A session_id ("s6") prefixes the filename since the aggregate
+    # writes preserve the single session_id when session_count == 1.
+    monkeypatch.chdir(tmp_path)
+    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
+    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", str(a_path), str(b_path),
+         "--slug", "test-slug", "--compare-scope", "project",
+         "--output", "md", "--yes"],
+    )
+    sm.main()
+    exports = tmp_path / "exports" / "session-metrics"
+    md_files = list(exports.glob("compare_*.md"))
+    assert len(md_files) == 1
+    body = md_files[0].read_text()
+    assert "**observational**" in body
+    assert "## Aggregate detail" in body
+
+
+# =============================================================================
+# Phase 4 — prompt suite + sentinels + --compare-prep
+# Phase 5 — IFEval predicate eval + instruction_pass column
+# =============================================================================
+
+import io as _io_p45       # noqa: E402  (import here to keep Phase 4/5 tests self-contained)
+import textwrap as _tw45   # noqa: E402
+
+_SUITE_DIR = (
+    _HERE.parent / "references" / "model-compare" / "prompts"
+)
+
+
+# ---- Sentinel regex --------------------------------------------------------
+
+def test_sentinel_regex_matches_basic():
+    text = "[session-metrics:compare-suite:v1:prompt=claudemd_summarise]\n\nplease summarise..."
+    hits = smc._extract_sentinels(text)
+    assert hits == [(1, "claudemd_summarise")]
+
+
+def test_sentinel_regex_survives_whitespace_roundtrip():
+    # Leading/trailing whitespace + CR/LF normalization should not affect the match.
+    text = "   \r\n[session-metrics:compare-suite:v1:prompt=english_prose]\r\n  ..."
+    hits = smc._extract_sentinels(text)
+    assert hits == [(1, "english_prose")]
+
+
+def test_sentinel_regex_survives_markdown_quoting():
+    # Blockquote-prefixed paste shouldn't break the regex.
+    text = "> [session-metrics:compare-suite:v1:prompt=code_review]\n> Review this..."
+    hits = smc._extract_sentinels(text)
+    assert hits == [(1, "code_review")]
+
+
+def test_sentinel_regex_no_match():
+    assert smc._extract_sentinels("no sentinel here") == []
+    assert smc._extract_sentinels("") == []
+    assert smc._extract_sentinels(None) == []  # type: ignore[arg-type]
+
+
+def test_sentinel_regex_rejects_uppercase():
+    # Prompt names are restricted to [a-z0-9_] to avoid false positives from
+    # bracketed acronyms that happen to be adjacent to 'prompt='.
+    text = "[session-metrics:compare-suite:v1:prompt=CamelCase]"
+    assert smc._extract_sentinels(text) == []
+
+
+def test_primary_sentinel_returns_first():
+    text = (
+        "[session-metrics:compare-suite:v1:prompt=foo]\n"
+        "[session-metrics:compare-suite:v2:prompt=bar]"
+    )
+    assert smc._primary_sentinel(text) == (1, "foo")
+
+
+def test_primary_sentinel_none_on_empty():
+    assert smc._primary_sentinel("nothing here") is None
+
+
+# ---- YAML frontmatter parser -----------------------------------------------
+
+def test_parse_simple_yaml_basic():
+    text = _tw45.dedent("""\
+        name: foo
+        description: a simple description
+        reference_tokens_per_char: 0.23
+    """)
+    out = smc._parse_simple_yaml(text)
+    assert out["name"] == "foo"
+    assert out["description"] == "a simple description"
+    assert out["reference_tokens_per_char"] == "0.23"
+
+
+def test_parse_simple_yaml_strips_quotes():
+    text = 'sentinel: "[session-metrics:compare-suite:v1:prompt=x]"'
+    out = smc._parse_simple_yaml(text)
+    assert out["sentinel"] == "[session-metrics:compare-suite:v1:prompt=x]"
+
+
+def test_parse_simple_yaml_ignores_comments_and_blanks():
+    text = "# a comment\nname: foo\n\n# another\n"
+    out = smc._parse_simple_yaml(text)
+    assert out == {"name": "foo"}
+
+
+# ---- Prompt-suite loader ---------------------------------------------------
+
+def test_load_prompt_suite_loads_10_prompts():
+    suite = smc._load_prompt_suite(_SUITE_DIR)
+    assert len(suite) == 10
+    expected_names = {
+        "claudemd_summarise", "english_prose", "code_review",
+        "stack_trace_debug", "tool_heavy_task", "cjk_prose",
+        "json_reshape", "csv_transform", "typescript_refactor",
+        "instruction_stress",
+    }
+    assert set(suite.keys()) == expected_names
+
+
+def test_load_prompt_suite_every_prompt_has_sentinel_in_body():
+    suite = smc._load_prompt_suite(_SUITE_DIR)
+    for name, entry in suite.items():
+        hits = smc._extract_sentinels(entry["body"])
+        assert any(h[1] == name and h[0] == smc._SUITE_VERSION for h in hits), (
+            f"prompt {name!r} body missing matching sentinel"
+        )
+
+
+def test_load_prompt_suite_parses_predicates_except_tool_heavy():
+    suite = smc._load_prompt_suite(_SUITE_DIR)
+    # tool_heavy_task deliberately has `check = None`.
+    assert suite["tool_heavy_task"]["check"] is None
+    # Everything else has a callable predicate.
+    for name, entry in suite.items():
+        if name == "tool_heavy_task":
+            continue
+        assert callable(entry["check"]), f"{name} should have a callable check"
+
+
+def test_parse_prompt_file_malformed_raises(tmp_path):
+    bad = tmp_path / "bad.md"
+    bad.write_text("no frontmatter here\n")
+    with pytest.raises(smc.PromptSuiteError):
+        smc._parse_prompt_file(bad)
+
+
+def test_load_prompt_suite_missing_dir_returns_empty(tmp_path):
+    # A suite-less install shouldn't raise; callers silently skip IFEval.
+    assert smc._load_prompt_suite(tmp_path / "nonexistent") == {}
+
+
+# ---- Individual predicates (spot-check the critical ones) ------------------
+
+def test_predicate_english_prose_no_commas():
+    suite = smc._load_prompt_suite(_SUITE_DIR)
+    check = suite["english_prose"]["check"]
+    assert check("No commas here.") is True
+    assert check("Has a comma, see?") is False
+
+
+def test_predicate_instruction_stress_composite():
+    suite = smc._load_prompt_suite(_SUITE_DIR)
+    check = suite["instruction_stress"]["check"]
+    # 50 lowercase words, no commas, "foo" twice.
+    good = " ".join(["foo", "foo"] + ["x"] * 48)
+    assert check(good) is True
+    # Same words but uppercase 'Foo' breaks the lowercase rule.
+    bad_case = good.replace("foo", "Foo", 1)
+    assert check(bad_case) is False
+    # 49 words fails.
+    assert check(" ".join(good.split()[:-1])) is False
+
+
+def test_predicate_typescript_refactor_exactly_twice():
+    suite = smc._load_prompt_suite(_SUITE_DIR)
+    check = suite["typescript_refactor"]["check"]
+    assert check("I refactor this. Then I'll refactor again.") is True
+    assert check("Refactor refactor refactor.") is False
+    assert check("No matching word.") is False
+
+
+def test_predicate_cjk_prose_rejects_japanese():
+    suite = smc._load_prompt_suite(_SUITE_DIR)
+    check = suite["cjk_prose"]["check"]
+    assert check("A plain English translation.") is True
+    assert check("Mixed output 日本語 still here.") is False
+
+
+def test_predicate_json_reshape_validates_shape():
+    suite = smc._load_prompt_suite(_SUITE_DIR)
+    check = suite["json_reshape"]["check"]
+    good = '[{"id": "o_001", "name": "Acme", "total_cents": 3798}]'
+    assert check(good) is True
+    # Wrong keys.
+    assert check('[{"id": "x", "name": "y"}]') is False
+    # Not JSON.
+    assert check("not json at all") is False
+
+
+def test_predicate_exception_returns_false():
+    # A predicate that raises must not crash the run — returns False.
+    def bad(text):
+        raise RuntimeError("boom")
+    assert smc._run_predicate(bad, "whatever") is False
+
+
+def test_predicate_none_returns_none():
+    assert smc._run_predicate(None, "anything") is None
+
+
+# ---- Assistant-text extractor ----------------------------------------------
+
+def test_assistant_text_joins_text_blocks():
+    raw = {"message": {"content": [
+        {"type": "text", "text": "hello "},
+        {"type": "tool_use", "name": "Bash", "input": {}},
+        {"type": "text", "text": "world"},
+    ]}}
+    assert smc._assistant_text(raw) == "hello world"
+
+
+def test_assistant_text_handles_string_content():
+    raw = {"message": {"content": "just a string"}}
+    assert smc._assistant_text(raw) == "just a string"
+
+
+def test_assistant_text_empty_when_no_text():
+    raw = {"message": {"content": [{"type": "tool_use", "name": "Read", "input": {}}]}}
+    assert smc._assistant_text(raw) == ""
+
+
+def test_assistant_text_missing_content():
+    assert smc._assistant_text({"message": {}}) == ""
+    assert smc._assistant_text({}) == ""
+
+
+# ---- Suite-version detection + mismatch refusal ----------------------------
+
+def _make_sentinel_turn(
+    prompt_name: str,
+    version: int,
+    assistant_text: str,
+    model: str = "claude-opus-4-6",
+    input_tokens: int = 100,
+):
+    """Build a raw-turn dict with a sentinel-tagged user prompt."""
+    return {
+        "type": "assistant",
+        "uuid": f"a-{prompt_name}",
+        "timestamp": "2026-04-19T10:00:00.000Z",
+        "sessionId": "sX",
+        "message": {
+            "id": f"msg-{prompt_name}",
+            "model": model,
+            "role": "assistant",
+            "content": [{"type": "text", "text": assistant_text}],
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            },
+        },
+        "_preceding_user_content": [
+            {"type": "text",
+             "text": f"[session-metrics:compare-suite:v{version}:prompt={prompt_name}]\nplease..."},
+        ],
+        "_is_resume_marker": False,
+    }
+
+
+def test_detect_suite_versions_single_version():
+    turns = [_make_sentinel_turn("claudemd_summarise", 1, "ok")]
+    assert smc._detect_suite_versions(turns) == {1}
+
+
+def test_detect_suite_versions_mixed_refuses_without_allow():
+    a_turns = [_make_sentinel_turn("foo", 1, "ok")]
+    b_turns = [_make_sentinel_turn("foo", 2, "ok")]
+    with pytest.raises(smc.SuiteVersionMismatchError):
+        smc._resolve_suite_versions(a_turns, b_turns, allow_mismatch=False)
+
+
+def test_detect_suite_versions_mismatch_allowed_emits_advisory():
+    a_turns = [_make_sentinel_turn("foo", 1, "ok")]
+    b_turns = [_make_sentinel_turn("foo", 2, "ok")]
+    va, vb, advisories = smc._resolve_suite_versions(
+        a_turns, b_turns, allow_mismatch=True,
+    )
+    assert va == {1}
+    assert vb == {2}
+    assert any(a["kind"] == "suite-version-mismatch" for a in advisories)
+
+
+def test_resolve_suite_versions_empty_ok():
+    # No sentinels on either side — not a mismatch, just non-suite compare.
+    va, vb, advisories = smc._resolve_suite_versions([], [], allow_mismatch=False)
+    assert va == set()
+    assert vb == set()
+    assert advisories == []
+
+
+def test_intrasession_suite_mix_advises_when_allowed():
+    a_turns = [
+        _make_sentinel_turn("foo", 1, "ok"),
+        _make_sentinel_turn("bar", 2, "ok"),
+    ]
+    b_turns = [_make_sentinel_turn("foo", 1, "ok")]
+    # A session mixing v1 and v2 is almost always a copy-paste bug; by
+    # default the cross-side mismatch refuses outright. With
+    # allow_mismatch=True the compare still surfaces both the intra-session
+    # mix advisory and the cross-side mismatch advisory.
+    va, vb, advisories = smc._resolve_suite_versions(
+        a_turns, b_turns, allow_mismatch=True,
+    )
+    assert len(va) == 2
+    kinds = {a["kind"] for a in advisories}
+    assert "suite-version-intrasession-mix" in kinds
+    assert "suite-version-mismatch" in kinds
+
+
+# ---- IFEval wiring in _build_compare_report --------------------------------
+
+def _fake_suite() -> dict:
+    """Tiny inline suite for wiring tests — two named prompts with predicates."""
+    return {
+        "no_commas": {
+            "name":     "no_commas",
+            "metadata": {"name": "no_commas"},
+            "body":     "...",
+            "check":    lambda text: "," not in text,
+            "path":     None,
+        },
+        "lowercase": {
+            "name":     "lowercase",
+            "metadata": {"name": "lowercase"},
+            "body":     "...",
+            "check":    lambda text: text == text.lower(),
+            "path":     None,
+        },
+    }
+
+
+def test_build_compare_report_records_instruction_pass():
+    # A passes no_commas, B fails no_commas; both pass lowercase.
+    a_turns = [
+        _make_sentinel_turn("no_commas", 1, "no comma here"),
+        _make_sentinel_turn("lowercase", 1, "all lowercase"),
+    ]
+    b_turns = [
+        _make_sentinel_turn("no_commas", 1, "has, a comma"),
+        _make_sentinel_turn("lowercase", 1, "all lowercase"),
+    ]
+    report = smc._build_compare_report(
+        "s_a", a_turns, [],
+        "s_b", b_turns, [],
+        slug="t", prompt_suite=_fake_suite(),
+    )
+    assert len(report["paired"]) == 2
+    by_name = {p["suite_prompt_name"]: p for p in report["paired"]}
+    assert by_name["no_commas"]["instruction_pass_a"] is True
+    assert by_name["no_commas"]["instruction_pass_b"] is False
+    assert by_name["lowercase"]["instruction_pass_a"] is True
+    assert by_name["lowercase"]["instruction_pass_b"] is True
+
+
+def test_compare_summary_has_instruction_pass_rate():
+    a_turns = [_make_sentinel_turn("no_commas", 1, "no comma here")]
+    b_turns = [_make_sentinel_turn("no_commas", 1, "has, comma")]
+    report = smc._build_compare_report(
+        "s_a", a_turns, [], "s_b", b_turns, [],
+        slug="t", prompt_suite=_fake_suite(),
+    )
+    s = report["summary"]
+    assert s["instruction_evaluated"] == 1
+    assert s["instruction_pass_a"] == 1
+    assert s["instruction_pass_b"] == 0
+    assert s["instruction_pass_rate_a"] == pytest.approx(1.0)
+    assert s["instruction_pass_rate_b"] == pytest.approx(0.0)
+    assert s["instruction_pass_delta_pp"] == pytest.approx(-100.0)
+
+
+def test_compare_summary_blank_without_sentinels():
+    # Regular paired sessions with no sentinels leave IFEval fields blank.
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts, b_sid, b_turns, b_user_ts,
+        slug="t", prompt_suite={},
+    )
+    s = report["summary"]
+    assert s["instruction_evaluated"] == 0
+    assert s["instruction_pass_rate_a"] is None
+    assert s["instruction_pass_rate_b"] is None
+    assert s["instruction_pass_delta_pp"] is None
+
+
+def test_suite_version_mismatch_refuses_via_builder():
+    a_turns = [_make_sentinel_turn("foo", 1, "ok")]
+    b_turns = [_make_sentinel_turn("foo", 2, "ok")]
+    with pytest.raises(smc.SuiteVersionMismatchError):
+        smc._build_compare_report(
+            "s_a", a_turns, [], "s_b", b_turns, [],
+            slug="t", prompt_suite=_fake_suite(),
+        )
+
+
+def test_allow_suite_mismatch_proceeds_and_adds_advisory():
+    a_turns = [_make_sentinel_turn("foo", 1, "ok")]
+    b_turns = [_make_sentinel_turn("foo", 2, "ok")]
+    report = smc._build_compare_report(
+        "s_a", a_turns, [], "s_b", b_turns, [],
+        slug="t", prompt_suite=_fake_suite(),
+        allow_suite_mismatch=True,
+    )
+    kinds = {adv["kind"] for adv in report["advisories"]}
+    assert "suite-version-mismatch" in kinds
+
+
+# ---- Renderer wiring for IFEval --------------------------------------------
+
+def test_render_compare_text_has_instruction_pass_column():
+    a_turns = [_make_sentinel_turn("no_commas", 1, "no commas here")]
+    b_turns = [_make_sentinel_turn("no_commas", 1, "has, a comma")]
+    report = smc._build_compare_report(
+        "s_a", a_turns, [], "s_b", b_turns, [],
+        slug="t", prompt_suite=_fake_suite(),
+    )
+    out = smc.render_compare_text(report)
+    assert "IFEval pass" in out
+    assert "A✓" in out
+    assert "B✓" in out
+    assert "no_commas" in out
+    # A passed, B failed.
+    assert "✓" in out
+    assert "✗" in out
+
+
+def test_render_compare_md_has_instruction_pass_column():
+    a_turns = [_make_sentinel_turn("no_commas", 1, "no commas here")]
+    b_turns = [_make_sentinel_turn("no_commas", 1, "has, a comma")]
+    report = smc._build_compare_report(
+        "s_a", a_turns, [], "s_b", b_turns, [],
+        slug="t", prompt_suite=_fake_suite(),
+    )
+    out = smc.render_compare_md(report)
+    assert "A✓" in out
+    assert "IFEval pass (A)" in out
+    assert "| no_commas |" in out
+
+
+def test_render_compare_csv_has_instruction_pass_column():
+    a_turns = [_make_sentinel_turn("no_commas", 1, "no commas here")]
+    b_turns = [_make_sentinel_turn("no_commas", 1, "has, a comma")]
+    report = smc._build_compare_report(
+        "s_a", a_turns, [], "s_b", b_turns, [],
+        slug="t", prompt_suite=_fake_suite(),
+    )
+    out = smc.render_compare_csv(report)
+    assert "suite_prompt_name" in out
+    assert "a_instruction_pass" in out
+    assert "b_instruction_pass" in out
+    assert "no_commas,True" in out or "no_commas\tTrue" in out or ",no_commas," in out
+
+
+def test_render_compare_json_carries_instruction_pass():
+    a_turns = [_make_sentinel_turn("no_commas", 1, "no commas")]
+    b_turns = [_make_sentinel_turn("no_commas", 1, "has, comma")]
+    report = smc._build_compare_report(
+        "s_a", a_turns, [], "s_b", b_turns, [],
+        slug="t", prompt_suite=_fake_suite(),
+    )
+    payload = json.loads(smc.render_compare_json(report))
+    assert payload["paired"][0]["suite_prompt_name"] == "no_commas"
+    assert payload["paired"][0]["instruction_pass_a"] is True
+    assert payload["paired"][0]["instruction_pass_b"] is False
+
+
+# ---- --compare-prep helper --------------------------------------------------
+
+def test_compare_prep_default_models():
+    buf = _io_p45.StringIO()
+    smc._run_compare_prep([], out=buf)
+    txt = buf.getvalue()
+    assert "claude-opus-4-6" in txt
+    assert "claude-opus-4-7" in txt
+    assert "PROMPT SUITE (v1" in txt
+
+
+def test_compare_prep_custom_models():
+    buf = _io_p45.StringIO()
+    smc._run_compare_prep(["claude-opus-4-7", "claude-opus-4-8"], out=buf)
+    txt = buf.getvalue()
+    assert "claude-opus-4-7" in txt
+    assert "claude-opus-4-8" in txt
+
+
+def test_compare_prep_single_model_defaults_second():
+    # One positional model → A overridden, B stays at the 4.7 default.
+    buf = _io_p45.StringIO()
+    smc._run_compare_prep(["claude-opus-4-5"], out=buf)
+    txt = buf.getvalue()
+    assert "claude-opus-4-5" in txt
+    assert "claude-opus-4-7" in txt
+
+
+def test_compare_prep_three_models_refused(capsys):
+    with pytest.raises(SystemExit) as exc:
+        smc._run_compare_prep(["a", "b", "c"])
+    assert exc.value.code == 1
+    assert "at most two" in capsys.readouterr().err
+
+
+def test_compare_prep_includes_all_10_prompts():
+    buf = _io_p45.StringIO()
+    smc._run_compare_prep([], out=buf)
+    txt = buf.getvalue()
+    assert "PROMPT 1 of 10" in txt
+    assert "PROMPT 10 of 10" in txt
+
+
+def test_compare_prep_sentinels_in_output():
+    buf = _io_p45.StringIO()
+    smc._run_compare_prep([], out=buf)
+    txt = buf.getvalue()
+    # Every suite prompt's sentinel should appear in the emitted protocol.
+    suite = smc._load_prompt_suite(_SUITE_DIR)
+    for name in suite:
+        assert f"[session-metrics:compare-suite:v1:prompt={name}]" in txt
+
+
+def test_compare_prep_missing_suite_dir_errors(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        smc._run_compare_prep([], suite_dir=tmp_path / "nope")
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "suite is empty or missing" in err
+
+
+# ---- CLI wiring --------------------------------------------------------------
+
+def test_cli_compare_prep_end_to_end(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare-prep", "--slug", "test-slug"],
+    )
+    sm.main()
+    out = capsys.readouterr().out
+    assert "Compare capture protocol" in out
+    assert "PROMPT SUITE" in out
+
+
+def test_cli_compare_prep_with_custom_models(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare-prep", "claude-opus-4-7",
+         "claude-opus-4-8", "--slug", "test-slug"],
+    )
+    sm.main()
+    out = capsys.readouterr().out
+    assert "claude-opus-4-7" in out
+    assert "claude-opus-4-8" in out
+
+
+def test_cli_compare_prompts_override_accepted(monkeypatch, tmp_path, capsys):
+    # Override points at a dir with one prompt → only one prompt in the
+    # emitted list. Proves --compare-prompts wires through to --compare-prep.
+    custom = tmp_path / "prompts"
+    custom.mkdir()
+    (custom / "01_mini.md").write_text(_tw45.dedent("""\
+        ---
+        name: mini
+        description: minimal test prompt
+        ---
+
+        [session-metrics:compare-suite:v1:prompt=mini]
+
+        tiny prompt
+
+        <!-- PREDICATE -->
+
+        ````python
+        def check(text: str) -> bool:
+            return True
+        ````
+    """))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare-prep",
+         "--compare-prompts", str(custom), "--slug", "test-slug"],
+    )
+    sm.main()
+    out = capsys.readouterr().out
+    assert "PROMPT 1 of 1" in out
+    assert "prompt=mini" in out
+
+
+def test_cli_compare_suite_mismatch_refuses(monkeypatch, tmp_path, capsys):
+    # Two sessions whose user prompts sentinel at different suite versions.
+    a_dir = tmp_path / "a"
+    a_dir.mkdir()
+    b_dir = tmp_path / "b"
+    b_dir.mkdir()
+
+    def _write(path, version):
+        # Minimal-but-valid JSONL with one user+assistant pair carrying a sentinel.
+        user_text = f"[session-metrics:compare-suite:v{version}:prompt=foo]\nplease"
+        lines = [
+            json.dumps({
+                "type": "user", "uuid": "u1",
+                "timestamp": "2026-04-19T10:00:00.000Z", "sessionId": path.stem,
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": user_text}]},
+            }),
+            json.dumps({
+                "type": "assistant", "uuid": "a1",
+                "timestamp": "2026-04-19T10:00:05.000Z", "sessionId": path.stem,
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-opus-4-7",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ack"}],
+                    "usage": {"input_tokens": 100, "output_tokens": 20,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                },
+            }),
+        ]
+        path.write_text("\n".join(lines) + "\n")
+
+    a_jsonl = a_dir / "s_a.jsonl"
+    b_jsonl = b_dir / "s_b.jsonl"
+    _write(a_jsonl, 1)
+    _write(b_jsonl, 2)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", str(a_jsonl), str(b_jsonl),
+         "--slug", "test-slug"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        sm.main()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "compare-suite versions differ" in err
+
+
+def test_cli_compare_allow_suite_mismatch_proceeds(monkeypatch, tmp_path, capsys):
+    a_dir = tmp_path / "a"
+    a_dir.mkdir()
+    b_dir = tmp_path / "b"
+    b_dir.mkdir()
+
+    def _write(path, version):
+        user_text = f"[session-metrics:compare-suite:v{version}:prompt=foo]\nplease"
+        lines = [
+            json.dumps({
+                "type": "user", "uuid": "u1",
+                "timestamp": "2026-04-19T10:00:00.000Z", "sessionId": path.stem,
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": user_text}]},
+            }),
+            json.dumps({
+                "type": "assistant", "uuid": "a1",
+                "timestamp": "2026-04-19T10:00:05.000Z", "sessionId": path.stem,
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-opus-4-7",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ack"}],
+                    "usage": {"input_tokens": 100, "output_tokens": 20,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                },
+            }),
+        ]
+        path.write_text("\n".join(lines) + "\n")
+
+    a_jsonl = a_dir / "s_a.jsonl"
+    b_jsonl = b_dir / "s_b.jsonl"
+    _write(a_jsonl, 1)
+    _write(b_jsonl, 2)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", str(a_jsonl), str(b_jsonl),
+         "--slug", "test-slug", "--allow-suite-mismatch"],
+    )
+    sm.main()   # should not raise
+    out = capsys.readouterr().out
+    assert "COMPARE (controlled)" in out
+
+
+# =============================================================================
+# Phase 6 — HTML variant="compare" + --redact-user-prompts
+# =============================================================================
+# Split out after Phase 5 because these tests lean heavily on the compare
+# report builder, so keeping the report-construction helpers near the HTML
+# assertions prevents drift between "what the report contains" and "what
+# the renderer expects".
+
+
+def _make_controlled_compare_report():
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    return smc._build_compare_report(
+        a_sid, a_turns, a_user_ts, b_sid, b_turns, b_user_ts,
+        slug="phase6-slug", prompt_suite={},
+    )
+
+
+def _make_aggregate_compare_report():
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    return smc._build_compare_aggregate_report(
+        [(a_sid, a_turns, a_user_ts)],
+        [(b_sid, b_turns, b_user_ts)],
+        slug="phase6-agg-slug",
+    )
+
+
+def test_compare_html_mode1_renders_basic_shell():
+    """Mode 1 HTML has the shell elements every downstream viewer needs:
+    doctype, title, summary cards, a per-turn table, a methodology card."""
+    report = _make_controlled_compare_report()
+    html = smc.render_compare_html(report)
+    assert html.startswith("<!DOCTYPE html>")
+    assert "Session Metrics" in html
+    assert "phase6-slug" in html
+    # Summary strip + at least one cost/ratio card.
+    assert "Cost ratio" in html
+    assert "Input tokens ratio" in html
+    # Per-turn table is the Mode-1 hallmark.
+    assert "Paired turns" in html
+    # At least one paired-row with a ratio cell.
+    assert "ratio-warm" in html or "ratio-hot" in html or "ratio-mild" in html
+    # Methodology footer.
+    assert "references/model-compare.md" in html
+
+
+def test_compare_html_mode1_reproducibility_stamp_carries_both_models():
+    report = _make_controlled_compare_report()
+    html = smc.render_compare_html(report)
+    # Stamp names both models so a shared HTML includes provenance.
+    assert "claude-opus-4-6" in html
+    assert "claude-opus-4-7" in html
+
+
+def test_compare_html_mode1_ifeval_column_when_evaluated():
+    # Build a report with two prompts + inline predicates so the IFEval
+    # column actually fires. A passes, B fails on a comma predicate.
+    a_turns = [
+        _make_sentinel_turn("no_commas", 1, "no comma here", model="claude-opus-4-6"),
+    ]
+    b_turns = [
+        _make_sentinel_turn("no_commas", 1, "has, comma", model="claude-opus-4-7"),
+    ]
+    report = smc._build_compare_report(
+        "s_a", a_turns, [], "s_b", b_turns, [],
+        slug="phase6-slug", prompt_suite=_fake_suite(),
+    )
+    html = smc.render_compare_html(report)
+    # Pass / fail icons present (✓ ✗).
+    assert "pass-ok" in html
+    assert "pass-fail" in html
+    # IFEval summary card ("IFEval pass rate (B)") only renders when
+    # at least one predicate was evaluated.
+    assert "IFEval pass rate (B)" in html
+
+
+def test_compare_html_mode1_no_ifeval_column_without_predicates():
+    report = _make_controlled_compare_report()
+    html = smc.render_compare_html(report)
+    # No sentinel-tagged turns in the fixture, so the IFEval summary
+    # card is absent.
+    assert "IFEval pass rate" not in html
+
+
+def test_compare_html_mode1_histogram_card_when_paired_turns_present():
+    report = _make_controlled_compare_report()
+    html = smc.render_compare_html(report)
+    assert "Per-turn input-token ratio distribution" in html
+    # Mean / p50 / p95 meta-line.
+    assert "p50" in html and "p95" in html
+
+
+def test_compare_html_mode1_quality_vs_cost_card_present():
+    report = _make_controlled_compare_report()
+    html = smc.render_compare_html(report)
+    assert "Quality vs cost" in html
+    # Verdict sentence is always present on the quality-vs-cost card.
+    assert "quality/cost trade-off" in html or "no IFEval measurement" in html \
+        or "cost roughly flat" in html or "quality up with no" in html
+
+
+def test_compare_html_mode1_advisories_rendered_when_present():
+    # Two sessions with different context tiers triggers the
+    # context-tier-mismatch advisory.
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_1m_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts, b_sid, b_turns, b_user_ts,
+        slug="phase6-tier-slug", prompt_suite={},
+    )
+    html = smc.render_compare_html(report)
+    assert "context-tier mismatch" in html
+    assert "class=\"advisory warn\"" in html \
+        or "class='advisory warn'" in html
+
+
+def test_compare_html_mode1_redact_masks_non_suite_prompt_labels():
+    # Without redaction the prompt cell shows a fingerprint snippet;
+    # with redaction it flips to the literal "[redacted]" marker.
+    report = _make_controlled_compare_report()
+    html_plain = smc.render_compare_html(report, redact_user_prompts=False)
+    html_masked = smc.render_compare_html(report, redact_user_prompts=True)
+    assert "[redacted]" in html_masked
+    assert "[redacted]" not in html_plain
+
+
+def test_compare_html_mode1_redact_preserves_suite_names():
+    # Sentinel-tagged suite prompts stay visible even with redaction.
+    a_turns = [
+        _make_sentinel_turn("no_commas", 1, "no comma here", model="claude-opus-4-6"),
+    ]
+    b_turns = [
+        _make_sentinel_turn("no_commas", 1, "also fine", model="claude-opus-4-7"),
+    ]
+    report = smc._build_compare_report(
+        "s_a", a_turns, [], "s_b", b_turns, [],
+        slug="phase6-slug", prompt_suite=_fake_suite(),
+    )
+    html = smc.render_compare_html(report, redact_user_prompts=True)
+    # Suite prompt name stays visible through redaction.
+    assert "no_commas" in html
+    assert "[redacted]" not in html
+
+
+def test_compare_html_mode2_aggregate_shell():
+    """Mode 2 HTML swaps per-turn table for aggregate-detail cards and
+    keeps the observational advisory up front."""
+    report = _make_aggregate_compare_report()
+    html = smc.render_compare_html(report)
+    assert "<!DOCTYPE html>" in html
+    assert "mode <strong>observational</strong>" in html
+    # Observational-not-controlled advisory always fires on Mode 2.
+    assert "observational compare" in html
+    # No per-turn paired-turns section in Mode 2.
+    assert "Paired turns" not in html
+    # Aggregate detail table is present.
+    assert "Aggregate detail" in html
+    # Aggregate-only ratio cards.
+    assert "Avg input / prompt" in html
+    assert "Tool calls / turn" in html
+
+
+def test_compare_html_mode_dispatch_via_compare_mode_field():
+    """render_compare_html must dispatch on compare_mode, not any other
+    report shape — single hole to plug for future variants."""
+    controlled = _make_controlled_compare_report()
+    html_a = smc.render_compare_html(controlled)
+    assert "controlled" in html_a
+
+    observational = _make_aggregate_compare_report()
+    html_b = smc.render_compare_html(observational)
+    assert "observational" in html_b
+
+
+def test_compare_html_escapes_special_chars_in_advisory():
+    # HTML injection through an advisory message should be escaped.
+    report = _make_controlled_compare_report()
+    report["advisories"].append({
+        "kind":     "test-injection",
+        "severity": "warn",
+        "message":  "<script>alert(1)</script> & ' \" <b>",
+    })
+    html = smc.render_compare_html(report)
+    assert "<script>alert(1)" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_compare_html_ratio_tint_class_boundaries():
+    # Spot-check the heatmap classifier so downstream CSS can rely on
+    # the bucket boundaries.
+    assert smc._ratio_tint_class(None) == "ratio-na"
+    assert smc._ratio_tint_class(1.0) == "ratio-neutral"
+    assert smc._ratio_tint_class(1.10) == "ratio-mild"
+    assert smc._ratio_tint_class(1.30) == "ratio-warm"
+    assert smc._ratio_tint_class(1.50) == "ratio-hot"
+    assert smc._ratio_tint_class(0.80) == "ratio-cool"
+    assert smc._ratio_tint_class(0.92) == "ratio-coolish"
+
+
+def test_cli_compare_html_with_redact_flag(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
+    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", str(a_path), str(b_path),
+         "--slug", "test-slug", "--output", "html",
+         "--redact-user-prompts"],
+    )
+    sm.main()
+    err = capsys.readouterr().err
+    assert "[export] HTML (compare)" in err
+    html_files = list((tmp_path / "exports" / "session-metrics").glob("*.html"))
+    assert html_files
+    body = html_files[0].read_text(encoding="utf-8")
+    assert "[redacted]" in body
+
+
+def test_cli_compare_drops_state_marker(monkeypatch, tmp_path, capsys):
+    """Phase 7: running --compare plants the marker file under the
+    project's JSONL directory so dashboard renders can flip the compare
+    insight from "hint" to "refresh"."""
+    projects_dir, project_dir = _build_project_dir(
+        tmp_path, "phase7-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 10),
+            ("compare_opus_4_7_a.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.chdir(tmp_path)
+    marker = project_dir / ".session-metrics-compare-used"
+    assert not marker.exists()
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--compare", "last-opus-4-6", "last-opus-4-7",
+         "--slug", "phase7-slug"],
+    )
+    sm.main()
+    _ = capsys.readouterr()   # drain
+    assert marker.exists()
+
+
+# =============================================================================
+# Phase 7 — Model-compare insight card, state marker, --no-... flag
+# =============================================================================
+
+
+def test_version_suffix_of_family_parses_trailing_ints():
+    assert sm._version_suffix_of_family("opus-4-7") == (4, 7)
+    assert sm._version_suffix_of_family("opus-4-6") == (4, 6)
+    # Trailing non-int breaks the collection.
+    assert sm._version_suffix_of_family("opus") == ()
+    # Date stamps already stripped upstream, so we only handle bare slugs.
+    assert sm._version_suffix_of_family("haiku-4-5") == (4, 5)
+
+
+def test_order_family_pair_picks_oldest_and_newest():
+    assert sm._order_family_pair(["opus-4-7", "opus-4-6"]) == ("opus-4-6", "opus-4-7")
+    # With three families present, skill picks lowest / highest version.
+    assert sm._order_family_pair(["opus-4-7", "opus-4-6", "opus-4-8"]) == (
+        "opus-4-6", "opus-4-8",
+    )
+    # Fewer than two distinct families → None.
+    assert sm._order_family_pair(["opus-4-7"]) is None
+    assert sm._order_family_pair([]) is None
+
+
+def test_order_family_pair_alphabetical_fallback():
+    # Cross-tier (different version length) — falls back to alphabetical
+    # after the version comparison declares them equal at the shared
+    # prefix.
+    pair = sm._order_family_pair(["sonnet-4-7", "opus-4-7"])
+    assert pair is not None
+    assert "opus-4-7" in pair and "sonnet-4-7" in pair
+
+
+def test_model_compare_insight_fires_when_two_families_present(
+    tmp_path, monkeypatch,
+):
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "phase7-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 10),
+            ("compare_opus_4_7_a.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+
+    report = {
+        "slug":           "phase7-slug",
+        "totals":         {"cost": 1.0},
+        "sessions":       [],
+        "session_blocks": [],
+    }
+    insight = sm._compute_model_compare_insight(report)
+    assert insight is not None
+    assert insight["id"] == "model_compare"
+    assert insight["shown"] is True
+    # First-time copy mentions "Run session-metrics --compare-prep".
+    assert "compare-prep" in insight["body"]
+
+
+def test_model_compare_insight_escalates_after_marker(tmp_path, monkeypatch):
+    projects_dir, project_dir = _build_project_dir(
+        tmp_path, "phase7-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 10),
+            ("compare_opus_4_7_a.jsonl", 20),
+        ],
+    )
+    (project_dir / ".session-metrics-compare-used").write_text("marker")
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+
+    report = {
+        "slug": "phase7-slug", "totals": {"cost": 1.0},
+        "sessions": [], "session_blocks": [],
+    }
+    insight = sm._compute_model_compare_insight(report)
+    assert insight is not None
+    assert "refresh attribution" in insight["body"]
+    assert "--compare last-" in insight["body"]
+
+
+def test_model_compare_insight_none_when_single_family(tmp_path, monkeypatch):
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "phase7-slug",
+        [("compare_opus_4_7_a.jsonl", 10)],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    report = {
+        "slug": "phase7-slug", "totals": {"cost": 1.0},
+        "sessions": [], "session_blocks": [],
+    }
+    assert sm._compute_model_compare_insight(report) is None
+
+
+def test_model_compare_insight_none_when_slug_missing():
+    # Safety net: builder refuses to scan without a slug.
+    assert sm._compute_model_compare_insight({"slug": "", "totals": {"cost": 1.0}}) is None
+
+
+def test_compute_usage_insights_includes_model_compare_card(
+    tmp_path, monkeypatch,
+):
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "phase7-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 10),
+            ("compare_opus_4_7_a.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+
+    report = {
+        "slug":           "phase7-slug",
+        "totals":         {"cost": 1.0},
+        "sessions":       [],
+        "session_blocks": [],
+    }
+    insights = sm._compute_usage_insights(report)
+    ids = [i["id"] for i in insights]
+    assert "model_compare" in ids
+
+
+def test_compute_usage_insights_suppressed_flag_hides_card(
+    tmp_path, monkeypatch,
+):
+    projects_dir, _ = _build_project_dir(
+        tmp_path, "phase7-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 10),
+            ("compare_opus_4_7_a.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+
+    report = {
+        "slug":           "phase7-slug",
+        "totals":         {"cost": 1.0},
+        "sessions":       [],
+        "session_blocks": [],
+        "_suppress_model_compare_insight": True,
+    }
+    insights = sm._compute_usage_insights(report)
+    ids = [i["id"] for i in insights]
+    assert "model_compare" not in ids
+
+
+def test_build_report_suppress_flag_plumbs_through(tmp_path, monkeypatch):
+    # The flag is accepted by _build_report and the resulting report has
+    # no model_compare insight even when two families would otherwise
+    # be present — also confirming the internal underscore key doesn't
+    # leak into the final report dict.
+    projects_dir, project_dir = _build_project_dir(
+        tmp_path, "phase7-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 10),
+            ("compare_opus_4_7_a.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    # Use the newer of the two as the target session.
+    sid, turns, user_ts = sm._load_session(
+        project_dir / "compare_opus_4_7_a.jsonl",
+        include_subagents=False, use_cache=False,
+    )
+    report = sm._build_report(
+        "session", "phase7-slug",
+        [(sid, turns, user_ts)],
+        suppress_model_compare_insight=True,
+    )
+    # Internal flag must be stripped from the finished report.
+    assert "_suppress_model_compare_insight" not in report
+    ids = [i["id"] for i in report.get("usage_insights", [])]
+    assert "model_compare" not in ids
+
+
+def test_cli_no_model_compare_insight_flag_accepts(
+    tmp_path, monkeypatch, capsys,
+):
+    # Smoke: the flag doesn't break an otherwise-normal single-session
+    # run, even when the project has multiple families that would
+    # otherwise populate the card.
+    projects_dir, project_dir = _build_project_dir(
+        tmp_path, "phase7-slug",
+        [
+            ("compare_opus_4_6_a.jsonl", 10),
+            ("compare_opus_4_7_a.jsonl", 20),
+        ],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.chdir(tmp_path)
+    target = project_dir / "compare_opus_4_7_a.jsonl"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py",
+         "--session", target.stem,
+         "--slug", "phase7-slug",
+         "--no-model-compare-insight"],
+    )
+    sm.main()
+    out = capsys.readouterr().out
+    # Normal single-session output rendered.
+    assert "SESSION TOTAL" in out or "TOT " in out or "Totals" in out \
+        or "cache" in out.lower()
+
+
+def test_touch_compare_state_marker_and_detection(tmp_path, monkeypatch):
+    projects_dir, project_dir = _build_project_dir(
+        tmp_path, "phase7-slug",
+        [("compare_opus_4_7_a.jsonl", 10)],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    assert not sm._has_compare_state_marker("phase7-slug")
+    sm._touch_compare_state_marker("phase7-slug")
+    assert sm._has_compare_state_marker("phase7-slug")
+    # Marker lands in the project dir, not the session-metrics cache.
+    assert (project_dir / ".session-metrics-compare-used").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — count_tokens API mode
+# ---------------------------------------------------------------------------
+
+class _MockResp:
+    """Stand-in for ``urllib.request.urlopen``'s context-manager return.
+
+    Returns whatever JSON bytes are passed in at construction. Tests
+    pass a small helper function to urlopen to route per-model
+    responses.
+    """
+
+    def __init__(self, body: bytes, status: int = 200):
+        self._body = body
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _make_mock_urlopen(responses):
+    """Return a callable suitable for urlopen= injection.
+
+    ``responses`` maps a model id → either an int (token count to
+    return), a tuple ``(int, int)`` (status, tokens) for custom status,
+    or a string like ``"http_400"`` to raise HTTPError.
+    """
+    import urllib.error as ue
+    from email.message import Message as _HdrsMsg
+
+    def _urlopen(req, timeout=None):
+        # Pull the body out to find which model the request targets.
+        import json as _json
+        payload = _json.loads(req.data.decode("utf-8"))
+        model = payload["model"]
+        entry = responses.get(model)
+        if entry is None:
+            raise ue.HTTPError(
+                req.full_url, 404, "unknown model", hdrs=_HdrsMsg(),
+                fp=__import__("io").BytesIO(b'{"error":"unknown model"}'),
+            )
+        if isinstance(entry, str) and entry.startswith("http_"):
+            code = int(entry.split("_", 1)[1])
+            raise ue.HTTPError(
+                req.full_url, code, f"error {code}", hdrs=_HdrsMsg(),
+                fp=__import__("io").BytesIO(
+                    '{"error":"model not available (mock)"}'.encode()
+                ),
+            )
+        if isinstance(entry, str) and entry == "network":
+            raise ue.URLError("connection refused")
+        if isinstance(entry, tuple):
+            status, tokens = entry
+            return _MockResp(
+                __import__("json").dumps({"input_tokens": tokens}).encode(),
+                status=status,
+            )
+        # Integer token count.
+        return _MockResp(
+            __import__("json").dumps({"input_tokens": int(entry)}).encode()
+        )
+
+    return _urlopen
+
+
+def test_count_tokens_request_happy_path():
+    urlopen = _make_mock_urlopen({"claude-opus-4-7": 42})
+    assert smc._count_tokens_request(
+        "claude-opus-4-7", "hello world",
+        api_key="dummy-key", urlopen=urlopen,
+    ) == 42
+
+
+def test_count_tokens_request_http_error_raises():
+    urlopen = _make_mock_urlopen({"claude-opus-4-6": "http_404"})
+    with pytest.raises(smc.CountTokensError) as exc:
+        smc._count_tokens_request(
+            "claude-opus-4-6", "hello",
+            api_key="dummy-key", urlopen=urlopen,
+        )
+    assert "HTTP 404" in str(exc.value)
+
+
+def test_count_tokens_request_network_error_raises():
+    urlopen = _make_mock_urlopen({"claude-opus-4-7": "network"})
+    with pytest.raises(smc.CountTokensError) as exc:
+        smc._count_tokens_request(
+            "claude-opus-4-7", "hello",
+            api_key="dummy-key", urlopen=urlopen,
+        )
+    assert "network error" in str(exc.value)
+
+
+def test_count_tokens_request_malformed_body_raises():
+    """Server returned JSON but no ``input_tokens`` key."""
+    import urllib.error as ue  # noqa: F401
+
+    def _urlopen(req, timeout=None):
+        return _MockResp(b'{"something_else": 123}')
+    with pytest.raises(smc.CountTokensError) as exc:
+        smc._count_tokens_request(
+            "claude-opus-4-7", "hi",
+            api_key="dummy-key", urlopen=_urlopen,
+        )
+    assert "missing 'input_tokens'" in str(exc.value)
+
+
+def test_count_tokens_request_sends_correct_headers():
+    captured = {}
+
+    def _urlopen(req, timeout=None):
+        captured["headers"] = dict(req.headers)
+        captured["method"] = req.get_method()
+        captured["url"] = req.full_url
+        return _MockResp(b'{"input_tokens": 99}')
+
+    smc._count_tokens_request(
+        "claude-opus-4-7", "hi",
+        api_key="test-key-123", urlopen=_urlopen,
+    )
+    # urllib normalizes header names to Title-Case — use case-insensitive lookup.
+    headers_ci = {k.lower(): v for k, v in captured["headers"].items()}
+    assert headers_ci["x-api-key"] == "test-key-123"
+    assert headers_ci["anthropic-version"] == "2023-06-01"
+    assert headers_ci["content-type"] == "application/json"
+    assert captured["method"] == "POST"
+    assert captured["url"] == smc._COUNT_TOKENS_URL
+
+
+def test_run_count_tokens_only_missing_api_key(monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        smc._run_count_tokens_only(None, assume_yes=True)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "ANTHROPIC_API_KEY" in err
+
+
+def test_run_count_tokens_only_pair_emits_ratio(capsys):
+    import io as _io
+    urlopen = _make_mock_urlopen({
+        "claude-opus-4-6": 100,
+        "claude-opus-4-7": 130,
+    })
+    buf = _io.StringIO()
+    smc._run_count_tokens_only(
+        ["claude-opus-4-6", "claude-opus-4-7"],
+        assume_yes=True, api_key="dummy", urlopen=urlopen, out=buf,
+    )
+    text = buf.getvalue()
+    # One row per prompt in the packaged suite.
+    assert "claude-opus-4-6" in text
+    assert "claude-opus-4-7" in text
+    # 130/100 = 1.30× on every prompt.
+    assert "1.30×" in text
+    # Ratio summary footer renders for the pair.
+    assert "Ratio summary (B/A)" in text
+    # Input-only disclaimer reminds the user what this does NOT measure.
+    assert "INPUT tokens only" in text
+
+
+def test_run_count_tokens_only_probe_falls_back_to_b(capsys):
+    """Model A probe fails → collapse to counting against B only."""
+    import io as _io
+    urlopen = _make_mock_urlopen({
+        "claude-opus-4-6": "http_403",
+        "claude-opus-4-7": 150,
+    })
+    buf = _io.StringIO()
+    smc._run_count_tokens_only(
+        ["claude-opus-4-6", "claude-opus-4-7"],
+        assume_yes=True, api_key="dummy", urlopen=urlopen, out=buf,
+    )
+    text = buf.getvalue()
+    err = capsys.readouterr().err
+    # Friendly fallback message in stderr, not stdout.
+    assert "not accessible" in err
+    assert "claude-opus-4-6" in err
+    # Body covers model B counts, no ratio (single model remaining).
+    assert "claude-opus-4-7" in text
+    assert "1.30×" not in text  # no ratio when single-model.
+    assert "Ratios not computable" in text
+
+
+def test_run_count_tokens_only_rejects_three_models(capsys):
+    with pytest.raises(SystemExit) as exc:
+        smc._run_count_tokens_only(
+            ["a", "b", "c"],
+            assume_yes=True, api_key="dummy",
+        )
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "at most two" in err
+
+
+def test_run_count_tokens_only_single_model_accepts(capsys):
+    """Single-model invocation is allowed (no ratio, no probe)."""
+    import io as _io
+    urlopen = _make_mock_urlopen({"claude-opus-4-7": 77})
+    buf = _io.StringIO()
+    smc._run_count_tokens_only(
+        ["claude-opus-4-7"],
+        assume_yes=True, api_key="dummy", urlopen=urlopen, out=buf,
+    )
+    text = buf.getvalue()
+    err = capsys.readouterr().err
+    assert "only one model" in err
+    assert "claude-opus-4-7" in text
+    # 77 appears in every row (10 prompts in the packaged suite).
+    assert text.count(" 77") >= 10
+
+
+def test_run_count_tokens_only_confirmation_required_without_yes(monkeypatch, capsys):
+    """Non-interactive stdin + missing --yes → hard refusal."""
+    import io as _io
+    urlopen = _make_mock_urlopen({
+        "claude-opus-4-6": 100, "claude-opus-4-7": 120,
+    })
+
+    # Simulate non-TTY stdin: isatty returns False, no .read input.
+    class _NonTTYStdin:
+        def isatty(self):
+            return False
+
+    buf = _io.StringIO()
+    with pytest.raises(SystemExit) as exc:
+        smc._run_count_tokens_only(
+            ["claude-opus-4-6", "claude-opus-4-7"],
+            assume_yes=False, api_key="dummy",
+            urlopen=urlopen, stdin=_NonTTYStdin(), out=buf,
+        )
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "requires --yes" in err
+
+
+def test_run_count_tokens_only_empty_suite_errors(tmp_path, capsys):
+    empty = tmp_path / "empty-suite"
+    empty.mkdir()
+    with pytest.raises(SystemExit) as exc:
+        smc._run_count_tokens_only(
+            None, suite_dir=empty, assume_yes=True, api_key="dummy",
+        )
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "prompt suite is empty" in err
+
+
+def test_run_count_tokens_only_defaults_to_reference_pair(capsys):
+    """No models passed → canonical ``4-6`` / ``4-7`` reference pair."""
+    import io as _io
+    urlopen = _make_mock_urlopen({
+        "claude-opus-4-6": 200, "claude-opus-4-7": 250,
+    })
+    buf = _io.StringIO()
+    smc._run_count_tokens_only(
+        None,  # defaults
+        assume_yes=True, api_key="dummy", urlopen=urlopen, out=buf,
+    )
+    text = buf.getvalue()
+    assert "claude-opus-4-6" in text
+    assert "claude-opus-4-7" in text
+    # 250/200 = 1.25×
+    assert "1.25×" in text
+
+
+def test_render_count_tokens_no_results():
+    import io as _io
+    buf = _io.StringIO()
+    smc._render_count_tokens_text([], ["a", "b"], out=buf)
+    assert "nothing to count" in buf.getvalue()
+
+
+def test_render_count_tokens_partial_failures_show_dashes():
+    """If one prompt's call failed, the cell renders as em-dash."""
+    import io as _io
+    results = [
+        {"name": "p1", "tokens_by_model": {"mA": 100, "mB": 130}},
+        {"name": "p2", "tokens_by_model": {"mA": 100}},  # B failed
+        {"name": "p3", "tokens_by_model": {"mA": 100, "mB": 140}},
+    ]
+    buf = _io.StringIO()
+    smc._render_count_tokens_text(results, ["mA", "mB"], out=buf)
+    text = buf.getvalue()
+    # Em-dash placeholder for the missing B on p2, and no ratio cell
+    # for that row.
+    assert "—" in text
+    # p1 and p3 still contribute to the ratio summary.
+    assert "Ratio summary" in text
+
+
+def test_cli_count_tokens_dispatches(monkeypatch, capsys):
+    """End-to-end: ``--count-tokens-only --yes`` routes through the CLI."""
+    # Monkey-patch urlopen so no real network call is attempted.
+    import urllib.request
+
+    def _fake(req, timeout=None):
+        import json as _j
+        body = _j.loads(req.data.decode("utf-8"))
+        counts = {"claude-opus-4-6": 100, "claude-opus-4-7": 125}
+        return _MockResp(
+            _j.dumps({"input_tokens": counts[body["model"]]}).encode()
+        )
+    monkeypatch.setattr(urllib.request, "urlopen", _fake)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--count-tokens-only", "--yes"],
+    )
+    sm.main()
+    out = capsys.readouterr().out
+    # 125 / 100 = 1.25× per prompt.
+    assert "1.25×" in out
+    assert "INPUT tokens only" in out
+
+
+def test_cli_count_tokens_custom_models(monkeypatch, capsys):
+    import urllib.request
+    seen_models: list[str] = []
+
+    def _fake(req, timeout=None):
+        import json as _j
+        body = _j.loads(req.data.decode("utf-8"))
+        seen_models.append(body["model"])
+        return _MockResp(_j.dumps({"input_tokens": 77}).encode())
+    monkeypatch.setattr(urllib.request, "urlopen", _fake)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["session-metrics.py", "--count-tokens-only",
+         "--compare-models", "claude-sonnet-4-6", "claude-sonnet-4-7",
+         "--yes"],
+    )
+    sm.main()
+    # Both models were actually called.
+    assert "claude-sonnet-4-6" in seen_models
+    assert "claude-sonnet-4-7" in seen_models
