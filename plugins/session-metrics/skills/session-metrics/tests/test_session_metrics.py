@@ -330,6 +330,27 @@ def test_html_render_includes_legend_and_badge():
     assert "Cache TTL mix" in html
 
 
+def test_html_escapes_synthetic_model_name():
+    # CC writes `model: "<synthetic>"` for no-op assistant entries (local-command
+    # caveats, API errors). Without escaping, `<synthetic>` renders as an unknown
+    # HTML tag and the model cell appears blank. This test guards both the
+    # timeline row and the Models summary row.
+    r = _build_fixture_report()
+    # Inject a synthetic turn into the first session + models dict
+    syn_turn = dict(r["sessions"][0]["turns"][0])
+    syn_turn["model"] = "<synthetic>"
+    r["sessions"][0]["turns"].append(syn_turn)
+    r["models"]["<synthetic>"] = r["models"].get("<synthetic>", 0) + 1
+
+    html = sm.render_html(r, variant="single")
+    # Literal `<synthetic>` must NOT appear outside harmless contexts. Check the
+    # two specific rendering sites are escaped.
+    assert '<td class="model"><synthetic></td>' not in html
+    assert '<td><code><synthetic></code></td>' not in html
+    assert '<td class="model">&lt;synthetic&gt;</td>' in html
+    assert '<td><code>&lt;synthetic&gt;</code></td>' in html
+
+
 # --- Content-block distribution (Proposal B) --------------------------------
 
 def test_count_content_blocks_mixed_list():

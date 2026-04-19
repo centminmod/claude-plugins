@@ -9,7 +9,7 @@
       "name": "session-metrics",
       "source": "./plugins/session-metrics",
       "description": "Per-turn token, cost, and cache metrics for Claude Code sessions. Multi-format export (text/JSON/CSV/MD/HTML) with 5-hour session blocks, weekly roll-up, hour-of-day punchcard, and pluggable chart libraries.",
-      "version": "1.3.2",
+      "version": "1.3.3",
       "homepage": "https://github.com/centminmod/claude-plugins",
       "author": {
         "name": "George Liu"

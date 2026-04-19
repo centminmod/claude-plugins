@@ -32,6 +32,7 @@ import csv as csv_mod
 import functools
 import gzip
 import hashlib
+import html as html_mod
 import io
 import json
 import os
@@ -3146,7 +3147,7 @@ def render_html(report: dict, variant: str = "single",
             f'<tr data-session="{session_id[:8]}">'
             f'<td class="num">{t["index"]}</td>'
             f'<td class="ts">{t["timestamp_fmt"]}</td>'
-            f'<td class="model">{t["model"]}</td>'
+            f'<td class="model">{html_mod.escape(t["model"])}</td>'
             f'{mode_td}'
             f'<td class="num">{t["input_tokens"]:,}</td>'
             f'<td class="num">{t["output_tokens"]:,}</td>'
@@ -3214,7 +3215,7 @@ def render_html(report: dict, variant: str = "single",
 
         def _model_row_html(m: str, cnt: int) -> str:
             r = _pricing_for(m)
-            return (f'<tr><td><code>{m}</code></td><td class="num">{cnt:,}</td>'
+            return (f'<tr><td><code>{html_mod.escape(m)}</code></td><td class="num">{cnt:,}</td>'
                     f'<td class="num">${r["input"]:.2f}</td>'
                     f'<td class="num">${r["output"]:.2f}</td>'
                     f'<td class="num">${r["cache_read"]:.2f}</td>'
