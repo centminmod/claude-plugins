@@ -218,13 +218,41 @@ def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
     return entries
 
 
-# Resume-marker detection: `claude -c` replays the prior session's trailing
-# `/exit` local-command triplet into the resumed JSONL, and CC responds with
-# a no-op `model: "<synthetic>"` assistant turn. The predicate below matches
-# that fingerprint. See CLAUDE-session-metrics-development-history.md S22
-# for the corpus-scan data justifying the precision/recall tradeoffs.
+# Resume-marker detection: two high-precision fingerprints produce a no-op
+# `model: "<synthetic>"` assistant turn we want to surface as a timeline
+# divider rather than a billable row.
+#
+# 1. `/exit` local-command triplet replayed by `claude -c` into the resumed
+#    JSONL (Session 22 discovery). Matched via _EXIT_CMD_MARKER in a
+#    plain-string user content.
+# 2. An `isMeta` user entry with text `Continue from where you left off.`
+#    (Session 34 discovery) — the desktop client injects this placeholder
+#    pair when an auto-continue attempt couldn't reach the backend (e.g.
+#    five-hour rate-limit window). The user can't type `isMeta`, and the
+#    synthetic self-reply `No response requested.` makes the pair
+#    unambiguous. Matched via _CONTINUE_FROM_RESUME_MARKER in a
+#    text-block list user content.
+#
+# See CLAUDE-session-metrics-development-history.md S22 for the original
+# corpus-scan data; the S34 scan confirmed 3 new disjoint matches across
+# 7,731 JSONLs with zero overlap into unrelated synthetic flows.
 _EXIT_CMD_MARKER = "<command-name>/exit</command-name>"
+_CONTINUE_FROM_RESUME_MARKER = "Continue from where you left off."
 _RESUME_LOOKBACK_USER_ENTRIES = 10
+
+
+def _resume_fingerprint_match(recent_user_contents: list) -> bool:
+    """True if any recent user entry carries a resume-marker fingerprint."""
+    for c in recent_user_contents:
+        if isinstance(c, str) and _EXIT_CMD_MARKER in c:
+            return True
+        if isinstance(c, list):
+            for block in c:
+                if (isinstance(block, dict)
+                        and block.get("type") == "text"
+                        and _CONTINUE_FROM_RESUME_MARKER in (block.get("text") or "")):
+                    return True
+    return False
 
 
 def _extract_turns(entries: list[dict]) -> list[dict]:
@@ -254,9 +282,16 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
 
     Also attaches ``_is_resume_marker``: True when the turn is a synthetic
     no-op whose preceding ``_RESUME_LOOKBACK_USER_ENTRIES`` user entries
-    contain a ``/exit`` local-command marker — i.e. the fingerprint of a
-    `claude -c` resume. Precision is high (the triplet is unambiguous);
-    recall is incomplete (resumes after Ctrl+C / crash leave no trace).
+    carry either of two high-precision fingerprints:
+
+    - A ``/exit`` local-command triplet (``claude -c`` resume, Session 22).
+    - A ``"Continue from where you left off."`` isMeta user entry (desktop
+      auto-continue placeholder, Session 34 — typically a five-hour
+      rate-limit backoff where the client couldn't reach the API).
+
+    Precision is high (both fingerprints are client-generated and the
+    ``<synthetic>`` assistant reply is unambiguous); recall is incomplete
+    (resumes after Ctrl+C / crash leave no trace).
     """
     last_entry: dict[str, dict] = {}
     merged_content: dict[str, list] = {}
@@ -285,8 +320,7 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
         # streaming dupes of the same synthetic msg_id carry the same
         # preceding-user context by construction.
         if msg.get("model") == "<synthetic>" and msg_id not in resume_marker_msg_ids:
-            if any(isinstance(c, str) and _EXIT_CMD_MARKER in c
-                   for c in recent_user_contents):
+            if _resume_fingerprint_match(recent_user_contents):
                 resume_marker_msg_ids.add(msg_id)
         # First-occurrence wins for the preceding user pointer — streaming
         # echo entries of the same msg_id don't see a new user prompt in

@@ -370,6 +370,15 @@ _CLEAR_USER_ENTRY = {
     "type": "user",
     "message": {"content": "<command-name>/clear</command-name>"},
 }
+_CONTINUE_AUTO_RESUME_USER_ENTRY = {
+    "type": "user",
+    "isMeta": True,
+    "message": {
+        "role": "user",
+        "content": [{"type": "text",
+                     "text": "Continue from where you left off."}],
+    },
+}
 
 
 def _synthetic_assistant_entry(msg_id: str, timestamp: str = "2026-04-19T08:29:07Z"):
@@ -413,6 +422,20 @@ def test_extract_turns_does_not_flag_synthetic_without_exit():
     turns = sm._extract_turns(entries)
     assert len(turns) == 1
     assert turns[0]["_is_resume_marker"] is False
+
+
+def test_extract_turns_flags_resume_marker_after_continue_automessage():
+    # Session 34 fingerprint: desktop-injected `"Continue from where you left
+    # off."` isMeta user entry + <synthetic> "No response requested." reply.
+    # Seen when a five-hour rate-limit window lapses and auto-continue can't
+    # reach the backend. Matches even without a `/exit` triplet in the window.
+    entries = [
+        _CONTINUE_AUTO_RESUME_USER_ENTRY,
+        _synthetic_assistant_entry("msg_syn_cont"),
+    ]
+    turns = sm._extract_turns(entries)
+    assert len(turns) == 1
+    assert turns[0]["_is_resume_marker"] is True
 
 
 def test_extract_turns_flags_multiple_resumes_in_one_session():
