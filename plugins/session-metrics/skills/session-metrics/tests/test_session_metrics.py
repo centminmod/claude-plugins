@@ -351,6 +351,160 @@ def test_html_escapes_synthetic_model_name():
     assert '<td><code>&lt;synthetic&gt;</code></td>' in html
 
 
+# --- Resume detection (Phase 3) ---------------------------------------------
+
+_EXIT_USER_ENTRY = {
+    "type": "user",
+    "message": {"content": "<command-name>/exit</command-name>\n"},
+}
+_EXIT_STDOUT_ENTRY = {
+    "type": "user",
+    "message": {"content": "<local-command-stdout>See ya!</local-command-stdout>"},
+}
+_CLEAR_USER_ENTRY = {
+    "type": "user",
+    "message": {"content": "<command-name>/clear</command-name>"},
+}
+
+
+def _synthetic_assistant_entry(msg_id: str, timestamp: str = "2026-04-19T08:29:07Z"):
+    """Build a synthetic no-op assistant entry as CC writes it."""
+    return {
+        "type": "assistant",
+        "timestamp": timestamp,
+        "message": {
+            "id": msg_id,
+            "model": "<synthetic>",
+            "role": "assistant",
+            "usage": {"input_tokens": 0, "output_tokens": 0,
+                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                      "cache_creation": {"ephemeral_1h_input_tokens": 0,
+                                          "ephemeral_5m_input_tokens": 0}},
+            "content": [{"type": "text", "text": "No response requested."}],
+        },
+    }
+
+
+def test_extract_turns_flags_resume_marker_after_exit():
+    # /exit triplet (caveat, /exit, stdout) → synthetic assistant → marker flagged
+    entries = [
+        {"type": "user", "message": {"content": "<local-command-caveat>...",
+                                      "isMeta": True}},
+        _EXIT_USER_ENTRY,
+        _EXIT_STDOUT_ENTRY,
+        _synthetic_assistant_entry("msg_syn_1"),
+    ]
+    turns = sm._extract_turns(entries)
+    assert len(turns) == 1
+    assert turns[0]["_is_resume_marker"] is True
+
+
+def test_extract_turns_does_not_flag_synthetic_without_exit():
+    # Synthetic preceded by /clear (not /exit) — no resume marker
+    entries = [
+        _CLEAR_USER_ENTRY,
+        _synthetic_assistant_entry("msg_syn_2"),
+    ]
+    turns = sm._extract_turns(entries)
+    assert len(turns) == 1
+    assert turns[0]["_is_resume_marker"] is False
+
+
+def test_extract_turns_flags_multiple_resumes_in_one_session():
+    # Two /exit → synthetic pairs separated by real work = two resumes
+    entries = [
+        # Real assistant turn in between
+        {"type": "user", "message": {"content": "first prompt"}},
+        {"type": "assistant", "timestamp": "2026-04-19T08:28:24Z",
+         "message": {"id": "msg_real_1", "model": "claude-opus-4-7",
+                     "role": "assistant",
+                     "usage": {"input_tokens": 6, "output_tokens": 10,
+                               "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0},
+                     "content": []}},
+        _EXIT_USER_ENTRY, _EXIT_STDOUT_ENTRY,
+        _synthetic_assistant_entry("msg_syn_a", "2026-04-19T08:29:07Z"),
+        # Another real turn
+        {"type": "user", "message": {"content": "second prompt"}},
+        {"type": "assistant", "timestamp": "2026-04-19T08:30:00Z",
+         "message": {"id": "msg_real_2", "model": "claude-opus-4-7",
+                     "role": "assistant",
+                     "usage": {"input_tokens": 5, "output_tokens": 8,
+                               "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0},
+                     "content": []}},
+        _EXIT_USER_ENTRY, _EXIT_STDOUT_ENTRY,
+        _synthetic_assistant_entry("msg_syn_b", "2026-04-19T08:31:00Z"),
+    ]
+    turns = sm._extract_turns(entries)
+    resume_flags = [t["_is_resume_marker"] for t in turns]
+    # Sorted by timestamp: real_1, syn_a, real_2, syn_b
+    assert resume_flags == [False, True, False, True]
+
+
+def test_build_resumes_computes_gap_and_terminal_flag():
+    # Construct turn records with one mid-session and one terminal marker
+    turns = [
+        {"index": 1, "timestamp": "2026-04-19T08:28:24Z",
+         "timestamp_fmt": "2026-04-19 08:28:24", "is_resume_marker": False},
+        {"index": 2, "timestamp": "2026-04-19T08:29:00Z",
+         "timestamp_fmt": "2026-04-19 08:29:00", "is_resume_marker": True},   # mid
+        {"index": 3, "timestamp": "2026-04-19T08:30:00Z",
+         "timestamp_fmt": "2026-04-19 08:30:00", "is_resume_marker": False},
+        {"index": 4, "timestamp": "2026-04-19T08:31:00Z",
+         "timestamp_fmt": "2026-04-19 08:31:00", "is_resume_marker": True},   # terminal
+    ]
+    resumes = sm._build_resumes(turns)
+    assert len(resumes) == 2
+    # First marker — mid-session — gap = 36s (08:29:00 - 08:28:24)
+    assert resumes[0]["turn_index"] == 2
+    assert resumes[0]["gap_seconds"] == 36.0
+    assert resumes[0]["terminal"] is False
+    # Second marker — terminal — gap = 60s; terminal=True
+    assert resumes[1]["turn_index"] == 4
+    assert resumes[1]["gap_seconds"] == 60.0
+    assert resumes[1]["terminal"] is True
+
+
+def test_html_renders_resume_marker_divider_and_card():
+    # Inject a marker into the fixture report; HTML should include the
+    # dashboard card and timeline divider row. Baseline fixture carries no
+    # markers — without injection, neither the row nor the card appears.
+    # CSS rules for .resume-marker-row live in <style> regardless, so tests
+    # look for the row-level `<tr class=...>` and the card's `<div class="lbl">`
+    # label to avoid false hits on stylesheet-only presence.
+    r = _build_fixture_report()
+
+    # Baseline: no resumes in bundled fixture
+    assert r.get("resumes") == []
+    baseline_html = sm.render_html(r, variant="single")
+    assert '<tr class="resume-marker-row"' not in baseline_html
+    assert '>Session resumes' not in baseline_html
+
+    # Inject a resume marker on the first turn and rebuild the resumes list
+    r["sessions"][0]["turns"][0]["is_resume_marker"] = True
+    r["sessions"][0]["resumes"] = sm._build_resumes(r["sessions"][0]["turns"])
+    r["resumes"] = [m for s in r["sessions"] for m in s["resumes"]]
+
+    html = sm.render_html(r, variant="single")
+    assert '<tr class="resume-marker-row"' in html
+    assert 'class="resume-marker-pill"' in html
+    assert "Session resumed" in html
+    # Dashboard card label (not the CSS selector)
+    assert '>Session resumes' in html
+
+
+def test_resumes_card_absent_when_no_markers():
+    # Guard against the card rendering on a report with an empty resumes list.
+    r = _build_fixture_report()
+    assert r.get("resumes") == []
+    html = sm.render_html(r, variant="single")
+    # Row-level emission (not CSS rule) must not appear
+    assert '<tr class="resume-marker-row"' not in html
+    # Card label (not CSS selector) must not appear
+    assert '>Session resumes' not in html
+
+
 # --- Content-block distribution (Proposal B) --------------------------------
 
 def test_count_content_blocks_mixed_list():

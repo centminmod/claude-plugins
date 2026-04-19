@@ -105,6 +105,15 @@ carried a `thinking` block — counts turns and blocks but cannot
 recover per-block tokens, which are rolled into `output_tokens` by
 Anthropic) and **Tool calls** (shown when any turn used
 `tool_use` blocks — total, average per turn, and the top-3 tool names).
+**v1.4.0+** adds a **Session resumes** conditional card + an inline
+timeline divider row at each resume point. Detection is precise: it
+fires only when a `<command-name>/exit</command-name>` local command
+appears within the last ~10 user entries before a synthetic no-op
+assistant turn — the fingerprint of a `claude -c` resume. Recall is
+incomplete: resumes after Ctrl+C or crash leave no trace, so the count
+is a *lower bound* (hover the card for the caveat). JSON exports
+include a top-level `resumes` array and a per-turn `is_resume_marker`
+boolean; CSV does not add new columns.
 
 ## Reference files
 

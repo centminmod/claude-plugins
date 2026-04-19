@@ -218,6 +218,15 @@ def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
     return entries
 
 
+# Resume-marker detection: `claude -c` replays the prior session's trailing
+# `/exit` local-command triplet into the resumed JSONL, and CC responds with
+# a no-op `model: "<synthetic>"` assistant turn. The predicate below matches
+# that fingerprint. See CLAUDE-session-metrics-development-history.md S22
+# for the corpus-scan data justifying the precision/recall tradeoffs.
+_EXIT_CMD_MARKER = "<command-name>/exit</command-name>"
+_RESUME_LOOKBACK_USER_ENTRIES = 10
+
+
 def _extract_turns(entries: list[dict]) -> list[dict]:
     """Deduplicate on message.id and return one entry per assistant turn.
 
@@ -242,16 +251,27 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
     **first** occurrence in the raw stream (content-block counters use
     this to attribute ``tool_result`` / ``image`` blocks to the turn that
     consumed them).
+
+    Also attaches ``_is_resume_marker``: True when the turn is a synthetic
+    no-op whose preceding ``_RESUME_LOOKBACK_USER_ENTRIES`` user entries
+    contain a ``/exit`` local-command marker — i.e. the fingerprint of a
+    `claude -c` resume. Precision is high (the triplet is unambiguous);
+    recall is incomplete (resumes after Ctrl+C / crash leave no trace).
     """
     last_entry: dict[str, dict] = {}
     merged_content: dict[str, list] = {}
     preceding_user: dict[str, object] = {}
+    resume_marker_msg_ids: set[str] = set()
+    recent_user_contents: list[object] = []
     last_user_content = None
     for entry in entries:
         t = entry.get("type")
         if t == "user":
             msg = entry.get("message") or {}
             last_user_content = msg.get("content")
+            recent_user_contents.append(last_user_content)
+            if len(recent_user_contents) > _RESUME_LOOKBACK_USER_ENTRIES:
+                recent_user_contents.pop(0)
             continue
         if t != "assistant":
             continue
@@ -261,6 +281,13 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
         msg_id = msg.get("id")
         if not msg_id:
             continue
+        # Resume-marker detection runs once per msg_id (first occurrence);
+        # streaming dupes of the same synthetic msg_id carry the same
+        # preceding-user context by construction.
+        if msg.get("model") == "<synthetic>" and msg_id not in resume_marker_msg_ids:
+            if any(isinstance(c, str) and _EXIT_CMD_MARKER in c
+                   for c in recent_user_contents):
+                resume_marker_msg_ids.add(msg_id)
         # First-occurrence wins for the preceding user pointer — streaming
         # echo entries of the same msg_id don't see a new user prompt in
         # between, so the triggering user entry is the one we saw before
@@ -278,6 +305,7 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
             **entry,
             "message": merged_msg,
             "_preceding_user_content": preceding_user.get(msg_id),
+            "_is_resume_marker": msg_id in resume_marker_msg_ids,
         })
     turns.sort(key=lambda e: e.get("timestamp", ""))
     return turns
@@ -959,6 +987,7 @@ def _build_turn_record(global_index: int, entry: dict,
         "speed":                  u.get("speed", ""),
         "content_blocks":         content_blocks,
         "tool_use_names":         tool_names,
+        "is_resume_marker":       bool(entry.get("_is_resume_marker", False)),
     }
 
 
@@ -1057,6 +1086,7 @@ def _build_report(
             "subtotal":    _totals_from_turns(turn_records),
             "models":      _model_counts(turn_records),
             "time_of_day": _build_time_of_day(user_ts, offset_hours=tz_offset_hours),
+            "resumes":     _build_resumes(turn_records),
         })
 
     all_turns = [t for s in sessions_out for t in s["turns"]]
@@ -1076,7 +1106,50 @@ def _build_report(
         "block_summary":   _weekly_block_counts(blocks),
         "weekly_rollup":   _build_weekly_rollup(sessions_out, sessions_raw, blocks),
         "peak":            peak,
+        "resumes":         [r for s in sessions_out for r in s["resumes"]],
     }
+
+
+def _build_resumes(turn_records: list[dict]) -> list[dict]:
+    """Extract resume markers from per-session turn records.
+
+    A resume marker is a turn flagged ``is_resume_marker=True`` by
+    `_extract_turns` (synthetic no-op preceded by a `/exit` local-command
+    replay in the last ~10 user entries). For each marker we compute the
+    wall-clock gap to the previous assistant turn in the same session —
+    the practical "away" time between the user's prior work and the
+    resumed work. When the marker is the first turn in the session
+    (prior-session context not observable from this file), gap is null.
+    When the marker is the last turn in the session (user exited and did
+    not return), ``terminal`` is True — render as an exit marker rather
+    than a resume divider.
+
+    Returns a list ordered by ``turn_index``; each entry is a dict with
+    ``timestamp``, ``timestamp_fmt``, ``turn_index``, ``gap_seconds``,
+    ``terminal``.
+    """
+    markers: list[dict] = []
+    for i, t in enumerate(turn_records):
+        if not t.get("is_resume_marker"):
+            continue
+        gap: float | None = None
+        if i > 0:
+            prev_dt = _parse_iso_dt(turn_records[i-1].get("timestamp", ""))
+            cur_dt  = _parse_iso_dt(t.get("timestamp", ""))
+            if prev_dt and cur_dt:
+                try:
+                    gap = (cur_dt - prev_dt).total_seconds()
+                except (ValueError, AttributeError, TypeError, OSError):
+                    gap = None
+        terminal = (i == len(turn_records) - 1)
+        markers.append({
+            "timestamp":     t.get("timestamp", ""),
+            "timestamp_fmt": t.get("timestamp_fmt", ""),
+            "turn_index":    t.get("index"),
+            "gap_seconds":   gap,
+            "terminal":      terminal,
+        })
+    return markers
 
 
 # ---------------------------------------------------------------------------
@@ -3128,6 +3201,26 @@ def render_html(report: dict, variant: str = "single",
                 f'<span>{label}</span></td>')
 
     def turn_row(t: dict, session_id: str) -> str:
+        # Resume markers replace the normal data row with a full-width divider
+        # so users see "session resumed here" inline with the timeline rather
+        # than an all-zero row labelled `<synthetic>`. The marker is still
+        # counted in the turn index; only the rendering changes.
+        if t.get("is_resume_marker"):
+            ts_fmt = html_mod.escape(t.get("timestamp_fmt", ""))
+            return (
+                f'<tr class="resume-marker-row" data-session="{session_id[:8]}">'
+                f'<td class="num resume-marker-idx">{t["index"]}</td>'
+                f'<td colspan="{_full_cols - 1}" class="resume-marker-cell">'
+                f'<span class="resume-marker-pill" '
+                f'title="claude -c replayed a prior /exit local-command into '
+                f'this session; CC emitted a no-op `<synthetic>` assistant entry. '
+                f'Detection is precise when it fires but may under-count '
+                f'(resumes after Ctrl+C or crash leave no trace).">'
+                f'<span class="resume-marker-icon">&#8634;</span>'
+                f'<strong>Session resumed</strong>'
+                f'<span class="resume-marker-time">at {ts_fmt}</span>'
+                f'</span></td></tr>'
+            )
         bar_w = min(100, int(t["cost_usd"] * 2000))
         mode_td = ""
         if show_mode:
@@ -3342,6 +3435,32 @@ def render_html(report: dict, variant: str = "single",
                 f'<div class="val">{tc} · {avg:.1f}/turn</div>'
                 f'<div class="lbl">Tool calls &middot; top: {top3_str}</div></div>'
             )
+        resumes_card = ""
+        resumes_list = report.get("resumes") or []
+        if resumes_list:
+            non_terminal = [r for r in resumes_list if not r.get("terminal")]
+            n_resumes = len(non_terminal)
+            # Collect short local times (HH:MM portion of timestamp_fmt)
+            times = [r.get("timestamp_fmt", "").split(" ")[-1][:5]
+                     for r in non_terminal if r.get("timestamp_fmt")]
+            times_str = ", ".join(times) if times else ""
+            terminal_note = ""
+            n_terminal = len(resumes_list) - n_resumes
+            if n_terminal:
+                terminal_note = f' · {n_terminal} terminal exit'
+                if n_terminal != 1:
+                    terminal_note += "s"
+            resumes_card = (
+                f'\n  <div class="card">'
+                f'<div class="val">&#8634; {n_resumes} detected</div>'
+                f'<div class="lbl" title="Precise lower bound: detects claude -c '
+                f'resumes that replay a prior /exit into this session. Resumes '
+                f'after Ctrl+C or crash leave no trace and are not counted.">'
+                f'Session resumes'
+                f'{(" &middot; " + times_str) if times_str else ""}'
+                f'{terminal_note}'
+                f'</div></div>'
+            )
         summary_cards_html = f'''\
 <div class="cards">
   <div class="card amber"><div class="val">${totals['cost']:.4f}</div><div class="lbl">Total cost (USD)</div></div>
@@ -3351,7 +3470,7 @@ def render_html(report: dict, variant: str = "single",
   <div class="card"><div class="val">{totals['input']:,}</div><div class="lbl">Input tokens (new)</div></div>
   <div class="card"><div class="val">{totals['output']:,}</div><div class="lbl">Output tokens</div></div>
   <div class="card"><div class="val">{totals['cache_read']:,}</div><div class="lbl">Cache read tokens</div></div>
-  <div class="card"><div class="val">{totals['cache_write']:,}</div><div class="lbl">Cache write tokens</div></div>{ttl_mix_card}{thinking_card}{tool_calls_card}
+  <div class="card"><div class="val">{totals['cache_write']:,}</div><div class="lbl">Cache write tokens</div></div>{ttl_mix_card}{thinking_card}{tool_calls_card}{resumes_card}
 </div>'''
 
     toggle_script_html = ""
@@ -3449,6 +3568,21 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                         color: #a5d6ff; }}
   .chart-page-label {{ font-size: 11px; color: #8b949e; padding: 8px 16px 0;
                        border-top: 1px solid #30363d; margin-top: 4px; }}
+  tr.resume-marker-row td {{ background: #0d1a2e; border-top: 1px dashed #2f5f9c;
+                             border-bottom: 1px dashed #2f5f9c; padding: 6px 10px; }}
+  tr.resume-marker-row td.resume-marker-idx {{ color: #58a6ff; opacity: 0.7; }}
+  tr.resume-marker-row td.resume-marker-cell {{ text-align: center;
+                              color: #8b949e; font-size: 12px; }}
+  .resume-marker-pill {{ display: inline-flex; align-items: center;
+                         gap: 8px; padding: 3px 10px;
+                         background: #1f3552; border: 1px solid #2f5f9c;
+                         border-radius: 12px; color: #c9d1d9; cursor: help; }}
+  .resume-marker-pill strong {{ color: #58a6ff; font-weight: 600;
+                                font-size: 12px; letter-spacing: 0.2px; }}
+  .resume-marker-pill .resume-marker-icon {{ color: #58a6ff;
+                                             font-size: 14px; line-height: 1; }}
+  .resume-marker-pill .resume-marker-time {{ color: #8b949e; font-size: 11px;
+                                             font-variant-numeric: tabular-nums; }}
 </style>
 </head>
 <body>
