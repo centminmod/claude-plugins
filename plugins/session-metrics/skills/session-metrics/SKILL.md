@@ -7,6 +7,18 @@ description: >
   much a Claude Code session has cost. Also trigger for "how much have we spent",
   "show me token usage", "session summary", "cost so far", or any request to
   analyse or display per-turn metrics from the current or a past session.
+
+  **Does NOT auto-route into model-comparison mode.** Comparing two models
+  is an explicit operation that changes every column in the report and
+  requires a capture protocol. Only invoke compare mode when the user has
+  typed the literal CLI flag `--compare` (or `--compare-prep`,
+  `--count-tokens-only`) in a command they showed you, OR when they
+  explicitly said "run a compare report" / "use the compare feature".
+  Natural-language phrases like "compare 4.6 vs 4.7 cost" or "which model
+  is cheaper" should be answered by running the normal single-session
+  report on the current session and then pointing the user at
+  `session-metrics --compare-prep` if they want a controlled benchmark.
+  Never add `--compare` to a command line based on inferred intent.
 ---
 
 # Session Metrics
@@ -133,17 +145,30 @@ session-pacing insights.
 
 ## Model comparison (`--compare`)
 
+**Only invoke when the user explicitly types `--compare` / `--compare-prep`
+/ `--count-tokens-only` in a command or explicitly asks to "run a compare
+report". Do not dispatch from inferred intent — see the trigger-discipline
+clause in the frontmatter.**
+
 Compares two Claude Code sessions (or two sets of sessions) on tokens, cost,
 cache behaviour, tool-call fan-out, and IFEval-style instruction compliance.
 Two modes: **controlled** (session pair running the canonical suite) and
 **observational** (project-level aggregate across model families).
+
+**For Claude subscription-plan users:** `--compare` is the mode you want.
+Claude Code authenticates via your subscription transparently and writes the
+session JSONLs to `~/.claude/projects/…`. The skill reads those JSONLs
+locally — **no API key is needed** for `--compare` or `--compare-prep` or
+any of the renderers. Only the separate `--count-tokens-only` mode (§below)
+needs an API key, and it is a narrow pre-capture smoke test — not the tool
+for measuring subscription-plan token usage.
 
 ```bash
 # Print the capture protocol + canonical 10-prompt suite
 session-metrics --compare-prep > /tmp/suite.md     # defaults to 4.6 vs 4.7
 session-metrics --compare-prep claude-opus-4-7 claude-opus-4-8
 
-# Controlled compare (both sides ran the suite)
+# Controlled compare (both sides ran the suite) — the subscription workflow
 session-metrics --compare last-opus-4-6 last-opus-4-7 --output md
 
 # Controlled compare with shareable HTML dashboard (single self-contained file)
@@ -154,11 +179,6 @@ session-metrics --compare last-opus-4-6 last-opus-4-7 --output html --redact-use
 
 # Observational aggregate across every session of each family in the project
 session-metrics --compare all-opus-4-6 all-opus-4-7 --yes
-
-# Inference-free tokenizer check — no sessions needed, just an API key
-ANTHROPIC_API_KEY=sk-... session-metrics --count-tokens-only --yes
-ANTHROPIC_API_KEY=sk-... session-metrics --count-tokens-only \
-    --compare-models claude-sonnet-4-6 claude-sonnet-4-7 --yes
 ```
 
 Each prompt in the suite carries a sentinel line
@@ -184,14 +204,22 @@ from "detected, run `--compare-prep` to benchmark" (before the user tries
 `--compare`) to "refresh attribution with a new run" (after). Suppress with
 `--no-model-compare-insight`.
 
-**`count_tokens` API mode (v1.6.0+)**: `--count-tokens-only` hits
-`POST /v1/messages/count_tokens` once per prompt × model pair and prints an
-input-token ratio table — no inference, no output/cost data, just the
-tokenizer delta the article is about. Requires `ANTHROPIC_API_KEY`; pair with
-`--compare-models A B` to choose the two model IDs (defaults to the reference
-`claude-opus-4-6` vs `claude-opus-4-7` pair). Includes a confirmation gate
-(bypass with `--yes`) and a first-call probe that falls back to single-model
-counting if the baseline model is not accessible to the API key.
+**`count_tokens` API mode (v1.6.0+, narrow use case)**: `--count-tokens-only`
+hits `POST /v1/messages/count_tokens` once per prompt × model and prints an
+input-token ratio table — no inference, no output/cost data. It **requires
+an API key** because the Anthropic endpoint requires one; that is an
+API-side gate, not a design choice. Pair with `--compare-models A B` to
+choose the two model IDs (defaults: `claude-opus-4-6` vs `claude-opus-4-7`).
+
+> **Do not reach for `--count-tokens-only` to measure subscription-plan
+> token usage.** Subscription auth and the API-key `count_tokens` endpoint
+> are separate billing / auth paths. To compare real Claude subscription
+> sessions on two models, use `--compare` against the two session JSONLs
+> (produced by running the same prompts through each model via `/model`
+> inside Claude Code). `--count-tokens-only` is only useful when you want
+> a pre-capture tokenizer smoke test before running sessions at all, or
+> when you have an API key and don't want to pay inference cost just to
+> see the tokenizer delta.
 
 Full walkthrough + interpretation guide + methodology caveats:
 [`references/model-compare.md`](references/model-compare.md).
