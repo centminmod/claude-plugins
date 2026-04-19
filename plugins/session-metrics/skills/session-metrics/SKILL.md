@@ -115,6 +115,22 @@ is a *lower bound* (hover the card for the caveat). JSON exports
 include a top-level `resumes` array and a per-turn `is_resume_marker`
 boolean; CSV does not add new columns.
 
+**v1.5.0+** adds a **Usage Insights** panel to the HTML dashboard —
+prose-style characterisations of usage patterns inspired by Anthropic's
+`/usage` command (e.g. *"38% of cost came from sessions running 3+
+subagents"*, *"72% of cost was spent on turns with ≥150k context
+filled"*). 10 candidate insights compute against the report with
+auto-hide thresholds; only those that cross the bar render. The
+highest-value passing insight sits above-the-fold; the rest collapse
+into a native `<details>/<summary>` accordion (no JavaScript). Insights
+also flow into the JSON export under the top-level `usage_insights`
+key (each entry: `id`, `headline`, `body`, `value`, `threshold`,
+`shown`, `always_on`) and into the Markdown export as a flat
+`## Usage Insights` bullet list. Text and CSV outputs are unchanged.
+Each session dict additionally gains a `duration_seconds` field
+(integer, computed from raw timestamps) used by the long-session and
+session-pacing insights.
+
 ## Reference files
 
 - [`references/pricing.md`](references/pricing.md) — Per-model token prices used

@@ -1280,3 +1280,293 @@ def test_maybe_warn_chart_license_silent_for_mit_libs(capsys):
     err = capsys.readouterr().err
     assert "non-commercial" not in err
     assert "license" not in err.lower()
+
+
+# --- Usage Insights ----------------------------------------------------------
+#
+# Synthetic reports give us tight control over each threshold; the
+# JSONL-fixture path is exercised separately via the existing tests.
+
+def _synthetic_turn(cost=0.10, model="claude-sonnet-4-7", inp=100,
+                    cread=0, cwrite=0, tools=None, ts="2026-04-01T12:00:00Z"):
+    return {
+        "cost_usd":           cost,
+        "model":              model,
+        "input_tokens":       inp,
+        "cache_read_tokens":  cread,
+        "cache_write_tokens": cwrite,
+        "tool_use_names":     tools or [],
+        "timestamp":          ts,
+        "content_blocks":     {"thinking": 0, "tool_use": len(tools or []),
+                                "text": 1, "tool_result": 0, "image": 0},
+    }
+
+
+def _synthetic_report(sessions, blocks=None, tz_offset_hours=10.0):
+    """Build the minimum report shape `_compute_usage_insights` consumes."""
+    total_cost = sum(t.get("cost_usd", 0.0)
+                     for s in sessions for t in s.get("turns", []))
+    return {
+        "totals":          {"cost": total_cost, "turns":
+                            sum(len(s.get("turns", [])) for s in sessions)},
+        "sessions":        sessions,
+        "session_blocks":  blocks or [],
+        "tz_offset_hours": tz_offset_hours,
+    }
+
+
+def _by_id(insights, iid):
+    for i in insights:
+        if i["id"] == iid:
+            return i
+    raise KeyError(iid)
+
+
+def test_usage_insights_zero_cost_short_circuits():
+    """Empty / $0 reports return no candidates — avoids percentage divide-by-zero."""
+    rep = _synthetic_report([{"turns": [], "subtotal": {"cost": 0.0},
+                              "duration_seconds": 0}], blocks=[])
+    assert sm._compute_usage_insights(rep) == []
+
+
+def test_parallel_sessions_passes_threshold():
+    """Two sessions overlapping in one 5h block → high parallel %."""
+    sessions = [
+        {"session_id": "s1", "duration_seconds": 1800,
+         "subtotal": {"cost": 5.0},
+         "turns": [_synthetic_turn(cost=5.0)]},
+        {"session_id": "s2", "duration_seconds": 1800,
+         "subtotal": {"cost": 5.0},
+         "turns": [_synthetic_turn(cost=5.0)]},
+    ]
+    blocks = [{"cost_usd": 10.0, "sessions_touched": ["s1", "s2"]}]
+    rep = _synthetic_report(sessions, blocks=blocks)
+    res = sm._compute_usage_insights(rep)
+    par = _by_id(res, "parallel_sessions")
+    assert par["value"] == 100.0
+    assert par["shown"] is True
+
+
+def test_parallel_sessions_below_threshold_hidden():
+    """Single session, single block → 0% parallel, hidden."""
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": 1.0},
+                 "turns": [_synthetic_turn(cost=1.0)]}]
+    blocks = [{"cost_usd": 1.0, "sessions_touched": ["s1"]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions, blocks=blocks))
+    assert _by_id(res, "parallel_sessions")["shown"] is False
+
+
+def test_long_sessions_threshold_8h():
+    """One 9h session contributes 100% to long-session cost share."""
+    sessions = [{"session_id": "s1", "duration_seconds": 9 * 3600,
+                 "subtotal": {"cost": 10.0},
+                 "turns": [_synthetic_turn(cost=10.0)]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions))
+    long_i = _by_id(res, "long_sessions")
+    assert long_i["value"] == 100.0
+    assert long_i["shown"] is True
+
+
+def test_big_context_turns_only_counted_above_150k():
+    """Two turns, one with 200k context, one with 50k — only the big one counts."""
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": 2.0}, "turns": [
+        _synthetic_turn(cost=1.0, inp=200_000, cread=0, cwrite=0),
+        _synthetic_turn(cost=1.0, inp=50_000,  cread=0, cwrite=0),
+    ]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions))
+    bc = _by_id(res, "big_context_turns")
+    assert bc["value"] == 50.0  # 1 of 2 turns by cost
+    assert bc["shown"] is True
+
+
+def test_subagent_heavy_counts_task_tool_invocations():
+    """Session with 4 Task tool calls trips the 3+ threshold."""
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": 5.0}, "turns": [
+        _synthetic_turn(cost=1.25, tools=["Task"]),
+        _synthetic_turn(cost=1.25, tools=["Task", "Task"]),
+        _synthetic_turn(cost=1.25, tools=["Task"]),
+        _synthetic_turn(cost=1.25, tools=["Read"]),
+    ]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions))
+    sa = _by_id(res, "subagent_heavy")
+    assert sa["value"] == 100.0
+    assert sa["shown"] is True
+
+
+def test_top3_tools_min_calls_gate():
+    """Below the 10-call gate, the insight stays hidden even if math works."""
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": 1.0}, "turns": [
+        _synthetic_turn(cost=1.0, tools=["Read", "Bash", "Edit"]),
+    ]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions))
+    assert _by_id(res, "top3_tools")["shown"] is False
+
+
+def test_top3_tools_passes_when_volume_high():
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": 1.0}, "turns": [
+        _synthetic_turn(cost=0.1, tools=["Read"] * 5 + ["Bash"] * 5 + ["Edit"] * 2),
+    ]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions))
+    top3 = _by_id(res, "top3_tools")
+    assert top3["shown"] is True
+    assert top3["value"] == 100.0  # only 3 distinct tools
+
+
+def test_off_peak_calibration_heavy_off_peak():
+    """All turns at 03:00 local (UTC+10 → 17:00 UTC) → 100% off-peak, shown."""
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": 1.0}, "turns": [
+        _synthetic_turn(cost=0.5, ts="2026-04-01T17:00:00Z"),  # 03:00 local
+        _synthetic_turn(cost=0.5, ts="2026-04-02T17:00:00Z"),  # 03:00 local
+    ]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions, tz_offset_hours=10.0))
+    op = _by_id(res, "off_peak_share")
+    assert op["value"] == 100.0
+    assert op["shown"] is True
+
+
+def test_off_peak_calibration_office_hours_hidden():
+    """All turns at 13:00 local Mon — unremarkable, stays hidden."""
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": 1.0}, "turns": [
+        _synthetic_turn(cost=1.0, ts="2026-04-06T03:00:00Z"),  # Mon 13:00 +10
+    ]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions, tz_offset_hours=10.0))
+    assert _by_id(res, "off_peak_share")["shown"] is False
+
+
+def test_cost_concentration_min_turns_gate():
+    """Only 5 turns → top-5 = 100% trivially; gate hides this case."""
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": 1.0}, "turns": [
+        _synthetic_turn(cost=0.2) for _ in range(5)
+    ]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions))
+    assert _by_id(res, "cost_concentration")["shown"] is False
+
+
+def test_cost_concentration_shown_when_concentrated():
+    """20 turns, top-5 dominate 90% of cost → fires."""
+    turns = [_synthetic_turn(cost=1.0) for _ in range(5)] + \
+            [_synthetic_turn(cost=0.01) for _ in range(15)]
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": sum(t["cost_usd"] for t in turns)},
+                 "turns": turns}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions))
+    cc = _by_id(res, "cost_concentration")
+    assert cc["shown"] is True
+    assert cc["value"] > 90
+
+
+def test_model_mix_single_family_hidden():
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": 1.0}, "turns": [
+        _synthetic_turn(cost=1.0, model="claude-sonnet-4-7"),
+    ]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions))
+    assert _by_id(res, "model_mix")["shown"] is False
+
+
+def test_model_mix_multi_family_shown():
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": 2.0}, "turns": [
+        _synthetic_turn(cost=1.0, model="claude-opus-4-7"),
+        _synthetic_turn(cost=1.0, model="claude-sonnet-4-7"),
+    ]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions))
+    mm = _by_id(res, "model_mix")
+    assert mm["shown"] is True
+    assert "Opus" in mm["body"] or "Sonnet" in mm["body"]
+
+
+def test_session_pacing_requires_two_sessions():
+    sessions = [{"session_id": "s1", "duration_seconds": 600,
+                 "subtotal": {"cost": 1.0},
+                 "turns": [_synthetic_turn(cost=1.0)]}]
+    res = sm._compute_usage_insights(_synthetic_report(sessions))
+    assert _by_id(res, "session_pacing")["shown"] is False
+
+
+def test_session_duration_seconds_stamped_on_real_fixture():
+    """Regression guard for the new pre-computation in _build_report."""
+    rep = _mini_report()
+    for s in rep["sessions"]:
+        assert "duration_seconds" in s
+        assert isinstance(s["duration_seconds"], int)
+        assert s["duration_seconds"] >= 0
+
+
+def test_build_report_includes_usage_insights_key():
+    rep = _mini_report()
+    assert "usage_insights" in rep
+    assert isinstance(rep["usage_insights"], list)
+    for i in rep["usage_insights"]:
+        for key in ("id", "headline", "body", "value",
+                    "threshold", "shown", "always_on"):
+            assert key in i, f"insight missing key {key}: {i}"
+
+
+def test_html_dashboard_includes_panel_when_insights_present():
+    """Dashboard variant should render the panel when at least one insight is shown.
+    Uses the real fixture report and force-injects a heavy long_sessions
+    insight (the threshold-bearing kind that drives the above-fold slot)."""
+    rep = _mini_report()
+    # Stamp a long duration on one session so `long_sessions` definitely fires.
+    rep["sessions"][0]["duration_seconds"] = 12 * 3600
+    rep["usage_insights"] = sm._compute_usage_insights(rep)
+    html = sm.render_html(rep, variant="dashboard", chart_lib="none")
+    assert 'class="usage-insights"' in html
+    assert any(i["shown"] and not i.get("always_on") for i in rep["usage_insights"])
+
+
+def test_html_detail_excludes_panel():
+    """Detail variant must NOT render the panel — gated by include_insights."""
+    rep = _mini_report()
+    html = sm.render_html(rep, variant="detail", chart_lib="none")
+    assert 'class="usage-insights"' not in html
+
+
+def test_build_usage_insights_html_empty_returns_empty_string():
+    assert sm._build_usage_insights_html([]) == ""
+    assert sm._build_usage_insights_html([{"shown": False, "headline": "x",
+                                            "body": "y", "value": 0,
+                                            "always_on": False}]) == ""
+
+
+def test_build_usage_insights_html_single_insight_skips_accordion():
+    one = [{"id": "a", "shown": True, "headline": "100%",
+            "body": " of cost is in one bucket.", "value": 100.0,
+            "threshold": 1.0, "always_on": False}]
+    out = sm._build_usage_insights_html(one)
+    assert 'class="usage-insights"' in out
+    assert "<details>" not in out
+    assert "<strong>100%</strong>" in out
+
+
+def test_build_usage_insights_html_escapes_dynamic_strings():
+    """Belt-and-braces HTML escaping — guards against future regressions where
+    a tool/model name might carry an angle bracket (e.g. <synthetic>)."""
+    bad = [{"id": "a", "shown": True, "headline": "100%",
+            "body": " of cost from <script>alert(1)</script>.", "value": 100.0,
+            "threshold": 1.0, "always_on": False}]
+    out = sm._build_usage_insights_html(bad)
+    assert "<script>" not in out
+    assert "&lt;script&gt;" in out
+
+
+def test_build_usage_insights_md_empty_returns_empty_string():
+    assert sm._build_usage_insights_md([]) == ""
+
+
+def test_build_usage_insights_md_emits_section_header():
+    one = [{"id": "a", "shown": True, "headline": "100%",
+            "body": " of cost is in one bucket.", "value": 100.0,
+            "threshold": 1.0, "always_on": False}]
+    out = sm._build_usage_insights_md(one)
+    assert out.startswith("## Usage Insights")
+    assert "- **100%**" in out
