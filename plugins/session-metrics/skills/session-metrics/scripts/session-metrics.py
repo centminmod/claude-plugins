@@ -4315,13 +4315,20 @@ def _export_dir() -> Path:
 
 
 def _write_output(fmt: str, content: str, report: dict,
-                   suffix: str = "") -> Path:
+                   suffix: str = "",
+                   explicit_ts: str | None = None) -> Path:
     """Write ``content`` to an export file; ``suffix`` is appended before
-    the extension (e.g. ``"_dashboard"``, ``"_detail"``)."""
+    the extension (e.g. ``"_dashboard"``, ``"_detail"``).
+
+    ``explicit_ts`` overrides the default ``datetime.now(UTC)`` stamp in the
+    filename. Used by ``_emit_compare_run_extras`` so a bundle of companion
+    files (per-session dashboards + analysis.md) all share the same
+    timestamp and the Markdown href links resolve.
+    """
     out_dir = _export_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
     mode = report["mode"]
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = explicit_ts or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if mode == "project":
         stem = f"project_{ts}"
     elif mode == "compare":
@@ -4670,6 +4677,14 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Wall-clock timeout for each 'claude -p' subprocess "
                         "in --compare-run. Default 900s (15 min); the "
                         "tool-heavy prompt is the usual slowest.")
+    p.add_argument("--no-compare-run-extras", action="store_true",
+                   help="Skip the per-session HTML/JSON dashboards and the "
+                        "analysis.md companion that --compare-run normally "
+                        "emits alongside the compare report. Extras only fire "
+                        "when --compare-run is combined with --output (the "
+                        "text-only stdout path stays file-free regardless). "
+                        "Use this flag to restore the pre-v1.7.0 minimal "
+                        "single-artefact output.")
     return p
 
 
@@ -4802,6 +4817,7 @@ def main() -> None:
             pair_by=args.pair_by,
             min_turns=args.compare_min_turns,
             allow_suite_mismatch=args.allow_suite_mismatch,
+            compare_run_extras=not args.no_compare_run_extras,
         )
         return
 

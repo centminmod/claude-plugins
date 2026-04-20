@@ -2796,7 +2796,7 @@ def _run_compare(
     prompt_suite_dir: Path | None = None,
     allow_suite_mismatch: bool = False,
     redact_user_prompts: bool = False,
-) -> None:
+) -> dict | None:
     """Entrypoint the CLI calls after argument parsing.
 
     Resolves both ``--compare`` args to JSONL paths, enforces scope
@@ -2807,6 +2807,14 @@ def _run_compare(
 
     ``assume_yes`` skips the Mode-2 aggregate confirmation gate. Mode 1
     never prompts.
+
+    Returns the compare report dict (same object passed to
+    ``_dispatch``) so callers can feed downstream artefact generators
+    — e.g. ``_emit_compare_run_extras`` which renders per-session
+    dashboards and the companion analysis.md. Existing CLI callers
+    that discard the return value are unaffected. ``None`` is returned
+    on early-exit arg-error paths that terminate with ``sys.exit``;
+    normal code paths always return a dict.
     """
     m = _main()
     formats = formats or []
@@ -2862,7 +2870,7 @@ def _run_compare(
         m._dispatch(report, formats, single_page=single_page,
                     chart_lib=chart_lib,
                     redact_user_prompts=redact_user_prompts)
-        return
+        return report
 
     # compare_mode == "controlled" — Mode 1
     a_sid, a_turns, a_user_ts = side_a_sessions[0]
@@ -2906,6 +2914,7 @@ def _run_compare(
     m._dispatch(report, formats, single_page=single_page,
                 chart_lib=chart_lib,
                 redact_user_prompts=redact_user_prompts)
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -3622,6 +3631,7 @@ def _run_compare_run(
     progress_out=None,
     tempfile_mkdtemp=None,
     auto_resume: bool = True,
+    compare_run_extras: bool = True,
 ) -> dict:
     """Orchestrator for ``--compare-run``: capture both sides, then compare.
 
@@ -3734,8 +3744,9 @@ def _run_compare_run(
         f"(A={side_uuids['A']}, B={side_uuids['B']}) ===",
         file=progress_out,
     )
+    extras_paths: dict | None = None
     if auto_resume:
-        _run_compare(
+        compare_report = _run_compare(
             side_uuids["A"], side_uuids["B"],
             slug=slug,
             pair_by=pair_by,
@@ -3753,11 +3764,826 @@ def _run_compare_run(
             allow_suite_mismatch=allow_suite_mismatch,
             redact_user_prompts=redact_user_prompts,
         )
+        # Extras: per-session dashboards + analysis.md scaffold. Gated on
+        # (1) compare_run_extras (--no-compare-run-extras opts out),
+        # (2) formats (no user-requested file outputs → stay text-only),
+        # (3) compare_report is not None (defensive; _run_compare may
+        # short-circuit on the no-overlap path before building a report).
+        if compare_run_extras and formats and compare_report is not None:
+            try:
+                extras_paths = _emit_compare_run_extras(
+                    compare_report,
+                    side_uuids["A"],
+                    side_uuids["B"],
+                    slug,
+                    formats=formats,
+                    single_page=single_page,
+                    chart_lib=chart_lib,
+                    tz_offset=tz_offset,
+                    tz_label=tz_label,
+                    include_subagents=include_subagents,
+                    use_cache=use_cache,
+                    progress_out=progress_out,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Never fail the whole compare-run because extras emission
+                # hiccupped — the primary compare report already landed.
+                print(
+                    f"[warn] compare-run extras emission failed: {exc}",
+                    file=sys.stderr,
+                )
 
-    return {
+    result = {
         "scratch_dir": str(scratch_dir),
         "slug": slug,
         "side_a_session_id": side_uuids["A"],
         "side_b_session_id": side_uuids["B"],
         "suite_prompt_count": len(suite),
     }
+    if extras_paths is not None:
+        result["extras"] = extras_paths
+    return result
+
+
+# ---------------------------------------------------------------------------
+# --compare-run extras (Phase 8): per-session dashboards + analysis.md
+# ---------------------------------------------------------------------------
+#
+# After every ``compare-run``, users were running the same three follow-up
+# steps by hand: find the two captured JSONLs, render each side's dashboard
+# through the single-session entrypoint, and draft a Substack-style analysis
+# article over the numbers. The deterministic 80% of that workflow lives
+# here; the prose 20% stays as ``{{TODO}}`` placeholders the user can fill
+# in a follow-up turn.
+#
+# The extras are opt-in at the CLI level only via ``--no-compare-run-extras``
+# — when ``compare-run`` is invoked with ``--output`` and without that flag,
+# the 5 companion artefacts land alongside the compare report automatically.
+
+
+def _decision_framework_verdict(
+    cost_ratio: float | None,
+    ifeval_delta_pp: float | None,
+) -> dict:
+    """Map (cost_ratio, IFEval Δ pp) to a decision-framework verdict.
+
+    Mirror of the table in
+    ``references/model-compare.md:421-429``. Threshold drift between
+    this table and the docs is a bug — if you bump thresholds here,
+    bump the doc row and vice versa. ``analysis.md`` re-prints the
+    doc table alongside the verdict row so readers can audit the
+    match.
+
+    Returns ``{"bucket": <slug>, "verdict": <sentence>,
+    "explanation": <short reason>}``. ``bucket`` is stable for
+    diffing tests / tooling. ``no-ratio`` covers the edge case
+    where side A had zero cost (division-by-zero); ``no-ifeval``
+    covers observational compares and aborted suite runs where no
+    predicates fired.
+    """
+    if cost_ratio is None:
+        return {
+            "bucket": "no-ratio",
+            "verdict": "cannot auto-classify",
+            "explanation": (
+                "side A has no billable cost so no ratio is defined; "
+                "inspect the raw totals manually"
+            ),
+        }
+
+    if ifeval_delta_pp is None:
+        # Cost-only verdicts still reveal the cheapest-of-the-two
+        # rows (≤1.05× "Switch") and the most-expensive row (≥1.45×
+        # "Stay"). Anything in between is a workload-dependent
+        # judgment that needs IFEval data to resolve.
+        if cost_ratio <= 1.05:
+            return {
+                "bucket": "no-ifeval-cheap",
+                "verdict": "switch — minimal cost impact",
+                "explanation": (
+                    "cost ratio ≤1.05× means the newer model is "
+                    "essentially free to adopt regardless of quality "
+                    "delta; no IFEval data needed"
+                ),
+            }
+        if cost_ratio >= 1.45:
+            return {
+                "bucket": "no-ifeval-expensive",
+                "verdict": "stay, or use selectively",
+                "explanation": (
+                    "cost ratio ≥1.45× means the newer model is a "
+                    "material spend increase; without IFEval data "
+                    "there is no case for a blanket switch"
+                ),
+            }
+        return {
+            "bucket": "no-ifeval",
+            "verdict": "cannot auto-classify",
+            "explanation": (
+                "this compare has no IFEval predicate results "
+                "(observational or non-suite capture); the 1.05×–1.45× "
+                "cost band is workload-dependent and needs a quality "
+                "signal to resolve"
+            ),
+        }
+
+    # Controlled compare with IFEval data — map against the full 5-row
+    # table. Each predicate is written as a strict boundary that matches
+    # the doc wording ("+5 pp or more", "±2 pp", "+10 pp or more").
+    if cost_ratio <= 1.05:
+        return {
+            "bucket": "cheap",
+            "verdict": "switch — minimal cost impact",
+            "explanation": (
+                f"cost ratio {cost_ratio:.2f}× is within noise; quality "
+                f"delta ({ifeval_delta_pp:+.1f} pp) is not load-bearing"
+            ),
+        }
+    if 1.05 < cost_ratio <= 1.20:
+        if ifeval_delta_pp >= 5.0:
+            return {
+                "bucket": "mid-quality-win",
+                "verdict": "switch if quality matters",
+                "explanation": (
+                    f"cost ratio {cost_ratio:.2f}× is a moderate premium "
+                    f"offset by a +{ifeval_delta_pp:.1f} pp quality lift "
+                    f"— worth it when the workload rewards compliance"
+                ),
+            }
+        if abs(ifeval_delta_pp) <= 2.0:
+            return {
+                "bucket": "mid-flat",
+                "verdict": "workload-dependent — test with your own content",
+                "explanation": (
+                    f"cost ratio {cost_ratio:.2f}× with a flat quality "
+                    f"delta ({ifeval_delta_pp:+.1f} pp) is suite-agnostic; "
+                    f"the canonical suite doesn't resolve this band"
+                ),
+            }
+        # Between ±2 and +5 pp — the doc table doesn't list this cell
+        # explicitly. Fall through to workload-dependent with a
+        # gap-acknowledgement explanation.
+        return {
+            "bucket": "mid-gap",
+            "verdict": "workload-dependent",
+            "explanation": (
+                f"cost ratio {cost_ratio:.2f}× with quality delta "
+                f"{ifeval_delta_pp:+.1f} pp falls between the table's "
+                f"±2 pp row and +5 pp row; lean on workload evidence"
+            ),
+        }
+    if 1.20 < cost_ratio <= 1.45:
+        if ifeval_delta_pp >= 10.0:
+            return {
+                "bucket": "expensive-big-quality",
+                "verdict": "trade-off call — model your spend at the new ratio",
+                "explanation": (
+                    f"cost ratio {cost_ratio:.2f}× is a substantial "
+                    f"premium, but +{ifeval_delta_pp:.1f} pp IFEval "
+                    f"gain is large enough to rationalise on "
+                    f"quality-sensitive workloads"
+                ),
+            }
+        return {
+            "bucket": "expensive-gap",
+            "verdict": "workload-dependent — quality lift doesn't clearly pay for the cost",
+            "explanation": (
+                f"cost ratio {cost_ratio:.2f}× with quality delta "
+                f"{ifeval_delta_pp:+.1f} pp sits below the +10 pp "
+                f"threshold the doc table flags as a trade-off call"
+            ),
+        }
+    # cost_ratio > 1.45
+    return {
+        "bucket": "very-expensive",
+        "verdict": "stay, or use the newer model selectively",
+        "explanation": (
+            f"cost ratio {cost_ratio:.2f}× is prohibitive for a blanket "
+            f"switch regardless of quality delta ({ifeval_delta_pp:+.1f} "
+            f"pp); prefer selective use (e.g. code review only)"
+        ),
+    }
+
+
+def _analysis_link(href: str | None, label: str) -> str:
+    """Render an analysis.md link cell — em-dash when href is missing."""
+    if not href:
+        return f"_{label} not available_"
+    return f"[{label}]({href})"
+
+
+def _analysis_fmt_ratio_cell(value: float | None, precision: int = 2) -> str:
+    """Ratio cell — defers to the existing formatter, just a shorter alias."""
+    return _fmt_ratio(value, precision=precision)
+
+
+def _analysis_fmt_pp_cell(value: float | None, precision: int = 1) -> str:
+    """Percentage-point delta cell that tolerates None."""
+    if value is None:
+        return "n/a"
+    return _fmt_delta_pp(value, precision=precision)
+
+
+def _analysis_fmt_cost_delta_abs(a_cost: float, b_cost: float) -> str:
+    """Absolute cost delta in USD (B − A) with sign."""
+    delta = b_cost - a_cost
+    sign = "+" if delta >= 0 else ""
+    return f"{sign}${delta:.4f}"
+
+
+def _analysis_first_turn_cache_write(session_report: dict) -> int:
+    """First turn's cache-write tokens (system-prompt encoding proxy)."""
+    sessions = session_report.get("sessions") or []
+    if not sessions:
+        return 0
+    turns = sessions[0].get("turns") or []
+    if not turns:
+        return 0
+    return int(turns[0].get("cache_write_tokens", 0) or 0)
+
+
+def _render_compare_analysis_md(
+    compare_report: dict,
+    session_a_report: dict,
+    session_b_report: dict,
+    links: dict,
+) -> str:
+    """Render the Substack-style compare analysis Markdown scaffold.
+
+    The ~80% deterministic part is generated here from the compare
+    report + per-session reports; the prose ~20% stays as
+    ``{{TODO}}`` placeholders the author fills in a follow-up turn.
+
+    ``links`` carries relative hrefs to the compare HTML, per-session
+    dashboards/detail pages, and per-session JSONs that live in the
+    same ``exports/session-metrics/`` directory. Missing keys fall
+    through to a polite "not available" cell so an ``--output md``
+    run (no HTML emitted) still produces a valid article.
+
+    Section layout (13 sections):
+
+    1. Title + subtitle with ``{{TODO}}`` hooks
+    2. TL;DR auto headline ratios + decision verdict
+    3. Methodology — models, sessions, suite version, prompt list
+    4. The numbers — per-session totals side-by-side + per-prompt table
+    5. Where does the cost come from? — cache-write / cache-read /
+       output / user-prompt-input decomposition
+    6. Extended thinking usage — counts per side + ``{{TODO}}``
+    7. Advisories — auto bullet list
+    8. Should I switch? — embedded decision table + bolded row
+    9. Caveats — boilerplate port of five items from
+       ``model-compare.md``
+    10. Reproduce it yourself — the ``compare-run`` command + manual
+        fallback note
+    11. Links — relative hrefs to the 6 artefacts + upstream repo
+    12. Footer — run timestamp + skill-version pointer
+    """
+    out = io.StringIO()
+
+    def p(*args, **kw):
+        print(*args, **kw, file=out)
+
+    a = compare_report.get("side_a") or {}
+    b = compare_report.get("side_b") or {}
+    s = compare_report.get("summary") or {}
+    paired = compare_report.get("paired") or []
+    advisories = compare_report.get("advisories") or []
+
+    a_model = a.get("dominant_model_id") or "side-A model"
+    b_model = b.get("dominant_model_id") or "side-B model"
+    a_family = a.get("model_family") or a_model
+    b_family = b.get("model_family") or b_model
+    a_totals = a.get("totals") or {}
+    b_totals = b.get("totals") or {}
+
+    a_session_totals = session_a_report.get("totals") or a_totals
+    b_session_totals = session_b_report.get("totals") or b_totals
+
+    cost_ratio = s.get("cost_ratio")
+    ifeval_delta = s.get("instruction_pass_delta_pp")
+    input_ratio = s.get("input_tokens_ratio")
+    output_ratio = s.get("output_tokens_ratio")
+    total_ratio = s.get("total_tokens_ratio")
+
+    verdict = _decision_framework_verdict(cost_ratio, ifeval_delta)
+
+    # ---- 1. Title + subtitle ---------------------------------------------
+    p(f"# {{{{TODO: one-line hook — e.g. \"I ran {b_family} against "
+      f"{a_family} on {len(paired)} prompts. It cost "
+      f"{_analysis_fmt_ratio_cell(cost_ratio)} more for "
+      f"{_analysis_fmt_pp_cell(ifeval_delta)} of IFEval compliance.\"}}}}")
+    p()
+    p(f"_{{{{TODO: one-sentence framing — e.g. \"The ratio held across "
+      f"{len(paired)} canonical prompts. Here's where the cost came "
+      f"from and when it's worth paying.\"}}}}_")
+    p()
+
+    # ---- 2. TL;DR --------------------------------------------------------
+    p("## TL;DR")
+    p()
+    p(f"- **Cost ratio ({b_family} ÷ {a_family}):** "
+      f"{_analysis_fmt_ratio_cell(cost_ratio)}  "
+      f"(Δ absolute: {_analysis_fmt_cost_delta_abs(a_totals.get('cost', 0.0) or 0.0, b_totals.get('cost', 0.0) or 0.0)})")
+    p(f"- **Input-token ratio:** {_analysis_fmt_ratio_cell(input_ratio)}")
+    p(f"- **Output-token ratio:** {_analysis_fmt_ratio_cell(output_ratio)}")
+    p(f"- **Total-token ratio:** {_analysis_fmt_ratio_cell(total_ratio)}")
+    if s.get("instruction_evaluated"):
+        rate_a = s.get("instruction_pass_rate_a") or 0
+        rate_b = s.get("instruction_pass_rate_b") or 0
+        p(f"- **IFEval pass rate:** "
+          f"A {rate_a * 100:.0f}% "
+          f"({s.get('instruction_pass_a', 0)}/{s['instruction_evaluated']}), "
+          f"B {rate_b * 100:.0f}% "
+          f"({s.get('instruction_pass_b', 0)}/{s['instruction_evaluated']}) — "
+          f"Δ {_analysis_fmt_pp_cell(ifeval_delta)}")
+    else:
+        p("- **IFEval pass rate:** not evaluated (no suite predicates fired)")
+    p(f"- **Decision-framework verdict:** **{verdict['verdict']}** — "
+      f"{verdict['explanation']}")
+    p()
+    p(f"{{{{TODO: 2–3 sentences of framing — the headline "
+      f"ratio in plain English, the workload-specific "
+      f"caveat, and why a reader should read past the TL;DR.}}}}")
+    p()
+
+    # ---- 3. Methodology --------------------------------------------------
+    p("## Methodology")
+    p()
+    a_sid = a.get("session_id") or ""
+    b_sid = b.get("session_id") or ""
+    p(f"- **Side A:** `{a_model}` — session `{a_sid}`")
+    p(f"- **Side B:** `{b_model}` — session `{b_sid}`")
+    p(f"- **Pair-by:** `{compare_report.get('pair_by', 'fingerprint')}`")
+    p(f"- **Compare mode:** `{compare_report.get('compare_mode', 'controlled')}`")
+    p(f"- **Slug:** `{compare_report.get('slug', '')}`")
+    a_first = a.get("first_ts_fmt") or a.get("first_ts") or ""
+    a_last = a.get("last_ts_fmt") or a.get("last_ts") or ""
+    b_first = b.get("first_ts_fmt") or b.get("first_ts") or ""
+    b_last = b.get("last_ts_fmt") or b.get("last_ts") or ""
+    p(f"- **Side A window:** {a_first} → {a_last}")
+    p(f"- **Side B window:** {b_first} → {b_last}")
+    p(f"- **Paired turns:** {s.get('paired_count', len(paired))} "
+      f"(unmatched A={s.get('unmatched_a_count', 0)}, "
+      f"B={s.get('unmatched_b_count', 0)})")
+    if paired:
+        p()
+        p("**Prompts exercised** (in pairing order):")
+        p()
+        for i, row in enumerate(paired, 1):
+            name = row.get("suite_prompt_name") or "_non-suite prompt_"
+            p(f"{i}. `{name}`")
+    p()
+
+    # ---- 4. The numbers --------------------------------------------------
+    p("## The numbers")
+    p()
+    p(f"### Per-session totals")
+    p()
+    p("| Metric | Side A | Side B | Ratio (B ÷ A) |")
+    p("|--------|-------:|-------:|--------------:|")
+    p(f"| Input tokens (net new) | "
+      f"{a_session_totals.get('input', a_totals.get('input', 0)):,} | "
+      f"{b_session_totals.get('input', b_totals.get('input', 0)):,} | "
+      f"{_analysis_fmt_ratio_cell(input_ratio)} |")
+    p(f"| Output tokens | "
+      f"{a_session_totals.get('output', a_totals.get('output', 0)):,} | "
+      f"{b_session_totals.get('output', b_totals.get('output', 0)):,} | "
+      f"{_analysis_fmt_ratio_cell(output_ratio)} |")
+    p(f"| Cache reads | "
+      f"{a_session_totals.get('cache_read', a_totals.get('cache_read', 0)):,} | "
+      f"{b_session_totals.get('cache_read', b_totals.get('cache_read', 0)):,} | "
+      f"{_analysis_fmt_ratio_cell(_safe_ratio(b_session_totals.get('cache_read', b_totals.get('cache_read', 0)), a_session_totals.get('cache_read', a_totals.get('cache_read', 0))))} |")
+    p(f"| Cache writes | "
+      f"{a_session_totals.get('cache_write', a_totals.get('cache_write', 0)):,} | "
+      f"{b_session_totals.get('cache_write', b_totals.get('cache_write', 0)):,} | "
+      f"{_analysis_fmt_ratio_cell(_safe_ratio(b_session_totals.get('cache_write', b_totals.get('cache_write', 0)), a_session_totals.get('cache_write', a_totals.get('cache_write', 0))))} |")
+    p(f"| Total billable tokens | "
+      f"{a_session_totals.get('total', a_totals.get('total', 0)):,} | "
+      f"{b_session_totals.get('total', b_totals.get('total', 0)):,} | "
+      f"{_analysis_fmt_ratio_cell(total_ratio)} |")
+    p(f"| Cost (USD) | "
+      f"${a_session_totals.get('cost', a_totals.get('cost', 0.0)):.4f} | "
+      f"${b_session_totals.get('cost', b_totals.get('cost', 0.0)):.4f} | "
+      f"{_analysis_fmt_ratio_cell(cost_ratio)} |")
+    thinking_a = a_session_totals.get("thinking_turn_count", 0)
+    thinking_b = b_session_totals.get("thinking_turn_count", 0)
+    p(f"| Turns with thinking blocks | {thinking_a} | {thinking_b} | — |")
+    tool_a = a_session_totals.get("tool_call_total", 0)
+    tool_b = b_session_totals.get("tool_call_total", 0)
+    p(f"| Tool-call total | {tool_a} | {tool_b} | — |")
+    p()
+
+    if paired:
+        has_instruction = any(
+            row.get("instruction_pass_a") is not None
+            or row.get("instruction_pass_b") is not None
+            for row in paired
+        )
+        p("### Per-prompt breakdown")
+        p()
+        if has_instruction:
+            p("| # | Prompt | A in | B in | Δ in | A out | B out | Δ out | "
+              "A cost | B cost | Δ cost | A✓ | B✓ |")
+            p("|--:|--------|-----:|-----:|-----:|------:|------:|------:|"
+              "-------:|-------:|-------:|:--:|:--:|")
+        else:
+            p("| # | Prompt | A in | B in | Δ in | A out | B out | Δ out | "
+              "A cost | B cost | Δ cost |")
+            p("|--:|--------|-----:|-----:|-----:|------:|------:|------:|"
+              "-------:|-------:|-------:|")
+        for i, row in enumerate(paired, 1):
+            ar = row.get("a") or {}
+            br = row.get("b") or {}
+            r = row.get("ratios") or {}
+            name = row.get("suite_prompt_name") or "—"
+            tail = ""
+            if has_instruction:
+                tail = (
+                    f" {_fmt_pass(row.get('instruction_pass_a'))} | "
+                    f"{_fmt_pass(row.get('instruction_pass_b'))} |"
+                )
+            p(f"| {i} | `{name}` | "
+              f"{ar.get('input_tokens', 0):,} | "
+              f"{br.get('input_tokens', 0):,} | "
+              f"{_analysis_fmt_ratio_cell(r.get('input_tokens'))} | "
+              f"{ar.get('output_tokens', 0):,} | "
+              f"{br.get('output_tokens', 0):,} | "
+              f"{_analysis_fmt_ratio_cell(r.get('output_tokens'))} | "
+              f"${ar.get('cost_usd', 0.0):.4f} | "
+              f"${br.get('cost_usd', 0.0):.4f} | "
+              f"{_analysis_fmt_ratio_cell(r.get('cost_usd'))} |{tail}")
+        p()
+
+    # ---- 5. Where does the cost come from? -------------------------------
+    p("## Where does the cost come from?")
+    p()
+    p(f"{{{{TODO: prose — explain which token bucket drove the "
+      f"cost delta. The decomposition table below shows the raw "
+      f"split; the prose connects it to the workload.}}}}")
+    p()
+    a_first_cw = _analysis_first_turn_cache_write(session_a_report)
+    b_first_cw = _analysis_first_turn_cache_write(session_b_report)
+    a_cache_read = a_session_totals.get("cache_read",
+                                        a_totals.get("cache_read", 0))
+    b_cache_read = b_session_totals.get("cache_read",
+                                        b_totals.get("cache_read", 0))
+    a_output = a_session_totals.get("output", a_totals.get("output", 0))
+    b_output = b_session_totals.get("output", b_totals.get("output", 0))
+    a_input = a_session_totals.get("input", a_totals.get("input", 0))
+    b_input = b_session_totals.get("input", b_totals.get("input", 0))
+    p("| Component | Side A | Side B | Ratio (B ÷ A) |")
+    p("|-----------|-------:|-------:|--------------:|")
+    p(f"| First-turn cache write (system-prompt encoding) | "
+      f"{a_first_cw:,} | {b_first_cw:,} | "
+      f"{_analysis_fmt_ratio_cell(_safe_ratio(b_first_cw, a_first_cw))} |")
+    p(f"| Cumulative cache reads | "
+      f"{a_cache_read:,} | {b_cache_read:,} | "
+      f"{_analysis_fmt_ratio_cell(_safe_ratio(b_cache_read, a_cache_read))} |")
+    p(f"| Output tokens | "
+      f"{a_output:,} | {b_output:,} | "
+      f"{_analysis_fmt_ratio_cell(_safe_ratio(b_output, a_output))} |")
+    p(f"| User-prompt input (uncached) | "
+      f"{a_input:,} | {b_input:,} | "
+      f"{_analysis_fmt_ratio_cell(_safe_ratio(b_input, a_input))} |")
+    p()
+
+    # ---- 6. Extended thinking usage -------------------------------------
+    p("## Extended thinking usage")
+    p()
+    a_turns = a.get("turn_count", 0) or 0
+    b_turns = b.get("turn_count", 0) or 0
+    p(f"- Side A: {thinking_a} of {a_turns} turn(s) carried at least one "
+      f"`thinking` block.")
+    p(f"- Side B: {thinking_b} of {b_turns} turn(s) carried at least one "
+      f"`thinking` block.")
+    p()
+    p(f"{{{{TODO: interpretation — extended thinking is billed at the "
+      f"output rate. Did one side use it more than the other? Was the "
+      f"compliance delta (if any) visible specifically on the thinking "
+      f"turns?}}}}")
+    p()
+
+    # ---- 7. Advisories ---------------------------------------------------
+    if advisories:
+        p("## Advisories raised by the compare report")
+        p()
+        for adv in advisories:
+            tag = "⚠️" if adv.get("severity") == "warn" else "ℹ️"
+            p(f"- {tag} **{adv.get('kind', 'advisory')}:** "
+              f"{adv.get('message', '')}")
+        p()
+
+    # ---- 8. Should I switch? --------------------------------------------
+    p("## Should I switch?")
+    p()
+    p("The canonical decision framework from "
+      "`references/model-compare.md`:")
+    p()
+    p("| Cost ratio | IFEval Δ | Recommendation |")
+    p("|------------|----------|----------------|")
+    rows = [
+        ("cheap",
+         "≤ 1.05×", "any", "Switch. Minimal cost impact."),
+        ("mid-quality-win",
+         "1.05–1.20×", "+5 pp or more", "Switch if quality matters."),
+        ("mid-flat",
+         "1.05–1.20×", "±2 pp",
+         "Suite-agnostic — depends on workload. Test with your own content."),
+        ("expensive-big-quality",
+         "1.20–1.45×", "+10 pp or more",
+         "Trade-off call. Model your spend at the new ratio."),
+        ("very-expensive",
+         "≥ 1.45×", "any",
+         "Stay, or use the newer model selectively (e.g. code review only)."),
+    ]
+    for bucket, cost_col, if_col, rec in rows:
+        bold_open = "**" if bucket == verdict["bucket"] else ""
+        bold_close = "**" if bucket == verdict["bucket"] else ""
+        p(f"| {bold_open}{cost_col}{bold_close} | "
+          f"{bold_open}{if_col}{bold_close} | "
+          f"{bold_open}{rec}{bold_close} |")
+    p()
+    p(f"_Matched bucket:_ `{verdict['bucket']}` — {verdict['explanation']}")
+    p()
+    p(f"{{{{TODO: workload-specific interpretation — is your actual "
+      f"workload closer to the suite's content shape, or skewed? "
+      f"Does the decision row above hold once you factor in the "
+      f"content mix you actually run?}}}}")
+    p()
+
+    # ---- 9. Caveats ------------------------------------------------------
+    p("## Methodology caveats")
+    p()
+    p("- **Single-run variance.** Each prompt runs once per side. "
+      "One-off captures can swing ±10% on tokenizer ratios. "
+      "Multi-trial support is on the roadmap.")
+    p("- **Cache warmth.** Running side B immediately after side A "
+      "means B's CLAUDE.md cache is in a different state than A's "
+      "was on its first turn. The report's `cache-share-drift` "
+      "advisory fires when the two sides' cache-read share differs "
+      "by >10 pp — read the cache column skeptically when it does.")
+    p("- **Context-tier confound.** Claude Code's default Opus 4.7 "
+      "arrives tagged `claude-opus-4-7[1m]`. When one side runs on "
+      "the default tier and the other on `[1m]`, ratios conflate "
+      "tokenizer + window tier + cache-hit-rate.")
+    p("- **System-prompt drift.** Claude Code's system prompt "
+      "evolves over time. Captures weeks or months apart can drift "
+      "for that reason alone.")
+    p("- **Prompt-suite representativeness.** The canonical 10 "
+      "prompts cover the content shapes the upstream tokenizer "
+      "article measured. Your real workload may be skewed — add "
+      "prompts to the suite and re-run if so.")
+    p()
+
+    # ---- 10. Reproduce it yourself --------------------------------------
+    p("## Reproduce it yourself")
+    p()
+    p("From any project root:")
+    p()
+    p("```bash")
+    p(f"session-metrics --compare-run {a_family} {b_family} \\")
+    p("    --output html")
+    p("```")
+    p()
+    p("That spawns two `claude -p` subprocesses, feeds each side the "
+      "canonical 10-prompt suite, and emits the compare HTML plus "
+      "the per-session dashboards and this analysis scaffold. Pass "
+      "`--no-compare-run-extras` to skip the per-session dashboards "
+      "and this file (the minimal pre-v1.7.0 output).")
+    p()
+    p("If `claude -p` isn't available on your machine "
+      "(e.g. a CI container without the CLI), fall back to "
+      "`session-metrics --compare-prep` to print the manual capture "
+      "protocol, then re-run `session-metrics --compare <A> <B>` "
+      "against the resulting JSONLs. An API-only smoke test is "
+      "`session-metrics --count-tokens-only --compare-models <A> <B>` "
+      "— it measures input tokens but not output or cost.")
+    p()
+
+    # ---- 11. Links -------------------------------------------------------
+    p("## Links")
+    p()
+    p(f"- {_analysis_link(links.get('compare_html'), 'Compare report (HTML)')}")
+    p(f"- {_analysis_link(links.get('side_a_dashboard'), 'Side A dashboard')}  ·  "
+      f"{_analysis_link(links.get('side_a_detail'), 'detail')}  ·  "
+      f"{_analysis_link(links.get('side_a_json'), 'JSON')}")
+    p(f"- {_analysis_link(links.get('side_b_dashboard'), 'Side B dashboard')}  ·  "
+      f"{_analysis_link(links.get('side_b_detail'), 'detail')}  ·  "
+      f"{_analysis_link(links.get('side_b_json'), 'JSON')}")
+    p("- [session-metrics skill](https://github.com/centminmod/claude-plugins)")
+    p()
+
+    # ---- 12. Footer ------------------------------------------------------
+    p(f"_Generated by session-metrics · "
+      f"{compare_report.get('generated_at', '')} · "
+      f"see marketplace listing for plugin version._")
+
+    return out.getvalue()
+
+
+def _emit_compare_run_extras(
+    compare_report: dict,
+    side_a_uuid: str,
+    side_b_uuid: str,
+    slug: str,
+    *,
+    formats: list[str],
+    single_page: bool,
+    chart_lib: str,
+    tz_offset: float,
+    tz_label: str,
+    include_subagents: bool,
+    use_cache: bool,
+    progress_out=None,
+) -> dict:
+    """Emit the 5 per-session + analysis.md companion artefacts.
+
+    Fires from ``_run_compare_run`` only when
+    ``auto_resume and compare_run_extras and formats`` — i.e. the
+    user is already opting into file output via ``--output`` and has
+    not flipped the opt-out flag.
+
+    Design choices encoded here:
+
+    - **Shared timestamp.** All 5 (or more) written files share the
+      single ``export_ts`` computed at the top of this function so
+      the analysis.md's relative hrefs resolve to the sibling files
+      regardless of how long the renders take in wall-clock time.
+    - **Inline render loop.** We bypass the main module's
+      ``_dispatch()`` because (a) it computes its own
+      ``datetime.now()`` for the HTML 2-page split, losing the
+      shared timestamp, and (b) it always prints ``render_text`` to
+      stdout — for the per-session extras we don't want to dump
+      side-A's timeline and then side-B's timeline over the user's
+      terminal (they already saw the compare text output).
+    - **Format fidelity.** Per-side renders honour the caller's
+      requested formats (html / json / md / csv) — including the
+      dashboard+detail split when ``single_page`` is False and
+      ``html`` is requested. Analysis.md is always emitted
+      regardless of format set, because it's the companion article,
+      not a primary render.
+    - **Defensive empty-side handling.** If a side's JSONL is
+      missing (rare — only happens if Claude Code wrote to an
+      unexpected path), that side's per-session exports are
+      skipped with a warning and the analysis.md still renders
+      using the side-info from the compare report.
+
+    Returns a diagnostic dict of written paths keyed by
+    ``{"side_a": {fmt: path}, "side_b": {fmt: path},
+    "analysis_md": path}`` — used by tests.
+    """
+    m = _main()
+    if progress_out is None:
+        progress_out = sys.stderr
+
+    export_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    projects_dir = m._projects_dir()
+    side_a_jsonl = projects_dir / slug / f"{side_a_uuid}.jsonl"
+    side_b_jsonl = projects_dir / slug / f"{side_b_uuid}.jsonl"
+
+    diagnostic: dict = {"side_a": {}, "side_b": {}, "analysis_md": None}
+    session_reports: dict[str, dict] = {}
+
+    for side_label, uuid, jsonl_path in (
+        ("A", side_a_uuid, side_a_jsonl),
+        ("B", side_b_uuid, side_b_jsonl),
+    ):
+        side_key = f"side_{side_label.lower()}"
+        if not jsonl_path.exists():
+            print(
+                f"[warn] compare-run extras: side {side_label} JSONL not "
+                f"found at {jsonl_path}; skipping per-session exports for "
+                f"this side",
+                file=progress_out,
+            )
+            continue
+        try:
+            session_id, turns, user_ts = m._load_session(
+                jsonl_path, include_subagents, use_cache=use_cache,
+            )
+        except OSError as exc:
+            print(
+                f"[warn] compare-run extras: failed to load side "
+                f"{side_label} JSONL ({exc}); skipping per-session exports",
+                file=progress_out,
+            )
+            continue
+        if not turns:
+            print(
+                f"[warn] compare-run extras: side {side_label} has no "
+                f"assistant turns with usage data; skipping per-session "
+                f"exports for this side",
+                file=progress_out,
+            )
+            continue
+
+        report = m._build_report(
+            "session", slug, [(session_id, turns, user_ts)],
+            tz_offset_hours=tz_offset, tz_label=tz_label, peak=None,
+            # Suppress the model-compare insight card on per-session
+            # dashboards emitted from compare-run — the compare report
+            # itself is the authoritative signal; duplicating the
+            # advisory on each side is noise.
+            suppress_model_compare_insight=True,
+        )
+        session_reports[side_key] = report
+
+        for fmt in formats:
+            if fmt == "text":
+                continue
+            if fmt == "html" and not single_page:
+                sid8 = session_id[:8]
+                dash_name = f"session_{sid8}_{export_ts}_dashboard.html"
+                det_name = f"session_{sid8}_{export_ts}_detail.html"
+                dash = m.render_html(report, variant="dashboard",
+                                     nav_sibling=det_name,
+                                     chart_lib=chart_lib)
+                det = m.render_html(report, variant="detail",
+                                    nav_sibling=dash_name,
+                                    chart_lib=chart_lib)
+                out_dir = m._export_dir()
+                out_dir.mkdir(parents=True, exist_ok=True)
+                dash_path = out_dir / dash_name
+                det_path = out_dir / det_name
+                dash_path.write_text(dash, encoding="utf-8")
+                det_path.write_text(det, encoding="utf-8")
+                diagnostic[side_key]["html_dashboard"] = dash_path
+                diagnostic[side_key]["html_detail"] = det_path
+                print(
+                    f"[export] side {side_label} HTML (dashboard) → "
+                    f"{dash_path}",
+                    file=progress_out,
+                )
+                print(
+                    f"[export] side {side_label} HTML (detail)    → "
+                    f"{det_path}",
+                    file=progress_out,
+                )
+                continue
+            if fmt == "html":
+                content = m.render_html(report, variant="single",
+                                        chart_lib=chart_lib)
+            else:
+                content = m._RENDERERS[fmt](report)
+            path = m._write_output(fmt, content, report,
+                                   explicit_ts=export_ts)
+            diagnostic[side_key][fmt] = path
+            print(
+                f"[export] side {side_label} {fmt.upper():4} → {path}",
+                file=progress_out,
+            )
+
+    # Build the links dict for the analysis.md — relative-only hrefs so
+    # the Markdown resolves regardless of where the user opens it
+    # from, as long as all files stay in ``exports/session-metrics/``.
+    def _rel(p):
+        return p.name if p is not None else None
+
+    a_export = diagnostic["side_a"]
+    b_export = diagnostic["side_b"]
+    a_sid8 = (compare_report.get("side_a") or {}).get("session_id", "a")[:8]
+    b_sid8 = (compare_report.get("side_b") or {}).get("session_id", "b")[:8]
+    compare_html_name = (
+        f"compare_{a_sid8}_vs_{b_sid8}_{export_ts}.html"
+    )
+    compare_html_path = m._export_dir() / compare_html_name
+
+    links = {
+        "compare_html": (
+            compare_html_name if compare_html_path.exists() else None
+        ),
+        "side_a_dashboard": _rel(a_export.get("html_dashboard")),
+        "side_a_detail": _rel(a_export.get("html_detail")),
+        "side_a_json": _rel(a_export.get("json")),
+        "side_b_dashboard": _rel(b_export.get("html_dashboard")),
+        "side_b_detail": _rel(b_export.get("html_detail")),
+        "side_b_json": _rel(b_export.get("json")),
+    }
+    # Single-page HTML extras land under the "html" key rather than
+    # the split keys — fall back so the link section still renders
+    # something useful when the user passed --single-page.
+    if links["side_a_dashboard"] is None:
+        links["side_a_dashboard"] = _rel(a_export.get("html"))
+    if links["side_b_dashboard"] is None:
+        links["side_b_dashboard"] = _rel(b_export.get("html"))
+
+    # Fall back to an empty session report dict when a side is
+    # missing — the analysis renderer defers to the compare report's
+    # ``side_a["totals"]`` / ``side_b["totals"]`` for the numbers.
+    content = _render_compare_analysis_md(
+        compare_report,
+        session_reports.get("side_a", {}),
+        session_reports.get("side_b", {}),
+        links,
+    )
+    analysis_path = m._write_output(
+        "md", content, compare_report,
+        suffix="_analysis", explicit_ts=export_ts,
+    )
+    diagnostic["analysis_md"] = analysis_path
+    print(
+        f"[export] compare-run analysis → {analysis_path}",
+        file=progress_out,
+    )
+
+    return diagnostic

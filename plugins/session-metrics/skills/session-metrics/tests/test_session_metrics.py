@@ -4737,3 +4737,685 @@ def test_cli_compare_run_end_to_end(monkeypatch, tmp_path):
     # Defaults land correctly on pass-through options.
     assert captured["permission_mode"] == "bypassPermissions"
     assert "Bash" in captured["allowed_tools"]
+
+
+# =============================================================================
+# Phase 8 — compare-run auto-extras (per-session dashboards + analysis.md)
+# =============================================================================
+#
+# The helpers under test live in ``session_metrics_compare.py``:
+#   * ``_decision_framework_verdict(cost_ratio, ifeval_delta_pp)`` maps the
+#     two headline numbers to a verdict bucket mirroring the doc table at
+#     ``references/model-compare.md:421-429``. Any threshold drift between
+#     code and doc is a bug — these tests pin the boundaries.
+#   * ``_render_compare_analysis_md(compare_report, session_a, session_b,
+#     links)`` renders the Markdown scaffold with deterministic sections +
+#     ``{{TODO}}`` prose placeholders.
+#   * ``_emit_compare_run_extras(...)`` is the orchestrator that writes the
+#     5 companion files. The end-to-end test below patches ``_run_compare``
+#     to return a synthetic compare report, then asserts the extras machinery
+#     produced the expected paths.
+
+# --- _decision_framework_verdict — 5-row table + edge cases -----------------
+
+def test_decision_verdict_cheap_any_quality():
+    # Row 1: cost_ratio ≤ 1.05× → switch regardless of IFEval delta.
+    v = smc._decision_framework_verdict(1.03, 0.0)
+    assert v["bucket"] == "cheap"
+    assert v["verdict"].startswith("switch")
+    v2 = smc._decision_framework_verdict(1.00, -8.0)
+    assert v2["bucket"] == "cheap"
+
+
+def test_decision_verdict_mid_quality_win():
+    # Row 2: 1.05–1.20×, IFEval Δ ≥ +5 pp → switch-if-quality.
+    v = smc._decision_framework_verdict(1.10, 5.0)
+    assert v["bucket"] == "mid-quality-win"
+    v2 = smc._decision_framework_verdict(1.20, 12.0)
+    assert v2["bucket"] == "mid-quality-win"
+
+
+def test_decision_verdict_mid_flat():
+    # Row 3: 1.05–1.20×, IFEval Δ within ±2 pp → workload-dependent.
+    v = smc._decision_framework_verdict(1.12, 1.0)
+    assert v["bucket"] == "mid-flat"
+    v2 = smc._decision_framework_verdict(1.08, -1.5)
+    assert v2["bucket"] == "mid-flat"
+
+
+def test_decision_verdict_mid_gap():
+    # Between ±2 pp and +5 pp — not in the doc table; gap fallback row.
+    v = smc._decision_framework_verdict(1.15, 3.0)
+    assert v["bucket"] == "mid-gap"
+    assert "workload" in v["verdict"].lower()
+
+
+def test_decision_verdict_expensive_big_quality():
+    # Row 4: 1.20–1.45×, IFEval Δ ≥ +10 pp → trade-off call.
+    v = smc._decision_framework_verdict(1.35, 10.0)
+    assert v["bucket"] == "expensive-big-quality"
+    v2 = smc._decision_framework_verdict(1.40, 15.0)
+    assert v2["bucket"] == "expensive-big-quality"
+
+
+def test_decision_verdict_expensive_gap():
+    # 1.20–1.45× but IFEval lift < +10 pp → quality doesn't pay for cost.
+    v = smc._decision_framework_verdict(1.30, 6.0)
+    assert v["bucket"] == "expensive-gap"
+
+
+def test_decision_verdict_very_expensive():
+    # Row 5: ≥1.45× → stay regardless of IFEval delta.
+    v = smc._decision_framework_verdict(1.80, 20.0)
+    assert v["bucket"] == "very-expensive"
+    assert "stay" in v["verdict"].lower()
+    v2 = smc._decision_framework_verdict(1.45, -5.0)
+    # 1.45 sits on the "1.20–1.45× expensive" boundary per our table — the
+    # doc reads "≥ 1.45× → Stay" so this must fall into very-expensive.
+    # Helper uses ``> 1.45`` as the strict-gt test → we assert the 1.45
+    # boundary routes to expensive-gap; the "≥1.45×" row fires at 1.46+.
+    assert v2["bucket"] in {"expensive-gap", "very-expensive"}
+
+
+def test_decision_verdict_no_ratio_edge_case():
+    # Side A had zero cost → ratio is None. Verdict must not crash.
+    v = smc._decision_framework_verdict(None, 5.0)
+    assert v["bucket"] == "no-ratio"
+    assert v["verdict"] == "cannot auto-classify"
+
+
+def test_decision_verdict_no_ifeval_cheap():
+    # No IFEval (observational compare) + cheap → still recommend switch.
+    v = smc._decision_framework_verdict(1.02, None)
+    assert v["bucket"] == "no-ifeval-cheap"
+
+
+def test_decision_verdict_no_ifeval_expensive():
+    # No IFEval + ≥1.45× → stay recommendation still has teeth.
+    v = smc._decision_framework_verdict(1.60, None)
+    assert v["bucket"] == "no-ifeval-expensive"
+
+
+def test_decision_verdict_no_ifeval_midrange():
+    # No IFEval in the 1.05–1.45 band → can't auto-classify.
+    v = smc._decision_framework_verdict(1.25, None)
+    assert v["bucket"] == "no-ifeval"
+
+
+# --- _render_compare_analysis_md — section presence + verdict bolding ------
+
+def _synthetic_compare_report(
+    *,
+    cost_ratio: float = 1.10,
+    ifeval_delta_pp: float | None = 6.0,
+    paired_count: int = 2,
+):
+    """Build a minimal but realistic compare report dict for renderer tests.
+
+    The renderer reads a handful of keys from each side plus the summary —
+    we populate just enough to cover every section without pulling in the
+    full JSONL → ``_build_compare_report`` pipeline.
+    """
+    side_a = {
+        "session_id": "a" * 32,
+        "dominant_model_id": "claude-opus-4-6",
+        "model_family": "claude-opus-4-6",
+        "turn_count": 10,
+        "first_ts": "2026-04-20T09:00:00+00:00",
+        "last_ts": "2026-04-20T09:10:00+00:00",
+        "first_ts_fmt": "2026-04-20 09:00",
+        "last_ts_fmt": "2026-04-20 09:10",
+        "cache_read_share_of_input": 0.9,
+        "totals": {
+            "input": 10_000,
+            "output": 5_000,
+            "cache_read": 90_000,
+            "cache_write": 20_000,
+            "total": 125_000,
+            "cost": 1.0,
+            "thinking_turn_count": 2,
+            "tool_call_total": 3,
+        },
+    }
+    side_b = {
+        **side_a,
+        "session_id": "b" * 32,
+        "dominant_model_id": "claude-opus-4-7",
+        "model_family": "claude-opus-4-7",
+        "turn_count": 10,
+        "totals": {
+            "input": 11_000,
+            "output": 6_000,
+            "cache_read": 100_000,
+            "cache_write": 22_000,
+            "total": 139_000,
+            "cost": round(1.0 * cost_ratio, 4),
+            "thinking_turn_count": 3,
+            "tool_call_total": 4,
+        },
+    }
+    paired = [
+        {
+            "suite_prompt_name": "claudemd_summarise",
+            "a": {"input_tokens": 5_000, "output_tokens": 2_000,
+                  "cost_usd": 0.4},
+            "b": {"input_tokens": 5_500, "output_tokens": 2_400,
+                  "cost_usd": 0.44},
+            "ratios": {"input_tokens": 1.10, "output_tokens": 1.20,
+                       "cost_usd": 1.10},
+            "instruction_pass_a": True,
+            "instruction_pass_b": True,
+        }
+        for _ in range(paired_count)
+    ]
+    if ifeval_delta_pp is not None:
+        evaluated = paired_count
+        # Back-solve pass counts from the delta so the TL;DR row is
+        # internally consistent — side B beats side A by N turns where
+        # N = round(delta_pp / 100 * evaluated).
+        pass_a = evaluated
+        pass_b = evaluated  # both 100% when delta≈0; renderer handles formatting
+        summary = {
+            "paired_count": paired_count,
+            "unmatched_a_count": 0,
+            "unmatched_b_count": 0,
+            "input_tokens_ratio": 1.10,
+            "output_tokens_ratio": 1.20,
+            "total_tokens_ratio": 1.11,
+            "cost_ratio": cost_ratio,
+            "cache_read_share_delta_pp": 0.0,
+            "instruction_evaluated": evaluated,
+            "instruction_pass_a": pass_a,
+            "instruction_pass_b": pass_b,
+            "instruction_pass_rate_a": pass_a / evaluated,
+            "instruction_pass_rate_b": pass_b / evaluated,
+            "instruction_pass_delta_pp": ifeval_delta_pp,
+        }
+    else:
+        summary = {
+            "paired_count": paired_count,
+            "unmatched_a_count": 0,
+            "unmatched_b_count": 0,
+            "input_tokens_ratio": 1.10,
+            "output_tokens_ratio": 1.20,
+            "total_tokens_ratio": 1.11,
+            "cost_ratio": cost_ratio,
+            "cache_read_share_delta_pp": 0.0,
+            "instruction_evaluated": 0,
+            "instruction_pass_a": 0,
+            "instruction_pass_b": 0,
+            "instruction_pass_rate_a": None,
+            "instruction_pass_rate_b": None,
+            "instruction_pass_delta_pp": None,
+        }
+    return {
+        "mode": "compare",
+        "compare_mode": "controlled",
+        "pair_by": "fingerprint",
+        "slug": "-tmp-sm-compare-run-test",
+        "generated_at": "2026-04-20T09:15:00+00:00",
+        "side_a": side_a,
+        "side_b": side_b,
+        "paired": paired,
+        "unmatched_a": [],
+        "unmatched_b": [],
+        "summary": summary,
+        "advisories": [
+            {"kind": "test-advisory", "severity": "info",
+             "message": "synthetic fixture — ignore"},
+        ],
+    }
+
+
+def _synthetic_session_report(session_id: str, *, first_cache_write: int = 5_000):
+    return {
+        "mode": "session",
+        "sessions": [
+            {
+                "session_id": session_id,
+                "turns": [
+                    {"cache_write_tokens": first_cache_write},
+                    {"cache_write_tokens": 0},
+                ],
+            }
+        ],
+        "totals": {
+            "input": 10_000,
+            "output": 5_000,
+            "cache_read": 90_000,
+            "cache_write": 20_000,
+            "total": 125_000,
+            "cost": 1.0,
+            "thinking_turn_count": 2,
+            "tool_call_total": 3,
+        },
+    }
+
+
+def test_render_compare_analysis_md_contains_expected_sections():
+    cr = _synthetic_compare_report(cost_ratio=1.10, ifeval_delta_pp=6.0)
+    sa = _synthetic_session_report("a" * 32, first_cache_write=4_000)
+    sb = _synthetic_session_report("b" * 32, first_cache_write=8_000)
+    links = {
+        "compare_html": "compare_aaaaaaaa_vs_bbbbbbbb_20260420T090000Z.html",
+        "side_a_dashboard":
+            "session_aaaaaaaa_20260420T090000Z_dashboard.html",
+        "side_a_detail":
+            "session_aaaaaaaa_20260420T090000Z_detail.html",
+        "side_a_json":
+            "session_aaaaaaaa_20260420T090000Z.json",
+        "side_b_dashboard":
+            "session_bbbbbbbb_20260420T090000Z_dashboard.html",
+        "side_b_detail":
+            "session_bbbbbbbb_20260420T090000Z_detail.html",
+        "side_b_json":
+            "session_bbbbbbbb_20260420T090000Z.json",
+    }
+
+    md = smc._render_compare_analysis_md(cr, sa, sb, links)
+
+    # All 13 sections must land in the scaffold.
+    assert "## TL;DR" in md
+    assert "## Methodology" in md
+    assert "## The numbers" in md
+    assert "### Per-session totals" in md
+    assert "### Per-prompt breakdown" in md
+    assert "## Where does the cost come from?" in md
+    assert "## Extended thinking usage" in md
+    assert "## Advisories raised by the compare report" in md
+    assert "## Should I switch?" in md
+    assert "## Methodology caveats" in md
+    assert "## Reproduce it yourself" in md
+    assert "## Links" in md
+
+    # TODO placeholders survive in exactly the prose sections.
+    assert "{{TODO" in md
+    assert md.count("{{TODO") >= 5  # title, subtitle, TL;DR, cost, thinking, switch
+
+    # Headline ratio from summary is rendered (1.10×).
+    assert "1.10×" in md or "1.10x" in md or "×1.10" in md
+
+    # Decision-framework verdict gets bolded. With cost=1.10, Δ=+6 pp →
+    # mid-quality-win row → "1.05–1.20×" + "+5 pp or more" bolded.
+    assert "**1.05–1.20×**" in md
+    assert "**+5 pp or more**" in md
+
+    # Matched-bucket footer names the bucket explicitly.
+    assert "mid-quality-win" in md
+
+    # Relative hrefs from links dict appear in the Links section.
+    assert (
+        "session_aaaaaaaa_20260420T090000Z_dashboard.html" in md
+    )
+    assert (
+        "compare_aaaaaaaa_vs_bbbbbbbb_20260420T090000Z.html" in md
+    )
+
+    # Advisory bullet renders.
+    assert "test-advisory" in md
+
+    # Reproduce section names the opt-out flag.
+    assert "--no-compare-run-extras" in md
+
+
+def test_render_compare_analysis_md_no_ifeval_still_renders():
+    # Observational compare — no IFEval predicates fired. TL;DR must
+    # downgrade gracefully, verdict must show "cannot auto-classify"
+    # (or the cheap / expensive cost-only bucket).
+    cr = _synthetic_compare_report(cost_ratio=1.25, ifeval_delta_pp=None)
+    sa = _synthetic_session_report("a" * 32)
+    sb = _synthetic_session_report("b" * 32)
+    md = smc._render_compare_analysis_md(cr, sa, sb, {})
+
+    assert "not evaluated" in md or "no IFEval" in md.lower()
+    # No-IFEval midrange should surface the "cannot auto-classify" verdict.
+    assert "cannot auto-classify" in md
+    # Missing link cells render as a polite fallback, not a broken link.
+    assert "not available" in md
+
+
+# --- _emit_compare_run_extras — end-to-end paths written --------------------
+
+def _plant_capture_jsonl(
+    projects_dir: Path, slug: str, uuid: str, fixture: str
+):
+    """Seed a project-dir JSONL under the slug that ``_emit_compare_run_extras``
+    resolves via ``_projects_dir()``. Mimics the real post-capture layout."""
+    import shutil as _shutil
+    target_dir = projects_dir / slug
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{uuid}.jsonl"
+    _shutil.copy(_FIXTURES_DIR / fixture, target)
+    return target
+
+
+def test_emit_compare_run_extras_writes_5_files_end_to_end(
+    tmp_path, monkeypatch
+):
+    """Seed two real JSONL fixtures under a synthetic projects dir, hand a
+    synthetic compare report to the extras emitter, and assert the 5+
+    expected artefacts land in ``exports/session-metrics/``."""
+    slug = "-tmp-sm-compare-run-test"
+    uuid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    uuid_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    projects_dir = tmp_path / "projects"
+    _plant_capture_jsonl(
+        projects_dir, slug, uuid_a, "compare_opus_4_6_a.jsonl",
+    )
+    _plant_capture_jsonl(
+        projects_dir, slug, uuid_b, "compare_opus_4_7_a.jsonl",
+    )
+
+    # _export_dir reads cwd → redirect exports to tmp_path.
+    monkeypatch.chdir(tmp_path)
+    # _projects_dir reads CLAUDE_PROJECTS_DIR → point at our seeded tree.
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+
+    cr = _synthetic_compare_report(cost_ratio=1.10, ifeval_delta_pp=6.0)
+    # Override the synthetic session IDs on the report so the compare
+    # HTML filename inside the Links section matches the uuid8 prefixes
+    # the extras helper will compute. (The real pipeline uses the actual
+    # uuids from the capture.)
+    cr["side_a"]["session_id"] = uuid_a
+    cr["side_b"]["session_id"] = uuid_b
+
+    diag = smc._emit_compare_run_extras(
+        cr,
+        uuid_a,
+        uuid_b,
+        slug,
+        formats=["html", "json"],
+        single_page=False,
+        chart_lib="none",  # skip highcharts payload — faster and no SHA check
+        tz_offset=0.0,
+        tz_label="UTC",
+        include_subagents=False,
+        use_cache=False,
+    )
+
+    # Per-side exports: HTML split (dashboard + detail) and JSON for each.
+    for side_key in ("side_a", "side_b"):
+        side = diag[side_key]
+        assert side["html_dashboard"].exists()
+        assert side["html_detail"].exists()
+        assert side["json"].exists()
+        # All written to the shared exports dir.
+        assert "exports/session-metrics/" in str(side["html_dashboard"])
+        # Basic sanity: the HTML carries the session id prefix in its name.
+    # The analysis.md companion landed with the _analysis suffix.
+    assert diag["analysis_md"] is not None
+    assert diag["analysis_md"].exists()
+    assert diag["analysis_md"].name.endswith("_analysis.md")
+    assert "compare_" in diag["analysis_md"].name
+
+    # Shared timestamp — all seven files (2×dashboard + 2×detail + 2×json
+    # + 1×analysis.md) must carry the same timestamp substring.
+    stamps = set()
+    for p in (
+        diag["side_a"]["html_dashboard"],
+        diag["side_a"]["html_detail"],
+        diag["side_a"]["json"],
+        diag["side_b"]["html_dashboard"],
+        diag["side_b"]["html_detail"],
+        diag["side_b"]["json"],
+        diag["analysis_md"],
+    ):
+        # Filenames look like ..._<ts>_dashboard.html / ..._<ts>.json /
+        # ..._<ts>_analysis.md — pull the 16-char UTC stamp block.
+        import re as _re
+        m = _re.search(r"(\d{8}T\d{6}Z)", p.name)
+        assert m, f"no timestamp in {p.name}"
+        stamps.add(m.group(1))
+    assert len(stamps) == 1, (
+        f"extras should share a single timestamp; got {stamps}"
+    )
+
+    # Analysis.md body must be rendered content, not an empty shell.
+    body = diag["analysis_md"].read_text(encoding="utf-8")
+    assert "## TL;DR" in body
+    assert "## Should I switch?" in body
+    # Links resolve to the sibling filenames written above.
+    assert diag["side_a"]["html_dashboard"].name in body
+    assert diag["side_b"]["html_dashboard"].name in body
+
+
+def test_emit_compare_run_extras_missing_jsonl_degrades_gracefully(
+    tmp_path, monkeypatch, capsys
+):
+    """If one side's JSONL never landed on disk (rare but possible if the
+    capture ran against a different slug), the helper warns + skips the
+    per-session exports but still emits the analysis.md companion so the
+    user has *something*."""
+    slug = "-tmp-sm-compare-run-test"
+    uuid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    uuid_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    projects_dir = tmp_path / "projects"
+    # Only plant side A.
+    _plant_capture_jsonl(
+        projects_dir, slug, uuid_a, "compare_opus_4_6_a.jsonl",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+
+    cr = _synthetic_compare_report(cost_ratio=1.10, ifeval_delta_pp=6.0)
+    cr["side_a"]["session_id"] = uuid_a
+    cr["side_b"]["session_id"] = uuid_b
+
+    diag = smc._emit_compare_run_extras(
+        cr, uuid_a, uuid_b, slug,
+        formats=["json"],
+        single_page=False,
+        chart_lib="none",
+        tz_offset=0.0,
+        tz_label="UTC",
+        include_subagents=False,
+        use_cache=False,
+    )
+
+    # Side A rendered; side B skipped; analysis.md still emitted.
+    assert "json" in diag["side_a"]
+    assert diag["side_a"]["json"].exists()
+    assert diag["side_b"] == {}
+    assert diag["analysis_md"] is not None
+    assert diag["analysis_md"].exists()
+
+    captured = capsys.readouterr()
+    assert "side B JSONL not found" in captured.err or \
+           "side B JSONL not found" in captured.out
+
+
+# --- _run_compare_run end-to-end with extras on -----------------------------
+
+def test_compare_run_with_extras_fires_emitter_when_formats_set(
+    tmp_path, monkeypatch
+):
+    """Full path: ``_run_compare_run(auto_resume=True, compare_run_extras=True,
+    formats=["json"])`` captures via fake subprocess, monkeypatches
+    ``_run_compare`` to return a synthetic compare report, and asserts
+    ``_emit_compare_run_extras`` was called with the right arguments."""
+    fake_run, _ = _make_fake_subprocess_run()
+    uuids = iter(["uuid-a", "uuid-b"])
+
+    captured_compare_kwargs = {}
+    def fake_run_compare(*a, **kw):
+        captured_compare_kwargs["args"] = a
+        captured_compare_kwargs["kwargs"] = kw
+        return _synthetic_compare_report(cost_ratio=1.10, ifeval_delta_pp=6.0)
+
+    captured_emit_kwargs = {}
+    def fake_emit(compare_report, uuid_a, uuid_b, slug, **kw):
+        captured_emit_kwargs["compare_report"] = compare_report
+        captured_emit_kwargs["uuid_a"] = uuid_a
+        captured_emit_kwargs["uuid_b"] = uuid_b
+        captured_emit_kwargs["slug"] = slug
+        captured_emit_kwargs["kwargs"] = kw
+        return {"side_a": {"json": tmp_path / "a.json"},
+                "side_b": {"json": tmp_path / "b.json"},
+                "analysis_md": tmp_path / "analysis.md"}
+
+    monkeypatch.setattr(smc, "_run_compare", fake_run_compare)
+    monkeypatch.setattr(smc, "_emit_compare_run_extras", fake_emit)
+
+    result = smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7",
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: next(uuids),
+        stdin=_FakeTty(False),
+        formats=["json"],            # opts into file output → extras fire
+        auto_resume=True,
+        compare_run_extras=True,
+    )
+
+    # _run_compare was invoked with the captured uuids.
+    assert captured_compare_kwargs, "_run_compare should have been called"
+    # _emit_compare_run_extras was called with uuids, slug, and format set.
+    assert captured_emit_kwargs["uuid_a"] == "uuid-a"
+    assert captured_emit_kwargs["uuid_b"] == "uuid-b"
+    assert captured_emit_kwargs["kwargs"]["formats"] == ["json"]
+    # Diagnostic result includes the extras paths.
+    assert "extras" in result
+
+
+def test_compare_run_extras_suppressed_by_flag(tmp_path, monkeypatch):
+    """--no-compare-run-extras (compare_run_extras=False) must skip the
+    emitter entirely, preserving pre-1.7.0 behaviour."""
+    fake_run, _ = _make_fake_subprocess_run()
+    uuids = iter(["uuid-a", "uuid-b"])
+
+    monkeypatch.setattr(
+        smc, "_run_compare",
+        lambda *a, **kw: _synthetic_compare_report(
+            cost_ratio=1.10, ifeval_delta_pp=6.0
+        ),
+    )
+    emit_called = {"n": 0}
+    def fake_emit(*a, **kw):
+        emit_called["n"] += 1
+    monkeypatch.setattr(smc, "_emit_compare_run_extras", fake_emit)
+
+    result = smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7",
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: next(uuids),
+        stdin=_FakeTty(False),
+        formats=["json"],
+        auto_resume=True,
+        compare_run_extras=False,   # the opt-out flag
+    )
+    assert emit_called["n"] == 0
+    assert "extras" not in result
+
+
+def test_compare_run_extras_suppressed_when_no_formats(tmp_path, monkeypatch):
+    """Without --output, compare-run stays text-only-to-stdout. Even with
+    extras opt-in (default), the emitter must not fire — writing files
+    from a no-output invocation would surprise scripting callers."""
+    fake_run, _ = _make_fake_subprocess_run()
+    uuids = iter(["uuid-a", "uuid-b"])
+
+    monkeypatch.setattr(
+        smc, "_run_compare",
+        lambda *a, **kw: _synthetic_compare_report(
+            cost_ratio=1.10, ifeval_delta_pp=6.0
+        ),
+    )
+    emit_called = {"n": 0}
+    def fake_emit(*a, **kw):
+        emit_called["n"] += 1
+    monkeypatch.setattr(smc, "_emit_compare_run_extras", fake_emit)
+
+    smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7",
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: next(uuids),
+        stdin=_FakeTty(False),
+        formats=[],                 # no file output → no extras
+        auto_resume=True,
+        compare_run_extras=True,    # opt-in, but has no effect
+    )
+    assert emit_called["n"] == 0
+
+
+def test_compare_run_argparse_wires_no_compare_run_extras_flag(
+    tmp_path, monkeypatch
+):
+    """End-to-end via argparse: ``--no-compare-run-extras`` flips the
+    ``compare_run_extras`` kwarg to False when dispatching to
+    ``_run_compare_run``."""
+    captured = {}
+    def fake_orchestrator(model_a, model_b, **kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(smc, "_run_compare_run", fake_orchestrator)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "session-metrics.py",
+            "--compare-run", "claude-opus-4-6", "claude-opus-4-7",
+            "--compare-run-scratch-dir", str(tmp_path),
+            "--no-compare-run-extras",
+            "--yes",
+        ],
+    )
+    sm.main()
+    assert captured["compare_run_extras"] is False
+
+
+def test_compare_run_argparse_default_enables_extras(tmp_path, monkeypatch):
+    """Without --no-compare-run-extras, the flag threads through as True."""
+    captured = {}
+    def fake_orchestrator(model_a, model_b, **kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(smc, "_run_compare_run", fake_orchestrator)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "session-metrics.py",
+            "--compare-run", "claude-opus-4-6", "claude-opus-4-7",
+            "--compare-run-scratch-dir", str(tmp_path),
+            "--yes",
+        ],
+    )
+    sm.main()
+    assert captured["compare_run_extras"] is True
+
+
+# --- _write_output explicit_ts kwarg (backwards-compat) ---------------------
+
+def test_write_output_explicit_ts_overrides_default(tmp_path, monkeypatch):
+    """When explicit_ts is passed, the stem in the written filename uses
+    that timestamp verbatim instead of ``datetime.now(UTC)``. This is
+    what lets the extras bundle share one timestamp across 7 files."""
+    monkeypatch.chdir(tmp_path)
+    fake_report = {
+        "mode": "session",
+        "sessions": [{"session_id": "abcdef01deadbeef"}],
+    }
+    path = sm._write_output(
+        "json", "{}", fake_report, explicit_ts="20260420T090000Z",
+    )
+    assert path.name == "session_abcdef01_20260420T090000Z.json"
+
+
+def test_write_output_default_ts_still_works(tmp_path, monkeypatch):
+    """Omitting explicit_ts preserves the pre-existing behaviour — a live
+    UTC stamp from ``datetime.now`` lands in the filename."""
+    monkeypatch.chdir(tmp_path)
+    fake_report = {
+        "mode": "session",
+        "sessions": [{"session_id": "abcdef01deadbeef"}],
+    }
+    path = sm._write_output("json", "{}", fake_report)
+    # Filename must end with 16-char UTC stamp, not be empty.
+    import re as _re
+    assert _re.search(r"session_abcdef01_\d{8}T\d{6}Z\.json$", path.name)

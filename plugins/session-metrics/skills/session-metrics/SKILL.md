@@ -160,6 +160,17 @@ the existing `context-tier-mismatch` advisory on the report.
 | `compare-prep`              | Print the manual capture protocol. Only suggest when `claude -p` is unavailable (e.g. CI container without the CLI). |
 | `count-tokens`              | API-key tokenizer smoke test. NOT a subscription path; do not suggest to users comparing two subscription sessions. |
 
+**`compare-run` auto-extras.** When `compare-run` is invoked with
+`--output <fmt>`, it emits the compare report *and* five companion
+files in `exports/session-metrics/`: a per-session dashboard + detail
+(HTML) and raw JSON for each side, plus a Markdown analysis scaffold
+(`compare_<a8>_vs_<b8>_<ts>_analysis.md`) with headline ratios,
+per-prompt table, cost decomposition, and a bolded decision-framework
+verdict. Prose sections carry `{{TODO}}` placeholders so a follow-up
+chat can fill them in. Pass `--no-compare-run-extras` to skip the
+companions and emit only the compare report. Without `--output`,
+nothing writes to disk (text-only stdout path preserved).
+
 **Before proposing any compare-mode command, read
 [`references/model-compare.md`](references/model-compare.md).** That
 doc has the full flag table, four workflow recipes, 4-way Opus combo

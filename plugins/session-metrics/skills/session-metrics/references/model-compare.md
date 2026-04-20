@@ -164,6 +164,38 @@ Proceed? [y/N]: y
 <compare report output follows>
 ```
 
+### Extras — per-session dashboards + analysis scaffold
+
+When you pass `--output <fmt>` to `compare-run`, the orchestrator emits
+the compare report **plus five companion files** in
+`exports/session-metrics/`:
+
+| File | What it is |
+|------|------------|
+| `session_<a8>_<ts>_dashboard.html` + `session_<a8>_<ts>_detail.html` | Per-session HTML dashboard + detail for side A (standard 2-page split) |
+| `session_<a8>_<ts>.json` | Side A full structured report (same schema as the default single-session JSON) |
+| `session_<b8>_<ts>_dashboard.html` + `session_<b8>_<ts>_detail.html` + `session_<b8>_<ts>.json` | Same trio for side B |
+| `compare_<a8>_vs_<b8>_<ts>_analysis.md` | Markdown analysis scaffold with headline ratios, per-prompt table, cost decomposition, advisories list, and a bolded decision-framework verdict row |
+
+All six companions share a single run timestamp `<ts>` so relative
+links inside the analysis scaffold resolve cleanly.
+
+The analysis scaffold carries `{{TODO}}` placeholders in the prose
+sections (title hook, TL;DR, interpretation of extended thinking,
+should-I-switch workload note) — the deterministic ~80% of the write-up
+lands auto-filled, and a follow-up chat (or manual edit) fills the
+prose.
+
+**Opt out** with `--no-compare-run-extras` when you want only the
+compare report (the pre-1.7.0 behaviour). Without any `--output` flag,
+no files are written to disk (text-to-stdout path preserved); the
+extras are a **superset** of the compare HTML/MD/JSON emission, never
+an addition to the stdout-only path.
+
+The analysis scaffold's decision-framework row is driven by the same
+cost-ratio / IFEval-delta thresholds in the *Decision framework*
+section below — any threshold bump needs to land in both places.
+
 ### When to use Workflow B (manual) instead
 
 Fall back to the manual protocol below when any of these apply:
