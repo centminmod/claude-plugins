@@ -4685,6 +4685,21 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Wall-clock timeout for each 'claude -p' subprocess "
                         "in --compare-run. Default 900s (15 min); the "
                         "tool-heavy prompt is the usual slowest.")
+    p.add_argument("--compare-run-effort", nargs="*", metavar="LEVEL",
+                   default=None,
+                   help="Reasoning effort level threaded as 'claude -p "
+                        "--effort <level>' to each --compare-run subprocess. "
+                        "Takes 0, 1, or 2 positional levels from "
+                        "{low, medium, high, xhigh, max}. With 0 (flag "
+                        "absent or given with no arguments) the flag is "
+                        "omitted entirely, so each model uses Claude Code's "
+                        "per-model default (opus-4-6 → high, opus-4-7 → "
+                        "xhigh). With 1 value both sides pin to that level. "
+                        "With 2 values the first applies to side A, the "
+                        "second to side B. Useful when you want to hold "
+                        "effort constant across a version comparison "
+                        "instead of letting each model fall back to its own "
+                        "default.")
     p.add_argument("--no-compare-run-extras", action="store_true",
                    help="Skip the per-session HTML/JSON dashboards and the "
                         "analysis.md companion that --compare-run normally "
@@ -4800,6 +4815,22 @@ def main() -> None:
         allowed_tools = args.compare_run_allowed_tools \
             or "Bash,Read,Write,Edit,Glob,Grep"
         timeout = args.compare_run_per_call_timeout or 900.0
+        # Resolve 0/1/2 positional effort values. None or empty list means
+        # "let each model use its Claude Code default" (Opus 4.6 → high,
+        # Opus 4.7 → xhigh). One value pins both sides; two values map
+        # A then B. The orchestrator validates the level itself, so we
+        # only enforce arity here.
+        _efforts = list(args.compare_run_effort or [])
+        if len(_efforts) == 0:
+            effort_a, effort_b = None, None
+        elif len(_efforts) == 1:
+            effort_a = effort_b = _efforts[0]
+        elif len(_efforts) == 2:
+            effort_a, effort_b = _efforts[0], _efforts[1]
+        else:
+            print("[error] --compare-run-effort takes 0, 1, or 2 levels; "
+                  f"got {len(_efforts)}", file=sys.stderr)
+            sys.exit(1)
         try:
             _touch_compare_state_marker(_cwd_to_slug(str(scratch_dir.resolve()))
                                         if scratch_dir else slug)
@@ -4826,6 +4857,8 @@ def main() -> None:
             min_turns=args.compare_min_turns,
             allow_suite_mismatch=args.allow_suite_mismatch,
             compare_run_extras=not args.no_compare_run_extras,
+            effort_a=effort_a,
+            effort_b=effort_b,
         )
         return
 

@@ -138,6 +138,15 @@ Optional safety belts:
 - `--compare-run-per-call-timeout SECONDS` — wall-clock timeout per
   prompt; default 900 (15 min) because the `tool_heavy_task` prompt
   can fan out.
+- `--compare-run-effort [LEVEL [LEVEL]]` — pin `claude -p --effort`
+  (`low | medium | high | xhigh | max`). Takes 0, 1, or 2 values:
+  zero omits the flag entirely so each model keeps its shipping
+  default (Opus 4.6 → `high`, Opus 4.7 → `xhigh`); one value applies
+  to both sides; two values map to A and B. Use this when you want
+  to hold effort constant across a version comparison (e.g. both
+  sides at `high`) instead of letting each model fall back to its
+  own default — useful when isolating tokenizer / algorithm changes
+  from the effort-level change that ships alongside a new model.
 
 If any single `claude -p` call fails, the orchestrator aborts with
 the stderr from that call and leaves the partial JSONL on disk for
@@ -150,6 +159,8 @@ rate-limit retries internally (via `system/api_retry` events).
 About to run --compare-run: 10 prompts × 2 models = 20 headless Claude Code invocations.
   Side A: claude-opus-4-6   Side B: claude-opus-4-7
   Scratch dir: /tmp/sm-compare-run-abc123
+  (with --compare-run-effort high xhigh the Side line becomes:
+   "Side A: claude-opus-4-6 (effort=high)   Side B: claude-opus-4-7 (effort=xhigh)")
 Each call runs full inference and counts against your subscription quota / rate limit.
 Proceed? [y/N]: y
 

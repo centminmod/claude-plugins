@@ -3418,6 +3418,15 @@ _DEFAULT_COMPARE_RUN_ALLOWED_TOOLS = "Bash,Read,Write,Edit,Glob,Grep"
 _DEFAULT_COMPARE_RUN_PERMISSION_MODE = "bypassPermissions"
 _DEFAULT_COMPARE_RUN_TIMEOUT_SEC = 900.0  # 15 min / prompt; tool-heavy #5 is slowest
 
+# Valid ``claude -p --effort`` values. Kept in sync with Claude Code's own
+# enum — mismatches would cause a cryptic subprocess error mid-capture. Opus
+# 4.6 defaults to ``high`` and Opus 4.7 defaults to ``xhigh`` when the flag
+# is omitted; passing ``None`` here (the default) preserves that per-model
+# behaviour so A/B runs across model versions stay apples-to-apples by
+# default. Override per-side via ``--compare-run-effort`` when pinning both
+# sides to a common level matters more than matching each model's default.
+_COMPARE_RUN_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
 
 class CompareRunError(RuntimeError):
     """Raised when the ``--compare-run`` orchestrator can't continue.
@@ -3442,6 +3451,7 @@ def _claude_headless_call(
     max_budget_usd: float | None,
     timeout: float,
     subprocess_run,
+    effort: str | None = None,
 ) -> dict:
     """Shell out to ``claude -p`` for one prompt and return the parsed JSON result.
 
@@ -3450,6 +3460,12 @@ def _claude_headless_call(
     so all turns append to the same file. ``--output-format json`` gives us
     ``{session_id, result, usage, total_cost_usd, ...}`` on stdout for
     cost telemetry and success confirmation.
+
+    ``effort`` — when non-None, threaded as ``--effort <level>`` so the
+    subprocess pins reasoning effort (low/medium/high/xhigh/max). Leave as
+    ``None`` to let Claude Code apply its per-model default (opus-4-6 →
+    high, opus-4-7 → xhigh), which keeps cross-version A/B runs faithful
+    to how each model actually ships by default.
 
     Raises :class:`CompareRunError` on FileNotFoundError (claude not on
     PATH), non-zero returncode, or stdout that doesn't parse as JSON.
@@ -3468,6 +3484,8 @@ def _claude_headless_call(
         cmd += ["--permission-mode", permission_mode]
     if max_budget_usd is not None:
         cmd += ["--max-budget-usd", str(max_budget_usd)]
+    if effort:
+        cmd += ["--effort", effort]
     try:
         result = subprocess_run(
             cmd,
@@ -3509,6 +3527,7 @@ def _run_compare_side(
     timeout: float,
     subprocess_run,
     progress_out,
+    effort: str | None = None,
 ) -> list[dict]:
     """Feed the full prompt suite into one model via ``claude -p``.
 
@@ -3540,6 +3559,7 @@ def _run_compare_side(
             max_budget_usd=max_budget_usd,
             timeout=timeout,
             subprocess_run=subprocess_run,
+            effort=effort,
         )
         results.append({"name": name, "response": out_json})
     return results
@@ -3553,6 +3573,8 @@ def _confirm_compare_run_or_exit(
     scratch_dir: Path,
     assume_yes: bool,
     stdin=None,
+    effort_a: str | None = None,
+    effort_b: str | None = None,
 ) -> None:
     """Confirmation gate before firing 2 × N headless inference calls.
 
@@ -3560,7 +3582,10 @@ def _confirm_compare_run_or_exit(
     non-TTY stdin without ``--yes`` is a hard refusal, interactive prompt
     defaults to no. Unlike count-tokens mode, each call here runs full
     inference and burns real subscription quota, so the message
-    emphasises that rather than rate-limit requests.
+    emphasises that rather than rate-limit requests. ``effort_a`` /
+    ``effort_b`` surface on the model line only when set — silent fallback
+    to Claude Code's per-model defaults preserves the existing output
+    shape for the no-flag case.
     """
     if stdin is None:
         stdin = sys.stdin
@@ -3570,8 +3595,10 @@ def _confirm_compare_run_or_exit(
         f"{total_calls} headless Claude Code invocations.",
         file=sys.stderr,
     )
+    suffix_a = f" (effort={effort_a})" if effort_a else ""
+    suffix_b = f" (effort={effort_b})" if effort_b else ""
     print(
-        f"  Side A: {model_a}   Side B: {model_b}",
+        f"  Side A: {model_a}{suffix_a}   Side B: {model_b}{suffix_b}",
         file=sys.stderr,
     )
     print(
@@ -3632,6 +3659,8 @@ def _run_compare_run(
     tempfile_mkdtemp=None,
     auto_resume: bool = True,
     compare_run_extras: bool = True,
+    effort_a: str | None = None,
+    effort_b: str | None = None,
 ) -> dict:
     """Orchestrator for ``--compare-run``: capture both sides, then compare.
 
@@ -3672,6 +3701,23 @@ def _run_compare_run(
         progress_out = sys.stderr
     formats = formats or []
 
+    # Effort levels: validate before we burn any subprocess calls. Empty
+    # string is a no-op so the CLI dispatcher can normalise ``""`` → ``None``
+    # without a branch, mirroring the permission-mode opt-out convention.
+    for label, level in (("A", effort_a), ("B", effort_b)):
+        if level in (None, ""):
+            continue
+        if level not in _COMPARE_RUN_EFFORT_LEVELS:
+            print(
+                f"[error] --compare-run-effort side {label}: {level!r} is "
+                f"not a valid effort level. Expected one of: "
+                f"{', '.join(sorted(_COMPARE_RUN_EFFORT_LEVELS))}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    effort_a = effort_a or None
+    effort_b = effort_b or None
+
     # Step 1: scratch dir. Resolve symlinks (``/tmp`` → ``/private/tmp`` on
     # macOS) so the slug we compute later matches what Claude Code derives
     # from its own cwd when the subprocess runs — otherwise the JSONLs land
@@ -3699,15 +3745,20 @@ def _run_compare_run(
     _confirm_compare_run_or_exit(
         model_a, model_b, len(suite),
         scratch_dir=scratch_dir, assume_yes=assume_yes, stdin=stdin,
+        effort_a=effort_a, effort_b=effort_b,
     )
 
     # Step 3: capture side A then side B
     side_uuids: dict[str, str] = {}
-    for side_label, model in (("A", model_a), ("B", model_b)):
+    for side_label, model, side_effort in (
+        ("A", model_a, effort_a), ("B", model_b, effort_b),
+    ):
         session_id = uuid_factory()
         side_uuids[side_label] = session_id
+        effort_suffix = f"  effort={side_effort}" if side_effort else ""
         print(
-            f"\n=== Side {side_label}: {model}  session_id={session_id} ===",
+            f"\n=== Side {side_label}: {model}  session_id={session_id}"
+            f"{effort_suffix} ===",
             file=progress_out,
         )
         try:
@@ -3720,6 +3771,7 @@ def _run_compare_run(
                 timeout=per_call_timeout,
                 subprocess_run=subprocess_run,
                 progress_out=progress_out,
+                effort=side_effort,
             )
         except CompareRunError as exc:
             print(f"[error] side {side_label} ({model}): {exc}", file=sys.stderr)

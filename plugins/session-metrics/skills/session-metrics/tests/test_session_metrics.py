@@ -4775,6 +4775,151 @@ def test_cli_compare_run_end_to_end(monkeypatch, tmp_path):
     # Defaults land correctly on pass-through options.
     assert captured["permission_mode"] == "bypassPermissions"
     assert "Bash" in captured["allowed_tools"]
+    # --compare-run-effort absent → both sides land as None so Claude Code
+    # keeps its per-model defaults (opus-4-6 high, opus-4-7 xhigh).
+    assert captured["effort_a"] is None
+    assert captured["effort_b"] is None
+
+
+# --- --compare-run-effort (reasoning effort pinning) ------------------------
+
+def test_compare_run_omits_effort_flag_when_unset(tmp_path, monkeypatch):
+    """With ``effort_a=effort_b=None`` (the default), no ``--effort`` flag
+    appears in any subprocess argv. This preserves Claude Code's per-model
+    defaults — opus-4-6 → high, opus-4-7 → xhigh — which is the whole point
+    of not passing the flag."""
+    fake_run, calls = _make_fake_subprocess_run()
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7",
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: "u",
+        stdin=_FakeTty(False),
+        auto_resume=False,
+    )
+    for c in calls:
+        assert "--effort" not in c
+
+
+def test_compare_run_threads_per_side_effort_into_argv(tmp_path, monkeypatch):
+    """Different effort per side lands in argv: all 10 side-A calls carry
+    ``--effort high`` and all 10 side-B calls carry ``--effort xhigh``."""
+    fake_run, calls = _make_fake_subprocess_run()
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7",
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: "u",
+        stdin=_FakeTty(False),
+        auto_resume=False,
+        effort_a="high",
+        effort_b="xhigh",
+    )
+    for c in calls[:10]:
+        assert "--effort" in c
+        assert c[c.index("--effort") + 1] == "high"
+    for c in calls[10:20]:
+        assert "--effort" in c
+        assert c[c.index("--effort") + 1] == "xhigh"
+
+
+def test_compare_run_rejects_invalid_effort_level(tmp_path, monkeypatch, capsys):
+    """An unknown level (e.g. ``turbo``) fails fast before any subprocess
+    is spawned — burning 20 inference calls only to discover a typo would
+    be the worst possible failure mode."""
+    fake_run, calls = _make_fake_subprocess_run()
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    with pytest.raises(SystemExit) as exc:
+        smc._run_compare_run(
+            "claude-opus-4-6", "claude-opus-4-7",
+            scratch_dir=tmp_path,
+            assume_yes=True,
+            subprocess_run=fake_run,
+            uuid_factory=lambda: "u",
+            stdin=_FakeTty(False),
+            auto_resume=False,
+            effort_a="turbo",
+        )
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "turbo" in err
+    assert "low" in err and "max" in err
+    # Crucially: no subprocess ran.
+    assert calls == []
+
+
+def test_cli_compare_run_effort_two_positional_values(monkeypatch, tmp_path):
+    """``--compare-run-effort high xhigh`` → ``effort_a=high, effort_b=xhigh``."""
+    captured = {}
+    monkeypatch.setattr(
+        smc, "_run_compare_run",
+        lambda a, b, **kw: captured.update({"effort_a": kw.get("effort_a"),
+                                            "effort_b": kw.get("effort_b")}),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "session-metrics.py",
+            "--compare-run", "claude-opus-4-6", "claude-opus-4-7",
+            "--compare-run-effort", "high", "xhigh",
+            "--compare-run-scratch-dir", str(tmp_path),
+            "--yes",
+        ],
+    )
+    sm.main()
+    assert captured["effort_a"] == "high"
+    assert captured["effort_b"] == "xhigh"
+
+
+def test_cli_compare_run_effort_single_value_applies_to_both(monkeypatch, tmp_path):
+    """One positional value pins both sides to that level — common case
+    when the user wants to hold effort constant across versions."""
+    captured = {}
+    monkeypatch.setattr(
+        smc, "_run_compare_run",
+        lambda a, b, **kw: captured.update({"effort_a": kw.get("effort_a"),
+                                            "effort_b": kw.get("effort_b")}),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "session-metrics.py",
+            "--compare-run",
+            "--compare-run-effort", "medium",
+            "--compare-run-scratch-dir", str(tmp_path),
+            "--yes",
+        ],
+    )
+    sm.main()
+    assert captured["effort_a"] == "medium"
+    assert captured["effort_b"] == "medium"
+
+
+def test_cli_compare_run_effort_three_values_refused(monkeypatch, tmp_path, capsys):
+    """Three or more positional values → clean exit 1, not a silent drop."""
+    monkeypatch.setattr(
+        smc, "_run_compare_run",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not run")),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "session-metrics.py",
+            "--compare-run",
+            "--compare-run-effort", "low", "medium", "high",
+            "--compare-run-scratch-dir", str(tmp_path),
+            "--yes",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        sm.main()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "0, 1, or 2" in err
 
 
 # =============================================================================
