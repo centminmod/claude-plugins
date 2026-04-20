@@ -1,6 +1,6 @@
 {
   "name": "session-metrics",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Parses Claude Code JSONL logs to produce per-turn token/cost/cache breakdowns. Multi-format export (text/JSON/CSV/MD/HTML) with 5-hour session blocks, weekly roll-up, session duration & burn rate, hour-of-day + weekday punchcard, and pluggable chart libraries (Highcharts/uPlot/Chart.js/none). --compare-run spawns two headless `claude -p` sessions for a one-command A/B benchmark (defaults to claude-opus-4-6[1m] vs claude-opus-4-7[1m]); --compare renders IFEval pass-rate + ratio heatmap + shareable HTML from existing JSONLs; --count-tokens-only hits the Anthropic count_tokens API for an inference-free tokenizer check. Zero network by default, stdlib-only Python.",
   "author": {
     "name": "George Liu",

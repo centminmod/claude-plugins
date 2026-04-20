@@ -908,7 +908,15 @@ def _ensure_within_projects(path: Path) -> Path:
 
 
 def _cwd_to_slug(cwd: str | None = None) -> str:
-    return (cwd or os.getcwd()).replace("/", "-")
+    # Claude Code writes JSONLs to ~/.claude/projects/<slug>/ where <slug>
+    # is the cwd with every non-alphanumeric character (except `-`) mapped
+    # to `-`. Runs of replaceable chars are preserved as consecutive `-`s
+    # — e.g. `/Users/x/.claude-mem` → `-Users-x--claude-mem`. An earlier
+    # version only replaced `/`, which drifted from Claude Code whenever
+    # the path carried `_`, `.`, spaces, or apostrophes (e.g. $TMPDIR
+    # paths under /private/var/folders/.../xxx_yyy/) and broke
+    # compare-run extras that looked up session JSONLs via this slug.
+    return re.sub(r"[^A-Za-z0-9-]", "-", cwd or os.getcwd())
 
 
 def _find_jsonl_files(slug: str, include_subagents: bool = False) -> list[Path]:

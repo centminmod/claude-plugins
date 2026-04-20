@@ -807,6 +807,44 @@ def test_validate_slug_rejects_slashes_and_traversal():
         sm._validate_slug("foo/../bar")
 
 
+# --- _cwd_to_slug ------------------------------------------------------------
+# The slug must match Claude Code's own cwd → project-dir rule exactly, since
+# it drives every session lookup (including compare-run extras, which look up
+# per-side JSONLs by building the slug-path themselves). The evidence-based
+# rule from observed ~/.claude/projects/<slug>/ entries is: replace every
+# non-alphanumeric char (except `-`) with `-`; preserve runs as consecutive
+# dashes. Previous behaviour replaced only `/`, which silently drifted when
+# cwd contained `_`, `.`, spaces, or apostrophes — and that broke compare-run
+# extras under $TMPDIR paths like /private/var/folders/.../xxx_yyy/zzz.
+
+
+def test_cwd_to_slug_replaces_slashes():
+    assert sm._cwd_to_slug("/Volumes/AMZ3/session-metrics") == \
+        "-Volumes-AMZ3-session-metrics"
+
+
+def test_cwd_to_slug_replaces_underscores():
+    # Regression: $TMPDIR paths on macOS (/private/var/folders/cv/xxx_yyy/T/...)
+    # caused compare-run extras to build the wrong lookup path.
+    assert sm._cwd_to_slug("/tmp/foo_bar/baz") == "-tmp-foo-bar-baz"
+
+
+def test_cwd_to_slug_replaces_dots_preserving_runs():
+    # `/Users/x/.claude-mem` → `-Users-x--claude-mem`: the `/` and `.`
+    # each become `-`, yielding a consecutive `--`. This matches
+    # entries observed in live ~/.claude/projects/.
+    assert sm._cwd_to_slug("/Users/x/.claude-mem") == "-Users-x--claude-mem"
+
+
+def test_cwd_to_slug_replaces_spaces_and_apostrophes():
+    assert sm._cwd_to_slug("/Users/george/Liu's Project") == \
+        "-Users-george-Liu-s-Project"
+
+
+def test_cwd_to_slug_preserves_digits_and_dashes():
+    assert sm._cwd_to_slug("/a/b-c/d1-2") == "-a-b-c-d1-2"
+
+
 # --- Time-of-day bucketing ---------------------------------------------------
 
 def _epoch(y, mo, d, h=0, m=0):
