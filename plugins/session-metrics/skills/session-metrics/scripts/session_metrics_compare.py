@@ -551,12 +551,21 @@ def _build_side_info(
     user_ts: list[int],
     turn_records: list[dict],
     tz_offset_hours: float,
+    *,
+    effort: str | None = None,
 ) -> dict:
     """Compact per-side summary consumed by every compare renderer.
 
     Carries both the raw model id (with any ``[1m]`` suffix, used for
     the header banner) and the stripped family slug (used for
     model-agnostic report copy).
+
+    ``effort`` records the ``claude -p --effort <level>`` value the
+    side was captured with. Preserved verbatim (``"low"`` / ``"medium"``
+    / ``"high"`` / ``"xhigh"`` / ``"max"``) and ``None`` when the caller
+    didn't pin a level — renderers must surface it only when truthy so
+    Mode 2 and arbitrary-JSONL inputs that never went through the
+    compare-run orchestrator stay unannotated.
     """
     m = _main()
     dominant = _dominant_model_id(raw_turns)
@@ -569,6 +578,7 @@ def _build_side_info(
         "dominant_model_id": dominant,
         "model_family":      _model_family_slug(dominant),
         "context_tier":      _context_tier_from_model_id(dominant),
+        "effort":            effort or None,
         "turn_count":        len(turn_records),
         "user_prompt_count": len(user_ts),
         "first_ts":          first_ts,
@@ -583,6 +593,8 @@ def _build_side_info(
 def _build_aggregate_side_info(
     sessions: list[tuple[str, list[dict], list[int], list[dict]]],
     tz_offset_hours: float,
+    *,
+    effort: str | None = None,
 ) -> dict:
     """Aggregate multiple sessions into a single compare side.
 
@@ -601,6 +613,12 @@ def _build_aggregate_side_info(
     Mode 1 side_info is retained separately — flattening both shapes
     into one entry point would make Mode 1 callers carry degenerate
     single-session fields they don't use.
+
+    ``effort`` mirrors :func:`_build_side_info` — pinned reasoning
+    level annotated onto the side if known, ``None`` otherwise. Mode 2
+    aggregates are rarely captured via the orchestrator so this stays
+    ``None`` by default; callers who do know the level (e.g. tests)
+    can still pass it through.
     """
     m = _main()
 
@@ -626,6 +644,7 @@ def _build_aggregate_side_info(
         "dominant_model_id": dominant,
         "model_family":      _model_family_slug(dominant),
         "context_tier":      _context_tier_from_model_id(dominant),
+        "effort":            effort or None,
         "turn_count":        n_turns,
         "user_prompt_count": n_prompts,
         "first_ts":          first_ts,
@@ -860,6 +879,8 @@ def _build_compare_report(
     tz_label: str = "UTC",
     prompt_suite: dict | None = None,
     allow_suite_mismatch: bool = False,
+    effort_a: str | None = None,
+    effort_b: str | None = None,
 ) -> dict:
     """Build a Mode-1 (controlled, session-pair) compare report.
 
@@ -949,10 +970,12 @@ def _build_compare_report(
     side_a_info = _build_side_info(
         side_a_session_id, side_a_turns, side_a_user_ts,
         a_turn_records, tz_offset_hours,
+        effort=effort_a,
     )
     side_b_info = _build_side_info(
         side_b_session_id, side_b_turns, side_b_user_ts,
         b_turn_records, tz_offset_hours,
+        effort=effort_b,
     )
     advisories = _build_advisories(side_a_info, side_b_info, pairing)
     advisories.extend(suite_advisories)
@@ -1090,6 +1113,8 @@ def _build_compare_aggregate_report(
     slug: str,
     tz_offset_hours: float = 0.0,
     tz_label: str = "UTC",
+    effort_a: str | None = None,
+    effort_b: str | None = None,
 ) -> dict:
     """Build a Mode-2 (observational, project-aggregate) compare report.
 
@@ -1104,19 +1129,26 @@ def _build_compare_aggregate_report(
     isn't meaningful when prompts differ across sessions), and the
     same header/summary/advisory/totals shape Mode 1 uses — so
     renderers can reuse most of the Mode 1 helpers.
+
+    ``effort_a`` / ``effort_b`` annotate each side with the pinned
+    reasoning level when known (threaded through from compare-run);
+    ``None`` (the default) leaves the side unannotated, which is the
+    common case for Mode 2 aggregates captured outside the orchestrator.
     """
     m = _main()
 
-    def _per_side(sessions):
+    def _per_side(sessions, effort):
         prepared = []
         for sid, raw_turns, user_ts in sessions:
             records = [m._build_turn_record(i + 1, t, tz_offset_hours)
                        for i, t in enumerate(raw_turns)]
             prepared.append((sid, raw_turns, user_ts, records))
-        return _build_aggregate_side_info(prepared, tz_offset_hours)
+        return _build_aggregate_side_info(
+            prepared, tz_offset_hours, effort=effort,
+        )
 
-    side_a_info = _per_side(side_a_sessions)
-    side_b_info = _per_side(side_b_sessions)
+    side_a_info = _per_side(side_a_sessions, effort_a)
+    side_b_info = _per_side(side_b_sessions, effort_b)
     advisories = _build_aggregate_advisories(side_a_info, side_b_info)
     summary = _build_aggregate_summary(side_a_info, side_b_info)
     return {
@@ -1406,6 +1438,31 @@ def _side_label(side: dict, fallback: str) -> str:
     return family or fallback
 
 
+def _fmt_effort_suffix(side: dict) -> str:
+    """Return ``" effort=<level>"`` when the side has a pinned reasoning
+    level, or an empty string otherwise.
+
+    Renderers concatenate this at the end of the model banner so the
+    output is self-descriptive for compare-run captures while staying
+    silent on Mode 2 / arbitrary-JSONL inputs that never ran through
+    the orchestrator (effort is ``None`` there).
+    """
+    effort = side.get("effort") or ""
+    return f" effort={effort}" if effort else ""
+
+
+def _any_effort(report: dict) -> bool:
+    """True when either side of the compare report carries a pinned
+    reasoning effort. Renderers use this to decide whether to emit an
+    Effort column / row — avoids rendering an empty cell on every
+    legacy / Mode 2 report that will never set the field.
+    """
+    return bool(
+        (report.get("side_a") or {}).get("effort")
+        or (report.get("side_b") or {}).get("effort")
+    )
+
+
 def render_compare_text(report: dict) -> str:
     """Render the compare report as plain-text for stdout.
 
@@ -1434,9 +1491,11 @@ def _render_controlled_text(report: dict) -> str:
     p(f"COMPARE (controlled)  slug={report['slug']}  pair-by={report['pair_by']}  tz={tz_label}")
     p("=" * 82)
     p(f"  A  {_side_label(a, 'a'):<14} model={a['dominant_model_id'] or '?':<28} "
-      f"turns={a['turn_count']:<4} cost=${a['totals']['cost']:.4f}")
+      f"turns={a['turn_count']:<4} cost=${a['totals']['cost']:.4f}"
+      f"{_fmt_effort_suffix(a)}")
     p(f"  B  {_side_label(b, 'b'):<14} model={b['dominant_model_id'] or '?':<28} "
-      f"turns={b['turn_count']:<4} cost=${b['totals']['cost']:.4f}")
+      f"turns={b['turn_count']:<4} cost=${b['totals']['cost']:.4f}"
+      f"{_fmt_effort_suffix(b)}")
     p()
 
     if report["advisories"]:
@@ -1540,12 +1599,24 @@ def _render_controlled_md(report: dict) -> str:
     p()
     p("## Sides")
     p()
-    p("| Side | Session | Model | Turns | Cost |")
-    p("|------|---------|-------|------:|-----:|")
+    has_effort = _any_effort(report)
+    if has_effort:
+        p("| Side | Session | Model | Effort | Turns | Cost |")
+        p("|------|---------|-------|--------|------:|-----:|")
+    else:
+        p("| Side | Session | Model | Turns | Cost |")
+        p("|------|---------|-------|------:|-----:|")
     for tag, side in (("A", a), ("B", b)):
-        p(f"| {tag} | `{_side_label(side, tag.lower())}` | "
-          f"`{side['dominant_model_id'] or '?'}` | "
-          f"{side['turn_count']} | ${side['totals']['cost']:.4f} |")
+        if has_effort:
+            effort_cell = f"`{side.get('effort')}`" if side.get("effort") else "—"
+            p(f"| {tag} | `{_side_label(side, tag.lower())}` | "
+              f"`{side['dominant_model_id'] or '?'}` | "
+              f"{effort_cell} | "
+              f"{side['turn_count']} | ${side['totals']['cost']:.4f} |")
+        else:
+            p(f"| {tag} | `{_side_label(side, tag.lower())}` | "
+              f"`{side['dominant_model_id'] or '?'}` | "
+              f"{side['turn_count']} | ${side['totals']['cost']:.4f} |")
     p()
 
     if report["advisories"]:
@@ -1697,13 +1768,14 @@ def _render_controlled_csv(report: dict) -> str:
     b = report["side_b"]
     w.writerow([])
     w.writerow(["# SUMMARY"])
-    w.writerow(["side", "session_id", "model_family", "context_tier",
+    w.writerow(["side", "session_id", "model_family", "context_tier", "effort",
                 "turn_count", "input", "output", "cache_read", "cache_write",
                 "total_tokens", "cost_usd", "cache_read_share_pct"])
     for tag, side in (("A", a), ("B", b)):
         t = side["totals"]
         w.writerow([
             tag, side["session_id"], side["model_family"], side["context_tier"],
+            side.get("effort") or "",
             side["turn_count"], t["input"], t["output"],
             t["cache_read"], t["cache_write"], t["total"],
             f"{t['cost']:.6f}", f"{side['cache_read_share_of_input']:.2f}",
@@ -1776,9 +1848,11 @@ def _render_aggregate_text(report: dict) -> str:
     p(f"COMPARE (observational)  slug={report['slug']}  tz={tz_label}")
     p("=" * 82)
     p(f"  A  {_aggregate_side_label(a):<28} model={a['dominant_model_id'] or '?':<28} "
-      f"turns={a['turn_count']:<4} cost=${a['totals']['cost']:.4f}")
+      f"turns={a['turn_count']:<4} cost=${a['totals']['cost']:.4f}"
+      f"{_fmt_effort_suffix(a)}")
     p(f"  B  {_aggregate_side_label(b):<28} model={b['dominant_model_id'] or '?':<28} "
-      f"turns={b['turn_count']:<4} cost=${b['totals']['cost']:.4f}")
+      f"turns={b['turn_count']:<4} cost=${b['totals']['cost']:.4f}"
+      f"{_fmt_effort_suffix(b)}")
     p()
 
     if report["advisories"]:
@@ -1843,14 +1917,28 @@ def _render_aggregate_md(report: dict) -> str:
     p()
     p("## Sides")
     p()
-    p("| Side | Family | Sessions | Model | Turns | Prompts | Cost |")
-    p("|------|--------|---------:|-------|------:|--------:|-----:|")
+    has_effort = _any_effort(report)
+    if has_effort:
+        p("| Side | Family | Sessions | Model | Effort | Turns | Prompts | Cost |")
+        p("|------|--------|---------:|-------|--------|------:|--------:|-----:|")
+    else:
+        p("| Side | Family | Sessions | Model | Turns | Prompts | Cost |")
+        p("|------|--------|---------:|-------|------:|--------:|-----:|")
     for tag, side in (("A", a), ("B", b)):
-        p(f"| {tag} | `{side['model_family'] or '?'}` | "
-          f"{side['session_count']} | "
-          f"`{side['dominant_model_id'] or '?'}` | "
-          f"{side['turn_count']} | {side['user_prompt_count']} | "
-          f"${side['totals']['cost']:.4f} |")
+        if has_effort:
+            effort_cell = f"`{side.get('effort')}`" if side.get("effort") else "—"
+            p(f"| {tag} | `{side['model_family'] or '?'}` | "
+              f"{side['session_count']} | "
+              f"`{side['dominant_model_id'] or '?'}` | "
+              f"{effort_cell} | "
+              f"{side['turn_count']} | {side['user_prompt_count']} | "
+              f"${side['totals']['cost']:.4f} |")
+        else:
+            p(f"| {tag} | `{side['model_family'] or '?'}` | "
+              f"{side['session_count']} | "
+              f"`{side['dominant_model_id'] or '?'}` | "
+              f"{side['turn_count']} | {side['user_prompt_count']} | "
+              f"${side['totals']['cost']:.4f} |")
     p()
 
     if report["advisories"]:
@@ -1901,7 +1989,7 @@ def _render_aggregate_csv(report: dict) -> str:
     w = csv_mod.writer(out)
 
     w.writerow([
-        "side", "model_family", "dominant_model_id", "context_tier",
+        "side", "model_family", "dominant_model_id", "context_tier", "effort",
         "session_count", "turn_count", "user_prompt_count",
         "input_tokens", "output_tokens", "cache_read_tokens",
         "cache_write_tokens", "total_tokens", "cost_usd",
@@ -1912,7 +2000,8 @@ def _render_aggregate_csv(report: dict) -> str:
         t = side["totals"]
         w.writerow([
             tag, side["model_family"], side["dominant_model_id"],
-            side["context_tier"], side["session_count"], side["turn_count"],
+            side["context_tier"], side.get("effort") or "",
+            side["session_count"], side["turn_count"],
             side["user_prompt_count"], t["input"], t["output"], t["cache_read"],
             t["cache_write"], t["total"], f"{t['cost']:.6f}",
             f"{side['cache_read_share_of_input']:.2f}",
@@ -2185,6 +2274,10 @@ def _render_compare_html_controlled(
 
     advisories_html = _advisory_banners_html(report.get("advisories", []) or [])
 
+    def _effort_html(side: dict) -> str:
+        effort = side.get("effort") or ""
+        return f' &middot; effort <code>{_html_escape(effort)}</code>' if effort else ""
+
     sides_html = (
         '<section class="sides">\n'
         f'  <div class="side-card side-a">\n'
@@ -2194,6 +2287,7 @@ def _render_compare_html_controlled(
         f'<code>{_html_escape((a.get("session_id") or "")[:16])}&hellip;</code>'
         f' &middot; {a.get("turn_count", 0)} turns'
         f' &middot; ${a.get("totals", {}).get("cost", 0):.4f}'
+        f'{_effort_html(a)}'
         f'</div>\n'
         f'  </div>\n'
         f'  <div class="side-card side-b">\n'
@@ -2203,6 +2297,7 @@ def _render_compare_html_controlled(
         f'<code>{_html_escape((b.get("session_id") or "")[:16])}&hellip;</code>'
         f' &middot; {b.get("turn_count", 0)} turns'
         f' &middot; ${b.get("totals", {}).get("cost", 0):.4f}'
+        f'{_effort_html(b)}'
         f'</div>\n'
         f'  </div>\n'
         '</section>'
@@ -2396,6 +2491,10 @@ def _render_compare_html_aggregate(
 
     def _side_block(tag: str, side: dict, cls: str) -> str:
         t = side.get("totals", {})
+        effort = side.get("effort") or ""
+        effort_html = (
+            f' &middot; effort <code>{_html_escape(effort)}</code>' if effort else ""
+        )
         return (
             f'  <div class="side-card {cls}">\n'
             f'    <div class="side-tag">{tag}</div>\n'
@@ -2406,6 +2505,7 @@ def _render_compare_html_aggregate(
             f' &middot; {side.get("session_count", 1)} session(s)'
             f' &middot; {side.get("turn_count", 0)} turns'
             f' &middot; ${t.get("cost", 0):.4f}'
+            f'{effort_html}'
             f'</div>\n'
             f'  </div>'
         )
@@ -2796,6 +2896,8 @@ def _run_compare(
     prompt_suite_dir: Path | None = None,
     allow_suite_mismatch: bool = False,
     redact_user_prompts: bool = False,
+    effort_a: str | None = None,
+    effort_b: str | None = None,
 ) -> dict | None:
     """Entrypoint the CLI calls after argument parsing.
 
@@ -2866,6 +2968,8 @@ def _run_compare(
             slug=slug,
             tz_offset_hours=tz_offset,
             tz_label=tz_label,
+            effort_a=effort_a,
+            effort_b=effort_b,
         )
         m._dispatch(report, formats, single_page=single_page,
                     chart_lib=chart_lib,
@@ -2907,6 +3011,8 @@ def _run_compare(
             tz_label=tz_label,
             prompt_suite=prompt_suite,
             allow_suite_mismatch=allow_suite_mismatch,
+            effort_a=effort_a,
+            effort_b=effort_b,
         )
     except SuiteVersionMismatchError as exc:
         print(f"[error] {exc}", file=sys.stderr)
@@ -3815,6 +3921,8 @@ def _run_compare_run(
             prompt_suite_dir=suite_dir,
             allow_suite_mismatch=allow_suite_mismatch,
             redact_user_prompts=redact_user_prompts,
+            effort_a=effort_a,
+            effort_b=effort_b,
         )
         # Extras: per-session dashboards + analysis.md scaffold. Gated on
         # (1) compare_run_extras (--no-compare-run-extras opts out),
@@ -4163,8 +4271,12 @@ def _render_compare_analysis_md(
     p()
     a_sid = a.get("session_id") or ""
     b_sid = b.get("session_id") or ""
-    p(f"- **Side A:** `{a_model}` — session `{a_sid}`")
-    p(f"- **Side B:** `{b_model}` — session `{b_sid}`")
+    a_effort = a.get("effort") or ""
+    b_effort = b.get("effort") or ""
+    a_effort_tail = f" — effort `{a_effort}`" if a_effort else ""
+    b_effort_tail = f" — effort `{b_effort}`" if b_effort else ""
+    p(f"- **Side A:** `{a_model}` — session `{a_sid}`{a_effort_tail}")
+    p(f"- **Side B:** `{b_model}` — session `{b_sid}`{b_effort_tail}")
     p(f"- **Pair-by:** `{compare_report.get('pair_by', 'fingerprint')}`")
     p(f"- **Compare mode:** `{compare_report.get('compare_mode', 'controlled')}`")
     p(f"- **Slug:** `{compare_report.get('slug', '')}`")

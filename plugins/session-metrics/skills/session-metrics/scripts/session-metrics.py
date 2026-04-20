@@ -4616,6 +4616,22 @@ def _build_parser() -> argparse.ArgumentParser:
                         "ran different compare-suite versions. Without this "
                         "flag the compare refuses (ratios would conflate "
                         "suite shift with model shift).")
+    p.add_argument("--compare-effort", nargs="*", metavar="LEVEL",
+                   default=None,
+                   help="Annotate the compare report with the reasoning "
+                        "effort level each side was captured at. Purely "
+                        "cosmetic — does not re-run anything — this flag "
+                        "surfaces the effort used during capture on the "
+                        "text, MD, CSV, HTML, and analysis.md outputs. "
+                        "Takes 0, 1, or 2 positional levels from "
+                        "{low, medium, high, xhigh, max}. With 1 value "
+                        "both sides share that label; with 2 values the "
+                        "first applies to side A, the second to side B. "
+                        "--compare-run already infers this from "
+                        "--compare-run-effort, so you rarely need to "
+                        "pass this flag manually unless you're running "
+                        "--compare on JSONLs captured outside the "
+                        "orchestrator.")
     # --- Phase 6 / 7 — HTML compare + Insights card ----------------------
     p.add_argument("--redact-user-prompts", action="store_true",
                    help="In the compare HTML report, replace freeform "
@@ -4836,6 +4852,15 @@ def main() -> None:
                                         if scratch_dir else slug)
         except (OSError, AttributeError):
             pass
+        # --compare-run defaults to md + html artefact generation so the
+        # user always gets the analysis.md scaffold + dashboard HTML
+        # pair alongside the text report. Passing an explicit --output
+        # list overrides this (empty list stays empty after override
+        # only via the not-yet-exposed opt-out; see SKILL.md for the
+        # rationale). --no-compare-run-extras is the escape hatch when
+        # the user wants the text-only behaviour back.
+        compare_run_formats = formats or ["md", "html"]
+        _maybe_warn_chart_license(chart_lib, compare_run_formats)
         smc._run_compare_run(
             model_a, model_b,
             scratch_dir=scratch_dir,
@@ -4845,7 +4870,7 @@ def main() -> None:
             permission_mode=permission_mode,
             max_budget_usd=args.compare_run_max_budget_usd,
             per_call_timeout=timeout,
-            formats=formats,
+            formats=compare_run_formats,
             single_page=args.single_page,
             chart_lib=chart_lib,
             redact_user_prompts=args.redact_user_prompts,
@@ -4865,6 +4890,22 @@ def main() -> None:
     if args.compare:
         smc = _load_compare_module()
         suite_dir = Path(args.compare_prompts).expanduser() if args.compare_prompts else None
+        # Resolve 0/1/2 positional effort annotations for --compare. This is
+        # cosmetic: it doesn't re-run inference, it just lets the user
+        # surface the effort level the JSONLs were captured at on the
+        # text/MD/HTML/CSV/analysis.md outputs. Same 0/1/2 arity as
+        # --compare-run-effort so the two feel symmetric.
+        _compare_efforts = list(args.compare_effort or [])
+        if len(_compare_efforts) == 0:
+            effort_a_compare = effort_b_compare = None
+        elif len(_compare_efforts) == 1:
+            effort_a_compare = effort_b_compare = _compare_efforts[0]
+        elif len(_compare_efforts) == 2:
+            effort_a_compare, effort_b_compare = _compare_efforts[0], _compare_efforts[1]
+        else:
+            print("[error] --compare-effort takes 0, 1, or 2 levels; "
+                  f"got {len(_compare_efforts)}", file=sys.stderr)
+            sys.exit(1)
         # State-marker file: Phase 7's dashboard insight card only fires
         # after the user has successfully run --compare once in this project.
         # Dropping the marker here (before the run, as a best-effort) means
@@ -4892,6 +4933,8 @@ def main() -> None:
             prompt_suite_dir=suite_dir,
             allow_suite_mismatch=args.allow_suite_mismatch,
             redact_user_prompts=args.redact_user_prompts,
+            effort_a=effort_a_compare,
+            effort_b=effort_b_compare,
         )
         return
 

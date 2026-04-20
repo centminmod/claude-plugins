@@ -147,6 +147,22 @@ Optional safety belts:
   sides at `high`) instead of letting each model fall back to its
   own default — useful when isolating tokenizer / algorithm changes
   from the effort-level change that ships alongside a new model.
+  The resolved effort for each side is threaded into the compare
+  report (text summary, Markdown "Effort" column, HTML side-meta,
+  analysis.md front matter) so consumers of the artefacts can see
+  what effort level produced the numbers.
+
+Annotation-only flag for the `compare` route (when you're rendering
+a report over two JSONLs that already exist and want the effort
+labels to appear even though they're not recorded in the transcript):
+
+- `--compare-effort [LEVEL [LEVEL]]` — purely cosmetic. Accepts 0,
+  1, or 2 values like `--compare-run-effort`, but does **not** spawn
+  any subprocess; it only tags the Side A / Side B metadata so the
+  renderers show the effort level. `--compare-run` already infers
+  the effort labels from `--compare-run-effort` automatically, so
+  this flag is relevant only for the manual-capture / re-render
+  workflows.
 
 If any single `claude -p` call fails, the orchestrator aborts with
 the stderr from that call and leaves the partial JSONL on disk for
@@ -177,8 +193,15 @@ Proceed? [y/N]: y
 
 ### Extras — per-session dashboards + analysis scaffold
 
-When you pass `--output <fmt>` to `compare-run`, the orchestrator emits
-the compare report **plus five companion files** in
+`compare-run` **defaults to `--output md html`** so every invocation
+emits the per-session dashboards + analysis scaffold on disk. The pre-
+v1.7.1 text-only default is still reachable with
+`--no-compare-run-extras` (strips the companions) or by passing
+`--output text` explicitly. Any explicit `--output …` value overrides
+the default entirely.
+
+When `--output <fmt>` is in effect (either by default or explicit), the
+orchestrator emits the compare report **plus five companion files** in
 `exports/session-metrics/`:
 
 | File | What it is |

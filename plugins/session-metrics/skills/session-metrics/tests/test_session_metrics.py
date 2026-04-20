@@ -2239,6 +2239,108 @@ def test_build_compare_report_basic_shape():
     # Fixture designed for exact 1.3× ratio across every metric.
     assert report["summary"]["input_tokens_ratio"] == pytest.approx(1.3)
     assert report["summary"]["cost_ratio"] == pytest.approx(1.3, rel=1e-9)
+    # Effort is unset by default — renderers treat None as "don't annotate".
+    assert report["side_a"]["effort"] is None
+    assert report["side_b"]["effort"] is None
+
+
+def test_build_compare_report_threads_effort_into_both_sides():
+    # Effort labels are purely cosmetic annotations that flow from the
+    # CLI into the report dict so every renderer (text/MD/CSV/HTML/
+    # analysis.md) can surface which --effort level each side ran at.
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, b_turns, b_user_ts,
+        slug="test-slug",
+        effort_a="high", effort_b="xhigh",
+    )
+    assert report["side_a"]["effort"] == "high"
+    assert report["side_b"]["effort"] == "xhigh"
+
+
+def test_compare_text_renderer_emits_effort_suffix_when_set():
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, b_turns, b_user_ts,
+        slug="test-slug",
+        effort_a="high", effort_b="xhigh",
+    )
+    text = smc._render_controlled_text(report)
+    # Both sides' banner rows carry the effort suffix when set.
+    assert "effort=high" in text
+    assert "effort=xhigh" in text
+
+
+def test_compare_text_renderer_omits_effort_suffix_when_unset():
+    report = _make_basic_compare_report()
+    text = smc._render_controlled_text(report)
+    assert "effort=" not in text
+
+
+def test_compare_md_renderer_adds_effort_column_when_set():
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, b_turns, b_user_ts,
+        slug="test-slug",
+        effort_a="high", effort_b="xhigh",
+    )
+    md = smc._render_controlled_md(report)
+    assert "| Effort |" in md
+    assert "`high`" in md
+    assert "`xhigh`" in md
+
+
+def test_compare_md_renderer_omits_effort_column_when_unset():
+    report = _make_basic_compare_report()
+    md = smc._render_controlled_md(report)
+    assert "| Effort |" not in md
+
+
+def test_compare_html_renderer_includes_effort_when_set():
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, b_turns, b_user_ts,
+        slug="test-slug",
+        effort_a="high", effort_b="xhigh",
+    )
+    html = smc._render_compare_html_controlled(report)
+    # Effort renders as `effort <code>level</code>` inside side-meta.
+    assert "effort <code>high</code>" in html
+    assert "effort <code>xhigh</code>" in html
+
+
+def test_compare_html_renderer_omits_effort_when_unset():
+    report = _make_basic_compare_report()
+    html = smc._render_compare_html_controlled(report)
+    assert "effort <code>" not in html
+
+
+def test_compare_analysis_md_includes_effort_when_set():
+    # Build a minimal fake analysis input: compare_report + two
+    # per-session report dicts. The analysis renderer only reads a
+    # narrow slice so empty session reports are fine.
+    a_sid, a_turns, a_user_ts = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, b_user_ts = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    compare_report = smc._build_compare_report(
+        a_sid, a_turns, a_user_ts,
+        b_sid, b_turns, b_user_ts,
+        slug="test-slug",
+        effort_a="high", effort_b="xhigh",
+    )
+    fake_session_report = {"totals": {}}
+    article = smc._render_compare_analysis_md(
+        compare_report, fake_session_report, fake_session_report, links={},
+    )
+    assert "effort `high`" in article
+    assert "effort `xhigh`" in article
 
 
 def test_build_compare_report_cost_delta_is_tokenizer_driven():
