@@ -4611,6 +4611,22 @@ def _build_parser() -> argparse.ArgumentParser:
                         "references/model-compare/prompts next to this script). "
                         "Used by --compare for predicate eval and by "
                         "--compare-prep for the prompt list.")
+    p.add_argument("--compare-list-prompts", action="store_true",
+                   help="Print which prompts will run on the next --compare-run "
+                        "(built-in suite + any user extras from "
+                        "~/.session-metrics/prompts/) and the total inference-"
+                        "call count. No inference is performed. Respects "
+                        "--compare-prompts if given.")
+    p.add_argument("--compare-add-prompt", metavar="TEXT",
+                   help="Add a custom prompt to ~/.session-metrics/prompts/ and "
+                        "print the file path and remove command. The prompt runs "
+                        "automatically on every subsequent --compare-run with no "
+                        "flags required. Supports plain-text prompts — no YAML "
+                        "or predicate needed.")
+    p.add_argument("--compare-remove-prompt", metavar="NAME",
+                   help="Remove a user prompt from ~/.session-metrics/prompts/ "
+                        "by its name (as shown by --compare-list-prompts). "
+                        "Cannot remove built-in prompts.")
     p.add_argument("--allow-suite-mismatch", action="store_true",
                    help="Proceed with a --compare even when the two sessions "
                         "ran different compare-suite versions. Without this "
@@ -4781,6 +4797,50 @@ def main() -> None:
 
     if args.list:
         _list_sessions(slug)
+        return
+
+    if args.compare_add_prompt:
+        smc = _load_compare_module()
+        _extras_dir = smc._EXTRAS_DIR
+        _extras_dir.mkdir(parents=True, exist_ok=True)
+        _slug = re.sub(r"[^a-z0-9]+", "_", args.compare_add_prompt.lower())[:40].strip("_") + "_user"
+        _dest = _extras_dir / f"{_slug}.md"
+        if _dest.exists():
+            print(f"[warn] prompt '{_slug}' already exists at {_dest}")
+            print("Edit it directly or delete it and re-run with a different prompt.")
+        else:
+            _dest.write_text(args.compare_add_prompt.strip() + "\n", encoding="utf-8")
+            print(f"Added prompt to {_dest}")
+            print("Will run automatically on every --compare-run "
+                  "(ratio/token data only; no pass/fail scoring)")
+            print(f"Preview: session-metrics --compare-list-prompts")
+            print(f"Remove:  session-metrics --compare-remove-prompt {_slug}")
+        return
+
+    if args.compare_remove_prompt:
+        smc = _load_compare_module()
+        _name = args.compare_remove_prompt.removesuffix(".md")
+        _extras_suite = smc._load_prompt_suite(smc._EXTRAS_DIR)
+        _entry = _extras_suite.get(_name)
+        if _entry is None:
+            print(f"[error] no user prompt named '{_name}' in {smc._EXTRAS_DIR}.",
+                  file=sys.stderr)
+            print("Run: session-metrics --compare-list-prompts  to see available names.",
+                  file=sys.stderr)
+            sys.exit(1)
+        _entry["path"].unlink()
+        print(f"Removed {_entry['path']}")
+        return
+
+    if args.compare_list_prompts:
+        smc = _load_compare_module()
+        _suite_dir = Path(args.compare_prompts).expanduser() if args.compare_prompts else None
+        try:
+            _suite = smc._load_prompt_suite(_suite_dir)
+        except smc.PromptSuiteError as exc:
+            print(f"[error] prompt suite: {exc}", file=sys.stderr)
+            sys.exit(1)
+        smc._run_compare_list_prompts(_suite)
         return
 
     if args.compare_prep is not None:

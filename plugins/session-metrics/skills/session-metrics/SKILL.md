@@ -171,6 +171,13 @@ chat can fill them in. Pass `--no-compare-run-extras` to skip the
 companions and emit only the compare report. Without `--output`,
 nothing writes to disk (text-only stdout path preserved).
 
+**Custom prompts.** Users can add their own prompts to the comparison suite with
+`--compare-add-prompt "text"` — no file format knowledge required. The prompt is
+saved to `~/.session-metrics/prompts/` and runs automatically on every subsequent
+`--compare-run`. Use `--compare-list-prompts` to preview the active suite and call
+count before spending on inference. Use `--compare-remove-prompt <name>` to remove.
+Full guide: [`references/custom-prompts.md`](references/custom-prompts.md).
+
 **Before proposing any compare-mode command, read
 [`references/model-compare.md`](references/model-compare.md).** That
 doc has the full flag table, four workflow recipes, 4-way Opus combo
@@ -191,6 +198,9 @@ use.
 - [`references/model-compare.md`](references/model-compare.md) — `--compare`
   workflow, prompt-suite catalogue, IFEval predicates, interpretation guide.
   Read when `$ARGUMENTS[0]` routes into compare mode.
+- [`references/custom-prompts.md`](references/custom-prompts.md) — Step-by-step
+  guide for adding, removing, and previewing custom prompts for `--compare-run`.
+  Read when the user asks how to add their own prompts or customise the suite.
 
 ## How session detection works
 

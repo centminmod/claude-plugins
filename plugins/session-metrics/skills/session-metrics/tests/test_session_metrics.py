@@ -3089,10 +3089,22 @@ def test_load_prompt_suite_parses_predicates_except_tool_heavy():
 
 
 def test_parse_prompt_file_malformed_raises(tmp_path):
+    # A file that STARTS with '---' but has no closing fence is malformed.
     bad = tmp_path / "bad.md"
-    bad.write_text("no frontmatter here\n")
+    bad.write_text("---\nname: oops\n(no closing fence)\n")
     with pytest.raises(smc.PromptSuiteError):
         smc._parse_prompt_file(bad)
+
+
+def test_parse_prompt_file_lite_format(tmp_path):
+    # A plain-text file (no frontmatter) is accepted as a lite-format prompt.
+    lite = tmp_path / "my_lite_prompt.md"
+    lite.write_text("Write a haiku about Python.\n")
+    entry = smc._parse_prompt_file(lite)
+    assert entry["name"] == "my_lite_prompt"
+    assert entry["check"] is None
+    assert "[session-metrics:user-suite:v1:prompt=my_lite_prompt]" in entry["body"]
+    assert "Write a haiku about Python." in entry["body"]
 
 
 def test_load_prompt_suite_missing_dir_returns_empty(tmp_path):

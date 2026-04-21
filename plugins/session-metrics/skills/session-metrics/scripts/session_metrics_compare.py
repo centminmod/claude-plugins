@@ -1184,6 +1184,12 @@ _PROMPT_SUITE_DIR = (
     / "references" / "model-compare" / "prompts"
 )
 
+# User-supplied extra prompts directory. Files here are merged on top of the
+# packaged suite automatically — no CLI flags required. Supports "lite" format
+# (plain text, no frontmatter needed). Only applies when suite_dir is None
+# (i.e. not overridden by --compare-prompts).
+_EXTRAS_DIR = Path.home() / ".session-metrics" / "prompts"
+
 # Sentinel regex: matches ``[session-metrics:compare-suite:v<N>:prompt=<name>]``
 # anywhere in a user prompt. Plain brackets (not HTML comments) because HTML
 # comments get mangled in some Claude-Code paste paths; the bracket form
@@ -1260,12 +1266,22 @@ class PromptSuiteError(ValueError):
 def _parse_prompt_file(path: Path) -> dict:
     """Parse one prompt file into ``{name, metadata, body, check}``.
 
-    File layout is fixed:
+    Two formats are accepted:
+
+    **Full format** (packaged suite + power-user custom prompts):
 
     - YAML-like frontmatter between ``---`` fences at the top.
     - Prompt body (what the user pastes into Claude Code).
     - A ``<!-- PREDICATE -->`` HTML-comment marker.
     - A 4-backtick ``python`` fenced block defining ``check(text) -> bool``.
+
+    **Lite format** (user extras in ``~/.session-metrics/prompts/``):
+
+    - Plain text prompt body only — no frontmatter, no predicate required.
+    - ``name`` is derived from the filename stem (numeric prefix stripped).
+    - A ``user-suite`` sentinel is auto-injected so the body carries a
+      fingerprint without triggering the compare-suite version checker.
+    - ``check`` is always ``None`` (ratio/token data only; no IFEval column).
 
     ``check`` may be ``None`` (prompt intentionally has no IFEval predicate
     — see ``05_tool_heavy_task.md``). The returned dict carries the body
@@ -1276,9 +1292,29 @@ def _parse_prompt_file(path: Path) -> dict:
     raw = path.read_text(encoding="utf-8")
     fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", raw, flags=re.DOTALL)
     if not fm_match:
-        raise PromptSuiteError(
-            f"{path.name}: missing YAML frontmatter (expected leading '---' fence)"
-        )
+        # A file that starts with '---' but doesn't match the full fence pattern
+        # is a malformed full-format file (missing closing fence, etc.).
+        if raw.lstrip().startswith("---"):
+            raise PromptSuiteError(
+                f"{path.name}: malformed YAML frontmatter (expected opening '---' "
+                f"fence followed by fields and a closing '---' fence)"
+            )
+        # Lite format: plain text prompt — derive name from filename, inject sentinel.
+        name = re.sub(r"^[0-9_]+", "", path.stem)
+        name = re.sub(r"[^a-z0-9_]", "_", name.lower()).strip("_")
+        if not name:
+            raise PromptSuiteError(
+                f"{path.name}: cannot derive a prompt name from the filename stem"
+            )
+        sentinel = f"[session-metrics:user-suite:v1:prompt={name}]"
+        body = f"{sentinel}\n\n{raw.strip()}"
+        return {
+            "name":     name,
+            "metadata": {"description": f"user prompt: {name}"},
+            "body":     body,
+            "check":    None,
+            "path":     path,
+        }
     fm_text, rest = fm_match.groups()
     metadata = _parse_simple_yaml(fm_text)
     name = metadata.get("name") or path.stem.lstrip("0123456789_")
@@ -1326,6 +1362,12 @@ def _load_prompt_suite(
     Falls back to the packaged suite dir when ``suite_dir`` is None. Files are
     sorted by filename so numeric prefixes (``01_``, ``02_``) control the
     canonical order the suite emits in ``--compare-prep`` output.
+
+    When ``suite_dir`` is ``None`` (default), also auto-merges any ``.md`` files
+    found in ``_EXTRAS_DIR`` (``~/.session-metrics/prompts/``). Extras support
+    the lite format (plain text, no frontmatter). This merge is skipped when an
+    explicit ``suite_dir`` override is provided, so ``--compare-prompts DIR``
+    behaviour is unchanged.
     """
     d = suite_dir if suite_dir is not None else _PROMPT_SUITE_DIR
     if not d.exists() or not d.is_dir():
@@ -1338,7 +1380,57 @@ def _load_prompt_suite(
                 f"duplicate prompt name {parsed['name']!r} in {d}"
             )
         suite[parsed["name"]] = parsed
+
+    # Auto-merge user extras only when using the packaged default suite.
+    # Callers passing an explicit suite_dir get exactly what they asked for.
+    if suite_dir is None and _EXTRAS_DIR.exists() and _EXTRAS_DIR.is_dir():
+        for path in sorted(_EXTRAS_DIR.glob("*.md")):
+            parsed = _parse_prompt_file(path)
+            if parsed["name"] in suite:
+                raise PromptSuiteError(
+                    f"user prompt name {parsed['name']!r} in {_EXTRAS_DIR} "
+                    f"collides with a built-in prompt name. "
+                    f"Rename the file (e.g. my_{parsed['name']}.md) to fix this."
+                )
+            parsed["metadata"]["user_prompt"] = True
+            suite[parsed["name"]] = parsed
+
     return suite
+
+
+def _run_compare_list_prompts(suite: dict[str, dict]) -> None:
+    """Print the active prompt suite to stdout and exit.
+
+    Shows which prompts will run on the next ``--compare-run``, their source
+    (built-in vs user), predicate status, and total inference-call count.
+    """
+    builtin = [(n, e) for n, e in suite.items() if not e["metadata"].get("user_prompt")]
+    user    = [(n, e) for n, e in suite.items() if e["metadata"].get("user_prompt")]
+    total   = len(suite)
+
+    if user:
+        header = (
+            f"Suite: {len(builtin)} built-in + {len(user)} user "
+            f"= {total} prompt(s) × 2 models = {2 * total} calls"
+        )
+    else:
+        header = f"Suite: {total} built-in prompt(s) × 2 models = {2 * total} calls"
+    print(header)
+    print()
+
+    col_w = max((len(n) for n in suite), default=20) + 2
+    for name, entry in suite.items():
+        is_user   = entry["metadata"].get("user_prompt", False)
+        marker    = "+" if is_user else "·"
+        has_pred  = "yes" if entry.get("check") is not None else "no "
+        desc      = entry["metadata"].get("description", "")
+        src       = str(entry["path"].parent) if is_user else "(built-in)"
+        print(f"  {marker} {name:<{col_w}} predicate: {has_pred}   {src}")
+        if desc and not desc.startswith("user prompt:"):
+            print(f"    {desc}")
+
+    print()
+    print("· = built-in   + = your prompts  (from ~/.session-metrics/prompts/)")
 
 
 def _assistant_text(raw_turn: dict) -> str:

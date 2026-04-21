@@ -470,7 +470,9 @@ The skill detects this sentinel in user prompts to (a) identify which suite prom
 | 9 | `typescript_refactor` | TypeScript code | word "refactor" appears exactly twice |
 | 10 | `instruction_stress` | stacked constraints | 50 words, no commas, "foo" ×2, lowercase |
 
-Add your own prompts by dropping a file into the suite dir that matches the same format. Point `--compare-prompts <dir>` at an override directory to swap the suite.
+To add, remove, or preview custom prompts, see
+[`references/custom-prompts.md`](custom-prompts.md) for the step-by-step guide
+(beginner-friendly; no YAML or predicates required for the common case).
 
 ---
 
