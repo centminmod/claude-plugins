@@ -382,6 +382,169 @@ def _count_content_blocks(content) -> tuple[dict[str, int], list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Per-turn drill-down helpers
+# ---------------------------------------------------------------------------
+# These feed the HTML detail report's right-side drawer + Prompts section.
+# All five are defensive against the JSONL's two observed user-content shapes
+# (plain string OR list[block]) and return plain strings that are safe to
+# HTML-escape at the point of insertion.
+
+# `<command-name>/foo</command-name>` is the wrapped slash-command marker CC
+# writes when the user types a local command. Unwrapped `/foo` appears when
+# the user types a slash command as a chat message.
+_SLASH_WRAPPED_RE  = re.compile(r"<command-name>\s*(/[A-Za-z][\w-]*)\s*</command-name>")
+_SLASH_BARE_RE     = re.compile(r"^\s*(/[A-Za-z][\w-]*)\b")
+# Stripped at prompt-extract time so the snippet shows the user's intent, not
+# the plumbing. `<local-command-stdout>…</local-command-stdout>` wraps the
+# stdout of a local command and isn't the user's typing.
+_XML_MARKER_RE     = re.compile(
+    r"<(?:command-name|command-message|command-args|local-command-stdout|"
+    r"local-command-stderr|local-command-caveat|system-reminder)[^>]*>"
+    r"[\s\S]*?</(?:command-name|command-message|command-args|local-command-stdout|"
+    r"local-command-stderr|local-command-caveat|system-reminder)>",
+    re.IGNORECASE,
+)
+
+# Bound on embedded assistant-text payload to keep the HTML JSON blob tractable
+# even when a session has a few 10k-char monologues. Prompt text is bounded by
+# the natural shape of user input and typically doesn't need a cap.
+_ASSISTANT_TEXT_CAP = 2000
+
+
+def _truncate(text: str, n: int) -> str:
+    """Slice to ``n`` characters, appending an ellipsis when truncated."""
+    if not isinstance(text, str):
+        return ""
+    if len(text) <= n:
+        return text
+    # Prefer a clean break at whitespace within the last 20% of the window
+    cut = text[:n].rstrip()
+    return cut + "\u2026"
+
+
+def _extract_user_prompt_text(content) -> str:
+    """Flatten a user-entry ``message.content`` to a single prompt string.
+
+    Accepts either a plain string (rare: old-style prompts) or a list of
+    content blocks. Strips XML markers (<command-name>, <local-command-stdout>,
+    <system-reminder>, etc.) so the returned snippet reflects the user's
+    intent, not the plumbing around it. Ignores ``tool_result`` / ``image``
+    blocks — those aren't user typing and are already counted separately.
+    """
+    if isinstance(content, str):
+        raw = content
+    elif isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                txt = block.get("text")
+                if isinstance(txt, str) and txt:
+                    parts.append(txt)
+        raw = "\n".join(parts)
+    else:
+        return ""
+    # Strip XML markers (including their inner text) before collapsing whitespace.
+    raw = _XML_MARKER_RE.sub("", raw).strip()
+    # Collapse runs of whitespace so snippets don't waste characters on
+    # indentation or blank lines.
+    raw = re.sub(r"\s+", " ", raw)
+    return raw
+
+
+def _extract_slash_command(prompt_text: str, raw_content=None) -> str:
+    """Return a leading slash-command name (``/clear``) or empty string.
+
+    Checks the wrapped XML form first (matches even if ``prompt_text`` has
+    been stripped of XML markers), then falls back to a bare `/foo` at the
+    start of the user prompt. Returns "" when neither matches.
+    """
+    if isinstance(raw_content, str):
+        m = _SLASH_WRAPPED_RE.search(raw_content)
+        if m:
+            return m.group(1)
+    elif isinstance(raw_content, list):
+        for block in raw_content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                txt = block.get("text") or ""
+                m = _SLASH_WRAPPED_RE.search(txt)
+                if m:
+                    return m.group(1)
+    if isinstance(prompt_text, str):
+        m = _SLASH_BARE_RE.match(prompt_text)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _extract_assistant_text(content) -> str:
+    """Join all assistant ``text`` blocks into a single string.
+
+    Ignores ``thinking`` blocks (signature-only anyway) and ``tool_use``
+    blocks (captured separately in ``tool_use_detail``). Caps at
+    ``_ASSISTANT_TEXT_CAP`` characters so the embedded JSON payload stays
+    bounded for very long monologue turns.
+    """
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            txt = block.get("text")
+            if isinstance(txt, str) and txt:
+                parts.append(txt)
+    raw = "\n\n".join(parts).strip()
+    if len(raw) > _ASSISTANT_TEXT_CAP:
+        raw = raw[:_ASSISTANT_TEXT_CAP].rstrip() + "\u2026"
+    return raw
+
+
+def _summarise_tool_input(name: str, tool_input) -> str:
+    """One-line preview of a ``tool_use`` block's ``input`` dict.
+
+    Picks the most meaningful field per tool to surface in the drawer's tool
+    list. Falls back to a truncated ``repr`` for unknown tools. The returned
+    string is plain text; escape at the point of insertion.
+    """
+    if not isinstance(tool_input, dict):
+        return ""
+    # Tool-specific fields that carry the actual "what did Claude do" signal.
+    if name == "Bash":
+        cmd = tool_input.get("command") or ""
+        if isinstance(cmd, str):
+            return cmd.splitlines()[0][:160] if cmd else ""
+    if name in ("Read", "Write", "NotebookRead", "NotebookEdit"):
+        p = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+        return str(p)[:160]
+    if name == "Edit":
+        p = tool_input.get("file_path") or ""
+        return str(p)[:160]
+    if name == "Grep":
+        pat = tool_input.get("pattern") or ""
+        path = tool_input.get("path") or ""
+        return f"{pat}" + (f"  in {path}" if path else "")
+    if name == "Glob":
+        return str(tool_input.get("pattern") or "")[:160]
+    if name == "Agent" or name == "Task":
+        return str(tool_input.get("description") or tool_input.get("subagent_type") or "")[:160]
+    if name == "WebFetch" or name == "WebSearch":
+        return str(tool_input.get("url") or tool_input.get("query") or "")[:160]
+    if name == "TodoWrite":
+        todos = tool_input.get("todos")
+        if isinstance(todos, list):
+            return f"{len(todos)} todo item(s)"
+    # Generic fallback: best-effort short JSON
+    try:
+        j = json.dumps(tool_input, default=str, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return ""
+    return j[:160] + ("\u2026" if len(j) > 160 else "")
+
+
+# ---------------------------------------------------------------------------
 # Time-of-day analysis
 # ---------------------------------------------------------------------------
 
@@ -1002,8 +1165,10 @@ def _build_turn_record(global_index: int, entry: dict,
     # Content-block distribution: assistant blocks come from this turn's own
     # message.content; tool_result / image blocks are attributed from the user
     # entry that immediately preceded this turn in the raw JSONL stream.
-    assist_counts, tool_names = _count_content_blocks(msg.get("content"))
-    user_counts, _ = _count_content_blocks(entry.get("_preceding_user_content"))
+    assist_content = msg.get("content")
+    user_raw       = entry.get("_preceding_user_content")
+    assist_counts, tool_names = _count_content_blocks(assist_content)
+    user_counts, _ = _count_content_blocks(user_raw)
     content_blocks = {
         "thinking":    assist_counts["thinking"],
         "tool_use":    assist_counts["tool_use"],
@@ -1011,6 +1176,23 @@ def _build_turn_record(global_index: int, entry: dict,
         "tool_result": user_counts["tool_result"],
         "image":       user_counts["image"],
     }
+    # Per-turn drill-down payload: the user prompt that triggered this turn,
+    # the assistant's text reply, and a tool-call list with input previews.
+    # All three feed the HTML detail drawer + Prompts section. Resume-marker
+    # turns keep empty strings here — the drawer excludes them anyway.
+    prompt_text = _extract_user_prompt_text(user_raw)
+    slash_cmd   = _extract_slash_command(prompt_text, user_raw)
+    asst_text   = _extract_assistant_text(assist_content)
+    tool_detail: list[dict] = []
+    if isinstance(assist_content, list):
+        for block in assist_content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name") or ""
+            tool_detail.append({
+                "name":          name if isinstance(name, str) else str(name),
+                "input_preview": _summarise_tool_input(name, block.get("input")),
+            })
     return {
         "index":                  global_index,
         "timestamp":              entry.get("timestamp", ""),
@@ -1030,6 +1212,12 @@ def _build_turn_record(global_index: int, entry: dict,
         "content_blocks":         content_blocks,
         "tool_use_names":         tool_names,
         "is_resume_marker":       bool(entry.get("_is_resume_marker", False)),
+        "prompt_text":            prompt_text,
+        "prompt_snippet":         _truncate(prompt_text, 240),
+        "slash_command":          slash_cmd,
+        "assistant_text":         asst_text,
+        "assistant_snippet":      _truncate(asst_text, 240),
+        "tool_use_detail":        tool_detail,
     }
 
 
@@ -3903,8 +4091,14 @@ def render_html(report: dict, variant: str = "single",
         )
         content_td = (_content_cell(t.get("content_blocks") or {})
                       if show_content else "")
+        # data-turn-id is the key the drawer JS uses to pull this turn's
+        # detail payload out of #turn-data. Namespaced by session_id[:8] so
+        # project-mode reports with multiple sessions don't collide on the
+        # per-session turn index.
+        turn_key = f'{session_id[:8]}-{t["index"]}'
         return (
-            f'<tr data-session="{session_id[:8]}">'
+            f'<tr id="turn-{turn_key}" class="turn-row" data-session="{session_id[:8]}"'
+            f' data-turn-id="{turn_key}" role="button" tabindex="0">'
             f'<td class="num">{t["index"]}</td>'
             f'<td class="ts">{t["timestamp_fmt"]}</td>'
             f'<td class="model">{html_mod.escape(t["model"])}</td>'
@@ -4162,6 +4356,308 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 });
 </script>"""
 
+    # Per-turn drill-down: embed one JSON payload per page (keyed by
+    # "<sid8>-<idx>"), render a right-side drawer + optional Prompts section,
+    # and wire both Timeline rows and Prompts rows to the same open/close JS.
+    # Skip resume-marker rows — the drawer doesn't open on them.
+    turn_data_json_html  = ""
+    turn_drawer_html     = ""
+    prompts_section_html = ""
+    drawer_script_html   = ""
+    if include_chart:
+        turn_data: dict[str, dict] = {}
+        prompts_rows: list[dict]   = []
+        for s in sessions:
+            sid8 = s["session_id"][:8]
+            for t in s["turns"]:
+                if t.get("is_resume_marker"):
+                    continue
+                key = f'{sid8}-{t["index"]}'
+                turn_data[key] = {
+                    "idx":               t["index"],
+                    "ts":                t.get("timestamp_fmt", ""),
+                    "model":             t.get("model", ""),
+                    "prompt_snippet":    t.get("prompt_snippet", ""),
+                    "prompt_text":       t.get("prompt_text", ""),
+                    "slash_command":     t.get("slash_command", ""),
+                    "tools":             t.get("tool_use_detail", []) or [],
+                    "content":           t.get("content_blocks") or {},
+                    "cost":              t.get("cost_usd", 0.0),
+                    "no_cache_cost":     t.get("no_cache_cost_usd", 0.0),
+                    "input":             t.get("input_tokens", 0),
+                    "output":            t.get("output_tokens", 0),
+                    "cache_read":        t.get("cache_read_tokens", 0),
+                    "cache_write":       t.get("cache_write_tokens", 0),
+                    "cache_write_ttl":   t.get("cache_write_ttl", ""),
+                    "assistant_snippet": t.get("assistant_snippet", ""),
+                    "assistant_text":    t.get("assistant_text", ""),
+                }
+                if t.get("prompt_text"):
+                    prompts_rows.append({
+                        "key":    key,
+                        "cost":   t.get("cost_usd", 0.0),
+                        "idx":    t["index"],
+                        "model":  t.get("model", ""),
+                        "prompt": t.get("prompt_snippet", ""),
+                        "tools":  [tu.get("name", "") for tu in
+                                   (t.get("tool_use_detail") or [])],
+                        "tokens": t.get("total_tokens", 0),
+                        "slash":  t.get("slash_command", ""),
+                    })
+        # `</` sequences would close the surrounding <script> tag early.
+        # Replace them with `<\/` (still valid JSON inside a string literal).
+        payload_json = json.dumps(turn_data, separators=(",", ":"), default=str)
+        payload_json = payload_json.replace("</", "<\\/")
+        turn_data_json_html = (
+            f'<script type="application/json" id="turn-data">{payload_json}</script>'
+        )
+
+        turn_drawer_html = '''<div class="turn-drawer-backdrop" hidden></div>
+<aside id="turn-drawer" class="turn-drawer" aria-hidden="true" role="dialog"
+       aria-labelledby="turn-drawer-title">
+  <header class="turn-drawer-hdr">
+    <h3 id="turn-drawer-title">Turn <span data-slot="idx"></span></h3>
+    <button class="turn-drawer-close" aria-label="Close">&times;</button>
+  </header>
+  <div class="turn-drawer-meta">
+    <span data-slot="ts"></span> <span class="sep">&middot;</span>
+    <code data-slot="model"></code><span data-slot="slash-wrap" hidden>
+    <span class="sep">&middot;</span> <code data-slot="slash"></code></span>
+  </div>
+  <section class="turn-drawer-prompt">
+    <h4>Prompt</h4>
+    <pre data-slot="prompt-snippet" class="turn-drawer-pre"></pre>
+    <button class="turn-drawer-more" data-state="collapsed" hidden>Show full prompt</button>
+    <pre data-slot="prompt-full" class="turn-drawer-pre" hidden></pre>
+  </section>
+  <section class="turn-drawer-tools" hidden>
+    <h4>Tools called (<span data-slot="tool-count"></span>)</h4>
+    <ul data-slot="tools" class="turn-drawer-tools-list"></ul>
+  </section>
+  <section class="turn-drawer-content">
+    <h4>Content blocks</h4>
+    <dl data-slot="content-dl" class="turn-drawer-content-dl"></dl>
+  </section>
+  <section class="turn-drawer-cost">
+    <h4>Tokens &amp; cost</h4>
+    <table class="turn-drawer-cost-table"><tbody>
+      <tr><th>Input (new)</th><td data-slot="tok-input"></td></tr>
+      <tr><th>Output</th><td data-slot="tok-output"></td></tr>
+      <tr><th>Cache read</th><td data-slot="tok-cache-read"></td></tr>
+      <tr><th>Cache write</th><td data-slot="tok-cache-write"></td></tr>
+      <tr><th>Cost</th><td data-slot="cost"></td></tr>
+    </tbody></table>
+    <p data-slot="cache-savings" class="turn-drawer-savings" hidden></p>
+  </section>
+  <section class="turn-drawer-assistant" hidden>
+    <h4>Assistant response</h4>
+    <pre data-slot="assistant-snippet" class="turn-drawer-pre"></pre>
+    <button class="turn-drawer-more-a" data-state="collapsed" hidden>Show full response</button>
+    <pre data-slot="assistant-full" class="turn-drawer-pre" hidden></pre>
+  </section>
+</aside>'''
+
+        if prompts_rows:
+            prompts_rows.sort(key=lambda r: -r["cost"])
+            top = prompts_rows[:20]
+            rows_html: list[str] = []
+            for r in top:
+                tool_names = r["tools"]
+                if tool_names:
+                    tools_str = ", ".join(html_mod.escape(n)
+                                          for n in tool_names[:3])
+                    if len(tool_names) > 3:
+                        tools_str += f" +{len(tool_names) - 3}"
+                else:
+                    tools_str = "&mdash;"
+                slash_badge = ""
+                if r.get("slash"):
+                    slash_badge = (f' <span class="prompts-slash">'
+                                   f'{html_mod.escape(r["slash"])}</span>')
+                key_esc = html_mod.escape(r["key"])
+                rows_html.append(
+                    f'<tr class="prompts-row" data-turn-id="{key_esc}"'
+                    f' role="button" tabindex="0">'
+                    f'<td class="cost">${r["cost"]:.4f}</td>'
+                    f'<td class="prompt-cell">'
+                    f'{html_mod.escape(r["prompt"])}{slash_badge}</td>'
+                    f'<td class="model"><code>{html_mod.escape(r["model"])}</code></td>'
+                    f'<td class="num"><a href="#turn-{key_esc}">#{r["idx"]}</a></td>'
+                    f'<td class="tools">{tools_str}</td>'
+                    f'<td class="num">{r["tokens"]:,}</td>'
+                    f'</tr>'
+                )
+            prompts_section_html = (
+                '<details class="prompts-details" open>'
+                '<summary><h2 class="prompts-h2">Prompts '
+                '<span class="legend">most-expensive user prompts in this report '
+                '&middot; click a row to open turn drawer</span></h2></summary>\n'
+                '<table class="prompts-table">\n<thead><tr>'
+                '<th>Cost</th><th>Prompt</th><th>Model</th>'
+                '<th class="num">Turn</th><th>Tools</th>'
+                '<th class="num">Tokens</th></tr></thead>\n'
+                f'<tbody>{"".join(rows_html)}</tbody></table>\n'
+                '</details>'
+            )
+
+        drawer_script_html = """<script>
+(function () {
+  var root = document.getElementById('turn-data');
+  if (!root) return;
+  var data; try { data = JSON.parse(root.textContent); } catch (e) { return; }
+  var drawer   = document.getElementById('turn-drawer');
+  if (!drawer) return;
+  var backdrop = document.querySelector('.turn-drawer-backdrop');
+  var lastFocused = null;
+  function sel(slot) { return drawer.querySelector('[data-slot="' + slot + '"]'); }
+  function setText(slot, v) { var el = sel(slot); if (el) el.textContent = v == null ? '' : String(v); }
+  function formatNum(n) { return typeof n === 'number' ? n.toLocaleString() : ''; }
+
+  function open(key) {
+    var t = data[key]; if (!t) return;
+    setText('idx', t.idx); setText('ts', t.ts); setText('model', t.model);
+    var slashWrap = sel('slash-wrap'), slashEl = sel('slash');
+    if (t.slash_command) { slashWrap.hidden = false; slashEl.textContent = t.slash_command; }
+    else { slashWrap.hidden = true; }
+
+    var snip = t.prompt_snippet || '(no prompt captured)';
+    setText('prompt-snippet', snip);
+    var full = sel('prompt-full'), moreBtn = drawer.querySelector('.turn-drawer-more');
+    if (t.prompt_text && t.prompt_text.length > (t.prompt_snippet || '').length) {
+      moreBtn.hidden = false; moreBtn.dataset.state = 'collapsed';
+      moreBtn.textContent = 'Show full prompt';
+      full.hidden = true; full.textContent = t.prompt_text;
+      sel('prompt-snippet').hidden = false;
+    } else {
+      moreBtn.hidden = true; full.hidden = true; full.textContent = '';
+      sel('prompt-snippet').hidden = false;
+    }
+
+    var tools = t.tools || [];
+    var toolsSect = drawer.querySelector('.turn-drawer-tools');
+    var toolsList = sel('tools');
+    setText('tool-count', tools.length);
+    toolsList.innerHTML = '';
+    if (tools.length) {
+      toolsSect.hidden = false;
+      tools.forEach(function (tu) {
+        var li = document.createElement('li');
+        var nm = document.createElement('code'); nm.textContent = tu.name || '';
+        li.appendChild(nm);
+        if (tu.input_preview) {
+          var pv = document.createElement('span');
+          pv.className = 'turn-drawer-tool-preview';
+          pv.textContent = ' ' + tu.input_preview;
+          li.appendChild(pv);
+        }
+        toolsList.appendChild(li);
+      });
+    } else { toolsSect.hidden = true; }
+
+    var dl = sel('content-dl'); dl.innerHTML = '';
+    var cb = t.content || {};
+    var labels = {thinking:'Thinking', tool_use:'Tool use', text:'Text',
+                  tool_result:'Tool result', image:'Image'};
+    Object.keys(labels).forEach(function (k) {
+      var v = cb[k] || 0; if (!v) return;
+      var dt = document.createElement('dt'); dt.textContent = labels[k];
+      var dd = document.createElement('dd'); dd.textContent = v;
+      dl.appendChild(dt); dl.appendChild(dd);
+    });
+    if (!dl.children.length) {
+      var dt2 = document.createElement('dt'); dt2.textContent = 'No blocks';
+      var dd2 = document.createElement('dd'); dd2.textContent = '\u2014';
+      dl.appendChild(dt2); dl.appendChild(dd2);
+    }
+
+    setText('tok-input',       formatNum(t.input));
+    setText('tok-output',      formatNum(t.output));
+    setText('tok-cache-read',  formatNum(t.cache_read));
+    var cw = formatNum(t.cache_write);
+    if (t.cache_write_ttl) cw += '  (' + t.cache_write_ttl + ')';
+    setText('tok-cache-write', cw);
+    setText('cost', '$' + (t.cost || 0).toFixed(4));
+    var savings = (t.no_cache_cost || 0) - (t.cost || 0);
+    var sEl = sel('cache-savings');
+    if (savings > 0) { sEl.textContent = 'Cache savings vs no-cache: $' + savings.toFixed(4); sEl.hidden = false; }
+    else { sEl.textContent = ''; sEl.hidden = true; }
+
+    var asstSect = drawer.querySelector('.turn-drawer-assistant');
+    var asstSnip = sel('assistant-snippet');
+    var asstFull = sel('assistant-full');
+    var asstMore = drawer.querySelector('.turn-drawer-more-a');
+    if (t.assistant_snippet) {
+      asstSect.hidden = false;
+      asstSnip.hidden = false;
+      asstSnip.textContent = t.assistant_snippet;
+      if (t.assistant_text && t.assistant_text.length > t.assistant_snippet.length) {
+        asstMore.hidden = false; asstMore.dataset.state = 'collapsed';
+        asstMore.textContent = 'Show full response';
+        asstFull.hidden = true; asstFull.textContent = t.assistant_text;
+      } else {
+        asstMore.hidden = true; asstFull.hidden = true; asstFull.textContent = '';
+      }
+    } else { asstSect.hidden = true; }
+
+    drawer.classList.add('open');
+    drawer.setAttribute('aria-hidden', 'false');
+    if (backdrop) { backdrop.hidden = false; }
+    lastFocused = document.activeElement;
+    var closeBtn = drawer.querySelector('.turn-drawer-close');
+    if (closeBtn) closeBtn.focus();
+  }
+
+  function close() {
+    drawer.classList.remove('open');
+    drawer.setAttribute('aria-hidden', 'true');
+    if (backdrop) { backdrop.hidden = true; }
+    if (lastFocused && typeof lastFocused.focus === 'function') lastFocused.focus();
+  }
+
+  document.querySelectorAll('tr.turn-row[data-turn-id], tr.prompts-row[data-turn-id]').forEach(function (el) {
+    el.addEventListener('click', function (ev) {
+      if (ev.target && ev.target.closest && ev.target.closest('a')) return;
+      open(el.getAttribute('data-turn-id'));
+    });
+    el.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        open(el.getAttribute('data-turn-id'));
+      }
+    });
+  });
+
+  drawer.querySelector('.turn-drawer-close').addEventListener('click', close);
+  if (backdrop) backdrop.addEventListener('click', close);
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape' && drawer.classList.contains('open')) close();
+  });
+
+  var moreBtn2 = drawer.querySelector('.turn-drawer-more');
+  moreBtn2.addEventListener('click', function () {
+    var full = sel('prompt-full'), snippet = sel('prompt-snippet');
+    if (moreBtn2.dataset.state === 'collapsed') {
+      full.hidden = false; snippet.hidden = true;
+      moreBtn2.textContent = 'Show snippet'; moreBtn2.dataset.state = 'expanded';
+    } else {
+      full.hidden = true; snippet.hidden = false;
+      moreBtn2.textContent = 'Show full prompt'; moreBtn2.dataset.state = 'collapsed';
+    }
+  });
+  var moreA2 = drawer.querySelector('.turn-drawer-more-a');
+  moreA2.addEventListener('click', function () {
+    var full = sel('assistant-full'), snippet = sel('assistant-snippet');
+    if (moreA2.dataset.state === 'collapsed') {
+      full.hidden = false; snippet.hidden = true;
+      moreA2.textContent = 'Show snippet'; moreA2.dataset.state = 'expanded';
+    } else {
+      full.hidden = true; snippet.hidden = false;
+      moreA2.textContent = 'Show full response'; moreA2.dataset.state = 'collapsed';
+    }
+  });
+})();
+</script>"""
+
     title_suffix  = (" — Dashboard" if variant == "dashboard"
                      else " — Detail" if variant == "detail" else "")
     return f"""<!DOCTYPE html>
@@ -4286,6 +4782,87 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
   .resume-marker-pill.terminal {{ background: #2e1f0d; border-color: #9c7a2f; }}
   .resume-marker-pill.terminal strong,
   .resume-marker-pill.terminal .resume-marker-icon {{ color: #e3b341; }}
+  tr.turn-row {{ cursor: pointer; }}
+  tr.turn-row:focus {{ outline: 1px solid #58a6ff; outline-offset: -1px; }}
+  .turn-drawer {{ position: fixed; top: 0; right: 0; width: 380px; max-width: 92vw;
+                  height: 100vh; background: #161b22; border-left: 1px solid #30363d;
+                  transform: translateX(100%); transition: transform 0.18s ease-out;
+                  overflow-y: auto; z-index: 1000; padding: 16px 20px 24px;
+                  box-shadow: -4px 0 20px rgba(0,0,0,0.5); }}
+  .turn-drawer.open {{ transform: translateX(0); }}
+  .turn-drawer h3 {{ font-size: 14px; font-weight: 600; color: #f0f6fc; margin: 0; }}
+  .turn-drawer h4 {{ font-size: 11px; font-weight: 600; color: #8b949e;
+                     margin: 14px 0 6px; text-transform: uppercase;
+                     letter-spacing: 0.6px; }}
+  .turn-drawer-hdr {{ display: flex; justify-content: space-between;
+                       align-items: center; margin-bottom: 4px;
+                       border-bottom: 1px solid #30363d; padding-bottom: 10px; }}
+  .turn-drawer-close {{ background: none; border: none; color: #8b949e;
+                         font-size: 22px; cursor: pointer; line-height: 1;
+                         padding: 4px 8px; }}
+  .turn-drawer-close:hover {{ color: #f0f6fc; }}
+  .turn-drawer-meta {{ color: #8b949e; font-size: 11px; margin-top: 6px;
+                        line-height: 1.6; }}
+  .turn-drawer-meta code {{ color: #a5d6ff; background: #0d1117;
+                             border: 1px solid #30363d; padding: 0 5px;
+                             border-radius: 3px; font-size: 10px; }}
+  .turn-drawer-pre {{ background: #0d1117; border: 1px solid #30363d;
+                       border-radius: 4px; padding: 8px 10px; color: #c9d1d9;
+                       font-family: "SF Mono", Menlo, Consolas, monospace;
+                       font-size: 11px; white-space: pre-wrap; word-break: break-word;
+                       max-height: 240px; overflow-y: auto; margin: 0; }}
+  .turn-drawer-more, .turn-drawer-more-a {{ margin-top: 6px; background: none;
+                       border: 1px solid #30363d; color: #58a6ff;
+                       padding: 3px 10px; font-size: 11px; border-radius: 4px;
+                       cursor: pointer; }}
+  .turn-drawer-more:hover, .turn-drawer-more-a:hover {{ border-color: #58a6ff; }}
+  .turn-drawer-tools-list {{ list-style: none; padding: 0; margin: 0; }}
+  .turn-drawer-tools-list li {{ padding: 4px 0; border-top: 1px dashed #21262d;
+                                 font-size: 11px; color: #c9d1d9; }}
+  .turn-drawer-tools-list li:first-child {{ border-top: none; }}
+  .turn-drawer-tools-list code {{ color: #a5d6ff; background: #0d1117;
+                                   border: 1px solid #30363d; padding: 0 4px;
+                                   border-radius: 3px; font-size: 10px; }}
+  .turn-drawer-tool-preview {{ color: #8b949e;
+                                font-family: "SF Mono", Menlo, Consolas, monospace;
+                                font-size: 10px; word-break: break-word; }}
+  .turn-drawer-content-dl {{ display: grid; grid-template-columns: auto 1fr;
+                              gap: 4px 12px; font-size: 11px; color: #c9d1d9;
+                              margin: 0; }}
+  .turn-drawer-content-dl dt {{ color: #8b949e; }}
+  .turn-drawer-content-dl dd {{ margin: 0; color: #a5d6ff;
+                                 font-variant-numeric: tabular-nums; }}
+  .turn-drawer-cost-table {{ width: 100%; font-size: 11px; }}
+  .turn-drawer-cost-table th {{ color: #8b949e; font-weight: 500;
+                                 padding: 3px 6px; border: none; background: none;
+                                 text-align: left; white-space: nowrap; }}
+  .turn-drawer-cost-table td {{ text-align: right; padding: 3px 6px;
+                                 border: none; color: #c9d1d9;
+                                 font-variant-numeric: tabular-nums; }}
+  .turn-drawer-savings {{ color: #3fb950; font-size: 11px; margin-top: 4px; }}
+  .turn-drawer-backdrop {{ position: fixed; inset: 0;
+                            background: rgba(0,0,0,0.35); z-index: 999; }}
+  .prompts-details {{ margin-top: 16px; }}
+  .prompts-details > summary {{ list-style: none; cursor: pointer; }}
+  .prompts-details > summary::-webkit-details-marker {{ display: none; }}
+  .prompts-details > summary h2.prompts-h2 {{ display: inline; }}
+  .prompts-details > summary::before {{ content: "\\25b8 "; font-size: 10px;
+                                         color: #8b949e; }}
+  .prompts-details[open] > summary::before {{ content: "\\25be "; }}
+  .prompts-table tbody tr.prompts-row {{ cursor: pointer; }}
+  .prompts-table tbody tr.prompts-row:focus {{ outline: 1px solid #58a6ff;
+                                                outline-offset: -1px; }}
+  .prompts-table td.prompt-cell {{ max-width: 560px; overflow: hidden;
+                                    text-overflow: ellipsis; white-space: nowrap;
+                                    color: #c9d1d9; }}
+  .prompts-table td.cost {{ color: #d29922; font-variant-numeric: tabular-nums;
+                             white-space: nowrap; }}
+  .prompts-table td.model code {{ color: #a5d6ff; font-size: 11px; }}
+  .prompts-table .prompts-slash {{ display: inline-block; padding: 0 5px;
+                                    font-size: 10px; color: #bc8cff;
+                                    background: #8957e522;
+                                    border: 1px solid #8957e566;
+                                    border-radius: 3px; margin-left: 6px; }}
 </style>
 </head>
 <body>
@@ -4298,8 +4875,12 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 {tod_html}
 {chart_section_html}
 {table_section_html}
+{prompts_section_html}
 {models_section_html}
 {toggle_script_html}
+{turn_data_json_html}
+{turn_drawer_html}
+{drawer_script_html}
 </body>
 </html>"""
 

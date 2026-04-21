@@ -5716,3 +5716,197 @@ def test_write_output_default_ts_still_works(tmp_path, monkeypatch):
     # Filename must end with 16-char UTC stamp, not be empty.
     import re as _re
     assert _re.search(r"session_abcdef01_\d{8}T\d{6}Z\.json$", path.name)
+
+
+# --- Per-turn drill-down (drawer + Prompts section) -------------------------
+#
+# These tests guard the new right-side drawer + "Prompts" section that surface
+# each turn's user prompt, slash command, tool calls, content-block mix, and
+# assistant reply. Both are gated on the Detail + single-page HTML variants —
+# Dashboard must stay untouched.
+
+def test_turn_record_has_prompt_and_tool_detail_fields():
+    """Every non-resume turn built from the fixture carries the new fields."""
+    r = _build_fixture_report()
+    new_keys = {
+        "prompt_text", "prompt_snippet", "slash_command",
+        "assistant_text", "assistant_snippet", "tool_use_detail",
+    }
+    for t in r["sessions"][0]["turns"]:
+        if t.get("is_resume_marker"):
+            continue
+        missing = new_keys - t.keys()
+        assert not missing, f"turn {t['index']} missing fields: {missing}"
+        assert isinstance(t["prompt_text"], str)
+        assert isinstance(t["prompt_snippet"], str)
+        assert isinstance(t["slash_command"], str)
+        assert isinstance(t["assistant_text"], str)
+        assert isinstance(t["assistant_snippet"], str)
+        assert isinstance(t["tool_use_detail"], list)
+
+
+def test_prompt_snippet_is_truncated_to_240_chars():
+    """Prompts longer than 240 chars are clipped + ellipsis; shorter stay whole."""
+    long_prompt = "x" * 500
+    out = sm._truncate(long_prompt, 240)
+    assert len(out) == 241          # 240 chars + ellipsis glyph
+    assert out.endswith("\u2026")
+    # Short prompts pass through unchanged.
+    assert sm._truncate("short", 240) == "short"
+    # Non-string input returns empty string (defensive).
+    assert sm._truncate(None, 240) == ""
+
+
+@pytest.mark.parametrize("prompt,raw,expected", [
+    ("/clear please", None, "/clear"),
+    ("/compact-now", None, "/compact-now"),
+    ("no slash here", None, ""),
+    ("",              None, ""),
+    # XML-wrapped form — stripped from prompt_text but detected on raw content
+    ("wipe context",  "<command-name>/clear</command-name>\nwipe context",  "/clear"),
+    # Raw-list content form
+    ("wipe context",
+     [{"type": "text", "text": "<command-name>/exit</command-name>bye"}],
+     "/exit"),
+])
+def test_slash_command_extraction(prompt, raw, expected):
+    assert sm._extract_slash_command(prompt, raw) == expected
+
+
+def test_html_has_turn_data_json_blob():
+    """Single-page HTML embeds a <script type=application/json> payload
+    keyed by `<sid8>-<index>` for every non-resume turn."""
+    import json as _json
+    r = _build_fixture_report()
+    html = sm.render_html(r, variant="single")
+    assert '<script type="application/json" id="turn-data">' in html
+    # Extract the JSON blob and parse it.
+    start = html.find('id="turn-data">') + len('id="turn-data">')
+    end   = html.find("</script>", start)
+    blob  = html[start:end].replace("<\\/", "</")
+    data  = _json.loads(blob)
+    # 6 turns in the fixture, none are resume markers → 6 payloads.
+    assert len(data) == 6
+    sid8 = r["sessions"][0]["session_id"][:8]
+    for idx in range(1, 7):
+        key = f"{sid8}-{idx}"
+        assert key in data, f"missing payload for {key}"
+        p = data[key]
+        for must_have in ("idx", "ts", "model", "prompt_snippet",
+                          "prompt_text", "slash_command", "tools",
+                          "content", "cost", "input", "output",
+                          "cache_read", "cache_write",
+                          "assistant_snippet", "assistant_text"):
+            assert must_have in p, f"payload {key} missing {must_have}"
+
+
+def test_html_has_turn_drawer_element():
+    """Drawer structural markup is present on single-page + detail variants."""
+    r = _build_fixture_report()
+    for variant in ("single", "detail"):
+        html = sm.render_html(r, variant=variant)
+        assert 'id="turn-drawer"' in html
+        assert 'class="turn-drawer-backdrop"' in html
+        # Data-slot attributes the JS populates at open time.
+        for slot in ("idx", "ts", "model", "prompt-snippet", "prompt-full",
+                     "tools", "tool-count", "content-dl", "cost",
+                     "tok-input", "tok-output", "tok-cache-read",
+                     "tok-cache-write", "cache-savings",
+                     "assistant-snippet", "assistant-full"):
+            assert f'data-slot="{slot}"' in html, (
+                f"drawer missing data-slot={slot!r} in variant={variant}"
+            )
+
+
+def test_html_has_prompts_section_when_prompts_present():
+    """Prompts section renders when at least one turn has a real prompt."""
+    r = _build_fixture_report()
+    html = sm.render_html(r, variant="single")
+    assert '<table class="prompts-table">' in html
+    # Every prompts row must carry data-turn-id so click-to-open works.
+    import re as _re
+    rows = _re.findall(r'<tr class="prompts-row" data-turn-id="([^"]+)"', html)
+    assert len(rows) >= 1
+    # Each row's key must match a Timeline row id="turn-<key>".
+    for key in rows:
+        assert f'id="turn-{key}"' in html
+
+
+def test_html_omits_prompts_section_when_no_prompts():
+    """A synthetic report with zero real prompts must not render the section."""
+    r = _build_fixture_report()
+    # Wipe prompts from every turn — simulates a tool-only subagent session.
+    for t in r["sessions"][0]["turns"]:
+        t["prompt_text"]    = ""
+        t["prompt_snippet"] = ""
+    html = sm.render_html(r, variant="single")
+    # CSS selectors for .prompts-table live in <style> always, but the actual
+    # markup (<table class="prompts-table">) must be gone.
+    assert '<table class="prompts-table">' not in html
+    assert '<details class="prompts-details"' not in html
+
+
+def test_html_preserves_resume_marker_row_class():
+    """Resume-marker rows keep their distinct class and never become turn-row."""
+    r = _build_fixture_report()
+    turns = r["sessions"][0]["turns"]
+    turns[0]["is_resume_marker"] = True
+    turns[0]["is_terminal_exit_marker"] = False
+    r["sessions"][0]["resumes"] = sm._build_resumes(turns)
+    html = sm.render_html(r, variant="single")
+    assert 'class="resume-marker-row"' in html
+    # Index 1 is a resume marker → no turn-<sid>-1 row with turn-row class.
+    sid8 = r["sessions"][0]["session_id"][:8]
+    assert f'class="turn-row" data-session="{sid8}" data-turn-id="{sid8}-1"' not in html
+    # It's also absent from the drawer's JSON payload.
+    import json as _json
+    start = html.find('id="turn-data">') + len('id="turn-data">')
+    end   = html.find("</script>", start)
+    blob  = html[start:end].replace("<\\/", "</")
+    data  = _json.loads(blob)
+    assert f"{sid8}-1" not in data
+
+
+def test_html_preserves_session_header_toggle():
+    """Project-mode session-header rows + toggle script remain intact."""
+    sid, turns, uts = sm._load_session(_FIXTURE, include_subagents=False)
+    r = sm._build_report("project", "test-slug", [(sid, turns, uts)])
+    html = sm.render_html(r, variant="single")
+    assert 'class="session-header" data-toggle="sess-1"' in html
+    # Pre-existing toggle JS must still be emitted.
+    assert "document.querySelectorAll('tr.session-header[data-toggle]')" in html
+
+
+def test_dashboard_variant_has_no_drawer_or_prompts_section():
+    """Dashboard variant stays untouched — no drawer, no Prompts table,
+    no turn-data JSON blob."""
+    r = _build_fixture_report()
+    html = sm.render_html(r, variant="dashboard")
+    assert 'id="turn-drawer"' not in html
+    assert '<table class="prompts-table">' not in html
+    assert '<script type="application/json" id="turn-data">' not in html
+
+
+def test_turn_data_json_is_html_escaped():
+    """Prompts containing <script> tags are embedded safely — the outer
+    <script> tag can't be closed early by a payload `</script>` token."""
+    import json as _json
+    r = _build_fixture_report()
+    # Inject a payload that would break the surrounding <script> tag if not
+    # escaped: both a literal </script> and a visible injected element.
+    r["sessions"][0]["turns"][0]["prompt_text"]    = "</script><img src=x onerror=alert(1)>"
+    r["sessions"][0]["turns"][0]["prompt_snippet"] = "</script><img>"
+    html = sm.render_html(r, variant="single")
+    # The JSON blob must not contain a literal `</script>` — it's neutralised
+    # to `<\/script>` by the renderer.
+    start = html.find('id="turn-data">') + len('id="turn-data">')
+    # First </script> after start is the blob's closing tag. A pre-closing
+    # `</script>` inside the blob would make the slice invalid JSON.
+    end = html.find("</script>", start)
+    blob = html[start:end]
+    assert "</script>" not in blob
+    # But once un-escaped, JSON still parses and preserves the original text.
+    data = _json.loads(blob.replace("<\\/", "</"))
+    sid8 = r["sessions"][0]["session_id"][:8]
+    payload = data[f"{sid8}-1"]
+    assert payload["prompt_text"] == "</script><img src=x onerror=alert(1)>"

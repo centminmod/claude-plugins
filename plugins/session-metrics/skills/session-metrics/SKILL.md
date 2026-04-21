@@ -130,6 +130,21 @@ project root, named `session_<id8>_<YYYYMMDD_HHMMSS>.<ext>` (single) or
 Deep-dive on exact column semantics, JSON keys, and detection rules:
 [`references/jsonl-schema.md`](references/jsonl-schema.md).
 
+### Per-turn drill-down (HTML only)
+
+In the Detail page and single-page variants, every Timeline row is
+clickable (keyboard: Enter / Space) and opens a right-side **drawer**
+showing the user's actual prompt, any slash command, the tools that were
+called (with one-line input previews), the content-block mix, the
+per-turn cost/token breakdown, and the assistant's reply. Prompt and
+assistant text are truncated to ~240 characters with a **Show full
+prompt** / **Show full response** toggle that reveals the full text (up
+to a 2 KB cap on assistant text). Close with the × button, Esc, or a
+backdrop click — focus returns to the originating row. Below the
+Timeline, a collapsible **Prompts** section lists the top-20
+most-expensive prompts; each row opens the same drawer. The Dashboard
+variant has no Timeline, so it's unaffected.
+
 Footer shows session totals + **cache savings** vs a hypothetical no-cache
 run. Conditional dashboard cards appear when their feature was used in the
 session: **Cache TTL mix** (when any 1h-tier cache writes happened),
