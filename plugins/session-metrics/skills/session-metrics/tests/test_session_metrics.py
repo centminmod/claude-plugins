@@ -2,6 +2,7 @@
 
 Run with: uv run python -m pytest tests/ -v
 """
+import html as html_std
 import importlib.util
 import sys
 from pathlib import Path
@@ -624,6 +625,21 @@ def test_fixture_tool_names_top3_ranked_by_count_then_name():
     assert totals["tool_names_top3"] == ["Bash", "Read", "WebFetch"]
 
 
+def test_html_escapes_malicious_tool_name_in_top3_card():
+    """Regression for H4: tool names originate from the JSONL and must be
+    HTML-escaped before interpolation into the tool_calls_card on the single
+    and dashboard variants. A compromised transcript with a tool name like
+    ``</script><img src=x onerror=1>`` must not emit that raw string."""
+    r = _build_fixture_report()
+    payload = "</script><img src=x onerror=alert(1)>"
+    r["totals"]["tool_names_top3"] = [payload, "Read", "WebFetch"]
+    # Ensure the tool_calls_card is actually emitted (guarded by total > 0).
+    assert r["totals"].get("tool_call_total", 0) > 0
+    html = sm.render_html(r, variant="single")
+    assert payload not in html
+    assert html_std.escape(payload) in html
+
+
 def test_fixture_thinking_turn_pct():
     r = _build_fixture_report()
     t = r["totals"]
@@ -1097,6 +1113,60 @@ def test_cached_parse_invalidates_on_mtime(tmp_path, monkeypatch):
     assert before.issubset(after)
 
 
+def test_parse_cache_key_includes_path_hash(tmp_path):
+    """Same stem + same mtime in sibling dirs must yield distinct cache keys.
+
+    Regression for H1: prior to the path-hash component, two JSONLs with
+    identical UUID filenames (e.g. sibling project dirs) sharing an mtime_ns
+    would collide on the same cache blob.
+    """
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    p_a = dir_a / "shared.jsonl"
+    p_b = dir_b / "shared.jsonl"
+    p_a.write_text("{}\n", encoding="utf-8")
+    p_b.write_text("{}\n", encoding="utf-8")
+    mtime_ns = 1_700_000_000_000_000_000
+    key_a = sm._parse_cache_key(p_a, mtime_ns)
+    key_b = sm._parse_cache_key(p_b, mtime_ns)
+    assert key_a != key_b
+    # Keys must still be deterministic for the same path.
+    assert key_a == sm._parse_cache_key(p_a, mtime_ns)
+
+
+def test_cached_parse_same_stem_sibling_dirs_no_collision(tmp_path, monkeypatch):
+    """End-to-end: two identically-named JSONLs in sibling dirs with identical
+    mtimes must cache independently and return their own distinct contents."""
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    # Two distinct JSONL payloads — must NOT cross-contaminate via cache.
+    p_a = dir_a / "shared.jsonl"
+    p_b = dir_b / "shared.jsonl"
+    p_a.write_text(_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    # Truncate the b-side so the two parses are observably different.
+    b_lines = _FIXTURE.read_text(encoding="utf-8").splitlines(keepends=True)[:1]
+    p_b.write_text("".join(b_lines), encoding="utf-8")
+    # Force identical mtimes so only the path distinguishes them.
+    import os
+    t = 1_700_000_000.0
+    os.utime(p_a, (t, t))
+    os.utime(p_b, (t, t))
+    parsed_a = sm._cached_parse_jsonl(p_a, use_cache=True)
+    parsed_b = sm._cached_parse_jsonl(p_b, use_cache=True)
+    assert parsed_a != parsed_b
+    # Re-parse from cache — still distinct, proving the cache stored two blobs.
+    assert sm._cached_parse_jsonl(p_a, use_cache=True) == parsed_a
+    assert sm._cached_parse_jsonl(p_b, use_cache=True) == parsed_b
+    # Two blobs on disk.
+    blobs = list((tmp_path / "parse").glob("*.json.gz"))
+    assert len(blobs) == 2
+
+
 def test_render_html_single_page_has_everything():
     r = _build_fixture_report()
     html = sm.render_html(r, variant="single")
@@ -1199,11 +1269,82 @@ def test_read_vendor_js_returns_real_payload_and_hash_matches():
     assert len(payload) > 100_000   # ~360 KB when all 4 files verify
 
 
-def test_read_vendor_js_unknown_library_returns_empty(capsys):
+def test_read_vendor_js_unknown_library_raises(monkeypatch):
+    """Post-H6 fail-closed: an unknown library raises rather than degrading."""
+    monkeypatch.setattr(sm, "_ALLOW_UNVERIFIED_CHARTS", False)
+    with pytest.raises(sm.VendorChartVerificationError, match="not in vendor manifest"):
+        sm._read_vendor_js("not-a-library")
+
+
+def test_read_vendor_js_unknown_library_warn_with_override(monkeypatch, capsys):
+    """With --allow-unverified-charts the failure degrades to a stderr warning."""
+    monkeypatch.setattr(sm, "_ALLOW_UNVERIFIED_CHARTS", True)
     payload = sm._read_vendor_js("not-a-library")
     assert payload == ""
     err = capsys.readouterr().err
     assert "not in vendor manifest" in err
+    assert "--allow-unverified-charts" in err
+
+
+def test_read_vendor_js_sha_mismatch_raises(tmp_path, monkeypatch):
+    """Tampered vendor JS must fail verification by default."""
+    # Build a fake vendor tree whose manifest entry's SHA doesn't match the
+    # on-disk file. Clear the lru_cache first so our synthetic manifest loads.
+    fake_root = tmp_path / "vendor_charts"
+    (fake_root / "mylib" / "v1").mkdir(parents=True)
+    js_path = fake_root / "mylib" / "v1" / "mylib.js"
+    js_path.write_text("console.log('tampered');\n", encoding="utf-8")
+    manifest = {
+        "libraries": {
+            "mylib": {
+                "version": "1", "license": "MIT",
+                "files": [{
+                    "name": "mylib.js", "path": "mylib/v1/mylib.js",
+                    "sha256": "0" * 64,  # deliberately wrong
+                }],
+            },
+        },
+    }
+    (fake_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(sm, "_VENDOR_CHARTS_DIR", fake_root)
+    monkeypatch.setattr(sm, "_ALLOW_UNVERIFIED_CHARTS", False)
+    sm._load_chart_manifest.cache_clear()
+    try:
+        with pytest.raises(sm.VendorChartVerificationError, match="SHA-256 mismatch"):
+            sm._read_vendor_js("mylib")
+    finally:
+        sm._load_chart_manifest.cache_clear()
+
+
+def test_read_vendor_js_sha_mismatch_warns_with_override(tmp_path, monkeypatch, capsys):
+    """With --allow-unverified-charts, SHA mismatches warn instead of raise."""
+    fake_root = tmp_path / "vendor_charts"
+    (fake_root / "mylib" / "v1").mkdir(parents=True)
+    js_path = fake_root / "mylib" / "v1" / "mylib.js"
+    js_path.write_text("console.log('tampered');\n", encoding="utf-8")
+    manifest = {
+        "libraries": {
+            "mylib": {
+                "version": "1", "license": "MIT",
+                "files": [{
+                    "name": "mylib.js", "path": "mylib/v1/mylib.js",
+                    "sha256": "0" * 64,
+                }],
+            },
+        },
+    }
+    (fake_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(sm, "_VENDOR_CHARTS_DIR", fake_root)
+    monkeypatch.setattr(sm, "_ALLOW_UNVERIFIED_CHARTS", True)
+    sm._load_chart_manifest.cache_clear()
+    try:
+        payload = sm._read_vendor_js("mylib")
+        # File was skipped, so payload is empty (no verified content).
+        assert payload == ""
+        err = capsys.readouterr().err
+        assert "SHA-256 mismatch" in err
+    finally:
+        sm._load_chart_manifest.cache_clear()
 
 
 def _mini_report():
@@ -1962,10 +2103,16 @@ def test_project_family_inventory_groups_by_family(tmp_path, monkeypatch):
     assert inv["opus-4-6"][0][1] == 5
 
 
-def test_resolve_compare_arg_path_existing(tmp_path):
-    # A real path returns ("single", [path]) without any project lookup.
-    path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
-    kind, paths = smc._resolve_compare_arg(str(path), "any-slug")
+def test_resolve_compare_arg_path_existing(tmp_path, monkeypatch):
+    # A real path inside CLAUDE_PROJECTS_DIR returns ("single", [path])
+    # without any project lookup. Post-H5 the explicit-path form requires
+    # the target to resolve under the projects directory.
+    projects_dir = tmp_path / "projects"
+    (projects_dir / "slug").mkdir(parents=True)
+    target = projects_dir / "slug" / "compare_opus_4_6_a.jsonl"
+    target.write_bytes((_FIXTURES_DIR / "compare_opus_4_6_a.jsonl").read_bytes())
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    kind, paths = smc._resolve_compare_arg(str(target), "any-slug")
     assert kind == "single"
     assert len(paths) == 1
     assert paths[0].name == "compare_opus_4_6_a.jsonl"
@@ -1974,6 +2121,18 @@ def test_resolve_compare_arg_path_existing(tmp_path):
 def test_resolve_compare_arg_path_missing_raises(tmp_path):
     with pytest.raises(smc.CompareArgError, match="path does not exist"):
         smc._resolve_compare_arg(str(tmp_path / "nope.jsonl"), "slug")
+
+
+def test_resolve_compare_arg_path_outside_projects_rejected(tmp_path, monkeypatch):
+    """Regression for H5: explicit paths outside CLAUDE_PROJECTS_DIR must
+    raise CompareArgError, not silently accept arbitrary filesystem reads."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(smc.CompareArgError, match="refusing to read outside"):
+        smc._resolve_compare_arg(str(outside), "slug")
 
 
 def test_resolve_compare_arg_last_family(tmp_path, monkeypatch):
@@ -2585,9 +2744,18 @@ def test_check_compare_scope_auto_picks_observational_on_aggregate():
 def test_cli_compare_happy_path(monkeypatch, tmp_path, capsys):
     # End-to-end invocation: fire --compare with absolute paths and
     # confirm stdout carries the compare report and the 1.30× ratio.
+    # Uses an isolated projects dir so compare's marker file
+    # (.session-metrics-compare-used) doesn't pollute the committed
+    # fixtures dir on every test run.
+    projects_dir, project_dir = _build_project_dir(
+        tmp_path, "test-slug",
+        [("compare_opus_4_6_a.jsonl", -1),
+         ("compare_opus_4_7_a.jsonl", 0)],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
     monkeypatch.chdir(tmp_path)
-    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
-    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    a_path = project_dir / "compare_opus_4_6_a.jsonl"
+    b_path = project_dir / "compare_opus_4_7_a.jsonl"
     monkeypatch.setattr(
         "sys.argv",
         ["session-metrics.py", "--compare", str(a_path), str(b_path),
@@ -2604,9 +2772,15 @@ def test_cli_compare_html_exports_single_page(monkeypatch, tmp_path, capsys):
     # HTML document. The test ensures the file lands on disk and carries
     # at least one compare-specific DOM marker so downstream renderers
     # that wrap the output can still see it.
+    projects_dir, project_dir = _build_project_dir(
+        tmp_path, "test-slug",
+        [("compare_opus_4_6_a.jsonl", -1),
+         ("compare_opus_4_7_a.jsonl", 0)],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
     monkeypatch.chdir(tmp_path)
-    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
-    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    a_path = project_dir / "compare_opus_4_6_a.jsonl"
+    b_path = project_dir / "compare_opus_4_7_a.jsonl"
     monkeypatch.setattr(
         "sys.argv",
         ["session-metrics.py", "--compare", str(a_path), str(b_path),
@@ -2652,16 +2826,20 @@ def test_cli_compare_last_family_magic_token(monkeypatch, tmp_path, capsys):
 def test_cli_compare_all_family_runs_mode_2(monkeypatch, tmp_path, capsys):
     # Phase 3: resolver produces an aggregate; _check_compare_scope returns
     # "observational" and _run_compare dispatches Mode 2.
-    projects_dir, _ = _build_project_dir(
+    projects_dir, project_dir = _build_project_dir(
         tmp_path,
         "test-slug",
         [
+            # Include the A-side fixture in the projects dir so the
+            # post-H5 traversal guard on compare's explicit-path form
+            # accepts the absolute path.
+            ("compare_opus_4_6_a.jsonl", -1),
             ("compare_opus_4_7_a.jsonl", 0),
         ],
     )
     monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
     monkeypatch.chdir(tmp_path)
-    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
+    a_path = project_dir / "compare_opus_4_6_a.jsonl"
     monkeypatch.setattr(
         "sys.argv",
         ["session-metrics.py", "--compare", str(a_path), "all-opus-4-7",
@@ -2677,9 +2855,15 @@ def test_cli_compare_all_family_runs_mode_2(monkeypatch, tmp_path, capsys):
 def test_cli_compare_scope_project_runs_mode_2(monkeypatch, tmp_path, capsys):
     # Phase 3: --compare-scope=project forces observational even when both
     # args are single sessions.
+    projects_dir, project_dir = _build_project_dir(
+        tmp_path, "test-slug",
+        [("compare_opus_4_6_a.jsonl", -1),
+         ("compare_opus_4_7_a.jsonl", 0)],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
     monkeypatch.chdir(tmp_path)
-    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
-    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    a_path = project_dir / "compare_opus_4_6_a.jsonl"
+    b_path = project_dir / "compare_opus_4_7_a.jsonl"
     monkeypatch.setattr(
         "sys.argv",
         ["session-metrics.py", "--compare", str(a_path), str(b_path),
@@ -2692,9 +2876,15 @@ def test_cli_compare_scope_project_runs_mode_2(monkeypatch, tmp_path, capsys):
 
 def test_cli_compare_write_output_filename(monkeypatch, tmp_path):
     # --output md should produce a compare_<a>_vs_<b>_<ts>.md file.
+    projects_dir, project_dir = _build_project_dir(
+        tmp_path, "test-slug",
+        [("compare_opus_4_6_a.jsonl", -1),
+         ("compare_opus_4_7_a.jsonl", 0)],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
     monkeypatch.chdir(tmp_path)
-    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
-    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    a_path = project_dir / "compare_opus_4_6_a.jsonl"
+    b_path = project_dir / "compare_opus_4_7_a.jsonl"
     monkeypatch.setattr(
         "sys.argv",
         ["session-metrics.py", "--compare", str(a_path), str(b_path),
@@ -2950,9 +3140,15 @@ def test_cli_compare_aggregate_write_output_filename(monkeypatch, tmp_path):
     # Mode 2 hitting --output md produces a compare_<a>_vs_<b>_<ts>.md file.
     # Side A session_id ("s6") prefixes the filename since the aggregate
     # writes preserve the single session_id when session_count == 1.
+    projects_dir, project_dir = _build_project_dir(
+        tmp_path, "test-slug",
+        [("compare_opus_4_6_a.jsonl", -1),
+         ("compare_opus_4_7_a.jsonl", 0)],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
     monkeypatch.chdir(tmp_path)
-    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
-    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    a_path = project_dir / "compare_opus_4_6_a.jsonl"
+    b_path = project_dir / "compare_opus_4_7_a.jsonl"
     monkeypatch.setattr(
         "sys.argv",
         ["session-metrics.py", "--compare", str(a_path), str(b_path),
@@ -3564,6 +3760,7 @@ def test_cli_compare_prompts_override_accepted(monkeypatch, tmp_path, capsys):
 
 def test_cli_compare_suite_mismatch_refuses(monkeypatch, tmp_path, capsys):
     # Two sessions whose user prompts sentinel at different suite versions.
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(tmp_path))
     a_dir = tmp_path / "a"
     a_dir.mkdir()
     b_dir = tmp_path / "b"
@@ -3614,6 +3811,7 @@ def test_cli_compare_suite_mismatch_refuses(monkeypatch, tmp_path, capsys):
 
 
 def test_cli_compare_allow_suite_mismatch_proceeds(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(tmp_path))
     a_dir = tmp_path / "a"
     a_dir.mkdir()
     b_dir = tmp_path / "b"
@@ -3861,9 +4059,15 @@ def test_compare_html_ratio_tint_class_boundaries():
 
 
 def test_cli_compare_html_with_redact_flag(monkeypatch, tmp_path, capsys):
+    projects_dir, project_dir = _build_project_dir(
+        tmp_path, "test-slug",
+        [("compare_opus_4_6_a.jsonl", -1),
+         ("compare_opus_4_7_a.jsonl", 0)],
+    )
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
     monkeypatch.chdir(tmp_path)
-    a_path = _FIXTURES_DIR / "compare_opus_4_6_a.jsonl"
-    b_path = _FIXTURES_DIR / "compare_opus_4_7_a.jsonl"
+    a_path = project_dir / "compare_opus_4_6_a.jsonl"
+    b_path = project_dir / "compare_opus_4_7_a.jsonl"
     monkeypatch.setattr(
         "sys.argv",
         ["session-metrics.py", "--compare", str(a_path), str(b_path),

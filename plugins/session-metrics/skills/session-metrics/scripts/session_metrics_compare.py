@@ -370,7 +370,20 @@ def _resolve_compare_arg(
     if "/" in arg or arg.endswith(".jsonl"):
         p = Path(arg).expanduser()
         if p.exists() and p.is_file():
-            return ("single", [p.resolve()])
+            resolved = p.resolve()
+            # Regression guard for H5: reject paths outside the projects
+            # directory. Main-script single-session lookup already enforces
+            # this via _ensure_within_projects; compare's explicit-path form
+            # must apply the same guard to prevent symlink/traversal escapes
+            # (e.g. ``/etc/passwd.jsonl`` or ``../../escape.jsonl``).
+            root = m._projects_dir().resolve()
+            try:
+                resolved.relative_to(root)
+            except ValueError as exc:
+                raise CompareArgError(
+                    f"refusing to read outside {root}: {resolved}"
+                ) from exc
+            return ("single", [resolved])
         raise CompareArgError(f"path does not exist: {arg}")
 
     # Forms 2 & 3: magic tokens. Checked BEFORE session-UUID because

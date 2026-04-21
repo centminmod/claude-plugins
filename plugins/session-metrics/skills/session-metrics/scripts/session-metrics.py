@@ -165,13 +165,20 @@ def _parse_cache_dir() -> Path:
 
 
 def _parse_cache_key(path: Path, mtime_ns: int) -> str:
-    """Build a stable cache-key filename from path stem, mtime, and script ver.
+    """Build a stable cache-key filename from path hash, stem, mtime, and ver.
 
+    An 8-hex-char SHA1 of the resolved absolute path disambiguates two JSONLs
+    that share a UUID stem (e.g. identical filenames in sibling project dirs).
     Using ``mtime_ns`` (nanoseconds since epoch) means a touched JSONL always
     invalidates the cache. Bumping ``_SCRIPT_VERSION`` invalidates every
     existing blob — safe default when the parser shape changes.
     """
-    return f"{path.stem}__{mtime_ns}__{_SCRIPT_VERSION}.json.gz"
+    try:
+        abs_path = str(path.resolve())
+    except OSError:
+        abs_path = str(path)
+    path_hash = hashlib.sha1(abs_path.encode("utf-8")).hexdigest()[:8]
+    return f"{path.stem}__{path_hash}__{mtime_ns}__{_SCRIPT_VERSION}.json.gz"
 
 
 def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
@@ -3458,6 +3465,27 @@ def _build_chart_html(
 
 _VENDOR_CHARTS_DIR = Path(__file__).parent / "vendor" / "charts"
 
+# When True, vendor-chart SHA mismatches / missing manifest entries / missing
+# files degrade to a stderr warning (and the chart silently drops). When
+# False (default), they raise :class:`RuntimeError` so a tampered or
+# corrupted install fails loudly instead of shipping unverified JS to the
+# browser. Flipped by ``--allow-unverified-charts``.
+_ALLOW_UNVERIFIED_CHARTS = False
+
+
+class VendorChartVerificationError(RuntimeError):
+    """Raised when a vendored chart asset fails SHA-256 verification or is
+    otherwise unavailable, and ``--allow-unverified-charts`` is not set."""
+
+
+def _chart_verification_failure(msg: str) -> None:
+    """Either raise a verification error or degrade to a stderr warning."""
+    if _ALLOW_UNVERIFIED_CHARTS:
+        print(f"[warn] {msg} (--allow-unverified-charts: continuing)",
+              file=sys.stderr)
+        return
+    raise VendorChartVerificationError(msg)
+
 
 @functools.lru_cache(maxsize=1)
 def _load_chart_manifest() -> dict:
@@ -3480,14 +3508,18 @@ def _load_chart_manifest() -> dict:
 def _read_vendor_files(library: str, suffix: str) -> str:
     """Read + concatenate vendor files for ``library`` whose path ends in
     ``suffix`` (``.js`` or ``.css``). Verifies each SHA-256 against the
-    manifest before inclusion; skips files that fail verification with a
-    stderr warning.
+    manifest before inclusion. On any failure (missing manifest entry,
+    missing file, or SHA mismatch) raises :class:`VendorChartVerificationError`
+    — fail-closed by default to prevent shipping unverified JS to the
+    browser. Set ``--allow-unverified-charts`` to degrade to stderr warnings.
     """
     manifest = _load_chart_manifest()
     lib_entry = manifest.get("libraries", {}).get(library)
     if not lib_entry:
-        print(f"[warn] chart library '{library}' not in vendor manifest; "
-              f"HTML will render without this chart.", file=sys.stderr)
+        _chart_verification_failure(
+            f"chart library {library!r} not in vendor manifest at "
+            f"{_VENDOR_CHARTS_DIR / 'manifest.json'}"
+        )
         return ""
     parts: list[str] = []
     for f in lib_entry.get("files", []):
@@ -3495,15 +3527,21 @@ def _read_vendor_files(library: str, suffix: str) -> str:
             continue
         path = _VENDOR_CHARTS_DIR / f["path"]
         if not path.exists():
-            print(f"[warn] vendor file missing: {path}", file=sys.stderr)
+            _chart_verification_failure(f"vendor file missing: {path}")
             continue
         data = path.read_bytes()
         actual = hashlib.sha256(data).hexdigest()
         expected = f.get("sha256", "")
-        if expected and actual != expected:
-            print(f"[warn] SHA-256 mismatch for {path.name}: "
-                  f"expected {expected[:12]}…, got {actual[:12]}… (skipped)",
-                  file=sys.stderr)
+        if not expected:
+            _chart_verification_failure(
+                f"vendor manifest entry for {path.name} has no sha256 field"
+            )
+            continue
+        if actual != expected:
+            _chart_verification_failure(
+                f"SHA-256 mismatch for {path.name}: "
+                f"expected {expected[:12]}…, got {actual[:12]}…"
+            )
             continue
         parts.append(data.decode("utf-8", errors="replace"))
     sep = ";\n" if suffix == ".js" else "\n"
@@ -4290,7 +4328,9 @@ def render_html(report: dict, variant: str = "single",
             tc = totals["tool_call_total"]
             avg = totals.get("tool_call_avg_per_turn", 0.0)
             top3 = totals.get("tool_names_top3") or []
-            top3_str = ", ".join(top3) if top3 else "none"
+            # Tool names originate from the JSONL and are attacker-controllable
+            # in a compromised transcript — escape each before interpolating.
+            top3_str = ", ".join(html_mod.escape(n) for n in top3) if top3 else "none"
             tool_calls_card = (
                 f'\n  <div class="card">'
                 f'<div class="val">{tc} · {avg:.1f}/turn</div>'
@@ -5145,6 +5185,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         "Default: highcharts (vendored, non-commercial). "
                         "Alternatives: uplot/chartjs (MIT). "
                         "Use 'none' for a no-JS detail page.")
+    p.add_argument("--allow-unverified-charts", action="store_true",
+                   help="Downgrade vendor-chart SHA-256 verification failures "
+                        "(missing manifest entry, missing file, hash mismatch) "
+                        "from hard errors to stderr warnings. Default: fail "
+                        "loudly so tampered or corrupted installs are caught.")
     # --- Compare-mode flags ------------------------------------------------
     # ``--compare`` is the single entrypoint: any other compare-mode flag is
     # a no-op without it. Kept out of the ``--project-cost`` / single-session
@@ -5374,6 +5419,10 @@ def main() -> None:
     tz_offset, tz_label = _resolve_tz(args.tz, args.utc_offset)
     peak = _build_peak(args.peak_hours, args.peak_tz)
     chart_lib: str = args.chart_lib
+    # Flip the module-level gate so _read_vendor_files knows whether to
+    # raise or warn on verification failures. Set before any chart code runs.
+    global _ALLOW_UNVERIFIED_CHARTS
+    _ALLOW_UNVERIFIED_CHARTS = bool(args.allow_unverified_charts)
     _maybe_warn_chart_license(chart_lib, formats)
 
     if args.list:
