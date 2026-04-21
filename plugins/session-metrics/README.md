@@ -153,12 +153,12 @@ The plugin turns that one-off study into a reproducible test against
 That's it. No arguments needed. The plugin will:
 
 1. Create a throwaway scratch directory.
-2. Show you: *"about to run 20 headless Claude Code calls (10 prompts
-   × 2 models) against your subscription quota — proceed?"* and wait
-   for `y`.
+2. Show you: *"about to run N × 2 headless Claude Code calls against
+   your subscription quota — proceed?"* (N = 10 built-in prompts plus
+   any you've added to `~/.session-metrics/prompts/`) and wait for `y`.
 3. Spawn two [headless](https://code.claude.com/docs/en/headless)
    `claude -p` sessions — one for Opus 4.6, one for Opus 4.7. Each
-   runs the same 10 canonical prompts in the same order. Takes about
+   runs the same canonical prompts in the same order. Takes about
    10–20 minutes total, unattended.
 4. Render a single HTML report: per-turn token ratios, cost delta,
    a quality-vs-cost card, a "should I switch?" recommendation.
@@ -207,7 +207,8 @@ A single HTML file with:
 
 - **Summary strip.** Input, output, total, and cost ratios (B vs A).
 - **IFEval quality card.** Pass-rate delta — does the more-expensive
-  side actually produce more accurate outputs on the 10 test prompts?
+  side produce more accurate outputs? Built-in prompts show pass/fail;
+  custom prompts you've added show ratio data only (no predicate).
 - **Per-turn table.** One row per prompt, A vs B tokens, heatmap tint
   showing where the ratio is worst.
 - **Input-token-ratio histogram.** Distribution across the suite.
@@ -264,12 +265,36 @@ directory or pass `--no-cache` to bypass.
 
 ---
 
+## Custom prompts (`v1.10.0+`)
+
+Add your own prompts to the comparison suite — no file format knowledge required:
+
+```
+/session-metrics compare-add-prompt "Write a haiku about Python programming."
+```
+
+The prompt is saved to `~/.session-metrics/prompts/` and runs automatically on every future `--compare-run` alongside the built-in 10. You can also drop any plain `.md` file into that directory and it will be picked up automatically.
+
+**Manage your suite:**
+
+| Command | What it does |
+|---------|-------------|
+| `compare-add-prompt "text"` | Add a new user prompt (plain text, no YAML needed) |
+| `compare-remove-prompt NAME` | Remove a prompt by name |
+| `compare-list-prompts` | Preview the full active suite + call count before running |
+
+Custom prompts capture cost and token ratios just like the built-in 10. They show "no predicate" in the pass/fail column — you get the ratio data without needing to write a compliance check.
+
+For the step-by-step guide (including advanced predicates and replacing the entire suite): [`skills/session-metrics/references/custom-prompts.md`](skills/session-metrics/references/custom-prompts.md).
+
+---
+
 ## Cost of running `--compare-run`
 
-One full run = **2 models × 10 prompts = 20 headless inference calls**
-against your Claude subscription quota. On Pro and Max this is a
-minor hit — the prompts are short-to-medium, and the 10-prompt suite
-runs in under 20 minutes wall-clock. On Team/Enterprise it's
+One full run = **2 models × N prompts** headless inference calls
+against your Claude subscription quota, where N = 10 built-in prompts
+(plus any you've added — see below). On Pro and Max this is a minor hit
+— the prompts are short-to-medium and finish in under 20 minutes wall-clock. On Team/Enterprise it's
 negligible. The plugin's confirmation gate is explicit about this
 before any work begins; pass `--yes` to bypass when scripting.
 
@@ -283,5 +308,6 @@ measurement) and you have an `ANTHROPIC_API_KEY`, use
 
 - **Full skill reference:** [`skills/session-metrics/SKILL.md`](skills/session-metrics/SKILL.md)
 - **Compare deep-dive:** [`skills/session-metrics/references/model-compare.md`](skills/session-metrics/references/model-compare.md)
+- **Custom prompts guide:** [`skills/session-metrics/references/custom-prompts.md`](skills/session-metrics/references/custom-prompts.md)
 - **Source of truth + changelog:** [`centminmod/session-metrics`](https://github.com/centminmod/session-metrics) (the dev repo this plugin is built from)
 - **Background articles:** [*"I built a token-cost analyzer skill for Claude Code"*](https://ai.georgeliu.com/p/i-built-a-token-cost-analyzer-skill) · [*"I ran two Claude Opus 4.7 5-hour sessions"*](https://ai.georgeliu.com/p/i-ran-two-claude-opus-47-5hr-sessions)
