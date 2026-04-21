@@ -37,6 +37,7 @@ import io
 import json
 import os
 import re
+import secrets
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -215,7 +216,13 @@ def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         # Write atomically so a crash mid-write doesn't leave a corrupt cache.
-        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        # Randomize the tmp suffix with pid + 4 bytes of entropy so two
+        # concurrent writers on the same cache_path never collide on the
+        # same tmp file (POSIX os.replace is atomic, but two writers racing
+        # on the same tmp could interleave bytes prior to replace()).
+        tmp = cache_path.with_suffix(
+            f"{cache_path.suffix}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        )
         with gzip.open(tmp, "wt", encoding="utf-8") as fh:
             json.dump(entries, fh, separators=(",", ":"))
         tmp.replace(cache_path)
@@ -829,9 +836,27 @@ def _resolve_tz(tz_name: str | None, utc_offset: float | None) -> tuple[float, s
     Priority: ``tz_name`` (IANA, DST-aware) > ``utc_offset`` (fixed float) >
     local system tz.  Returns ``(offset_hours, label)``.
 
-    Note: with an IANA name, the offset returned is the *current* offset —
-    adequate for static exports but ``ZoneInfo`` must be used by the HTML
-    client for per-event DST-aware bucketing across historical dates.
+    **Contract — fixed scalar offset, by design.** With an IANA name, the
+    offset returned is the *current* UTC offset captured once at parse time.
+    Historical hour-of-day buckets in static exports (text / JSON / CSV / MD
+    tables, and the Highcharts-rendered PNG) use this single scalar offset
+    applied uniformly across every event — they do **not** reflect per-event
+    DST (a spring-forward event in March and a summer event in July are
+    bucketed against the same offset).
+
+    This is intentional and historically stable. Static-export consumers
+    expect one tz label per report, not per-event astimezone() jitter. Any
+    switch to per-event ``ZoneInfo`` math here would perturb every existing
+    report — treat as a breaking change if ever proposed.
+
+    The HTML client's uPlot / Chart.js bucketing (see ``_chart_js`` helpers)
+    does per-event DST correctly via ``Intl.DateTimeFormat`` with the IANA
+    ``tz_label`` — client-side charts and static-export buckets will
+    legitimately differ by up to one hour near DST boundaries. This is not
+    a bug; it's the documented split.
+
+    See ``test_hour_of_day_dst_boundary_uses_fixed_offset`` for the
+    behaviour-lock regression test.
     """
     if tz_name:
         try:

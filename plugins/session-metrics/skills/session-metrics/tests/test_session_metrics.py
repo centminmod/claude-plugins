@@ -1167,6 +1167,112 @@ def test_cached_parse_same_stem_sibling_dirs_no_collision(tmp_path, monkeypatch)
     assert len(blobs) == 2
 
 
+def test_cache_write_tmp_filename_is_randomized(tmp_path, monkeypatch):
+    """Two writers must not collide on the same .tmp file.
+
+    Regression for H2: prior to randomizing the tmp suffix, two writers on
+    the same cache_path shared a deterministic '.tmp' name, risking
+    interleaved bytes prior to the atomic replace(). Post-fix the tmp
+    suffix is `<pid>.<token_hex(4)>.tmp` — each write gets a unique name.
+    """
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    seen = []
+    real_token_hex = sm.secrets.token_hex
+
+    def spy_token_hex(n):
+        r = real_token_hex(n)
+        seen.append(r)
+        return r
+
+    monkeypatch.setattr(sm.secrets, "token_hex", spy_token_hex)
+    src = tmp_path / "mini.jsonl"
+    src.write_text(_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    sm._cached_parse_jsonl(src, use_cache=True)
+    # Bump mtime so the second call is a cache miss (not a read).
+    import os
+    stat = src.stat()
+    os.utime(src, (stat.st_atime, stat.st_mtime + 2))
+    sm._cached_parse_jsonl(src, use_cache=True)
+    assert len(seen) == 2
+    # Each write draws a fresh 4-byte token — overwhelmingly likely distinct.
+    assert seen[0] != seen[1]
+    # No leftover .tmp files — atomic replace succeeded both times.
+    leftovers = list((tmp_path / "parse").glob("*.tmp"))
+    assert leftovers == []
+
+
+def test_cache_write_concurrent_threads_no_corruption(tmp_path, monkeypatch):
+    """Concurrent writers on the same cache path must not corrupt the blob.
+
+    Regression for H2: four threads racing to populate the cache for the
+    same source file all succeed, the final blob is a valid gzip+JSON,
+    and no orphan .tmp files are left behind. Threading (not
+    multiprocessing) is used intentionally — the contention that matters
+    here is on the tmp filename, which the random suffix now guards
+    against regardless of whether writers share a pid.
+    """
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    src = tmp_path / "mini.jsonl"
+    src.write_text(_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+
+    import threading
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            sm._cached_parse_jsonl(src, use_cache=True)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+        assert not t.is_alive(), "worker deadlocked"
+
+    assert errors == [], f"worker raised: {errors!r}"
+    # Final cache layer must be consistent: one blob, zero orphaned .tmp files.
+    cache_dir = tmp_path / "parse"
+    blobs = list(cache_dir.glob("*.json.gz"))
+    assert len(blobs) == 1, f"expected one blob, saw {[b.name for b in blobs]}"
+    orphans = list(cache_dir.glob("*.tmp"))
+    assert orphans == [], f"orphan tmp files: {[o.name for o in orphans]}"
+    # Reading the cached blob must succeed and return a usable list.
+    parsed = sm._cached_parse_jsonl(src, use_cache=True)
+    assert isinstance(parsed, list)
+
+
+def test_hour_of_day_dst_boundary_uses_fixed_offset():
+    """Behaviour lock: hour_of_day bucketing uses a scalar offset, not per-event DST.
+
+    Regression lock for the _resolve_tz documented contract: static-export
+    buckets apply a single offset uniformly to every timestamp. A future
+    "DST fix" that switched this module to per-event ``ZoneInfo`` math
+    would silently perturb every historical report — this test exists to
+    force that change to be explicit.
+
+    Scenario: a January event and a July event, each at 10:00 *local*
+    wall-clock time in America/Los_Angeles. With per-event DST math,
+    both would land in bucket 10. With the documented scalar offset
+    (PST = UTC-8), the July event (which was 10:00 PDT = 17:00 UTC)
+    buckets to 09:00 — one hour "off" from wall-clock local time. That
+    one-hour delta is the whole point of the contract.
+    """
+    # 10:00 PST = 18:00 UTC (January, no DST in effect).
+    jan = _epoch(2026, 1, 15, 18, 0)
+    # 10:00 PDT = 17:00 UTC (July, DST in effect).
+    jul = _epoch(2026, 7, 15, 17, 0)
+    hod = sm._build_hour_of_day([jan, jul], offset_hours=-8.0)
+    # Jan: (18 - 8) mod 24 == 10 — matches wall-clock.
+    assert hod["hours"][10] == 1
+    # Jul: (17 - 8) mod 24 == 9 — one hour off (no DST adjust).
+    assert hod["hours"][9] == 1
+    # Proves the two events did NOT coalesce into a single bucket.
+    assert hod["total"] == 2
+    assert sum(hod["hours"]) == 2
+
+
 def test_render_html_single_page_has_everything():
     r = _build_fixture_report()
     html = sm.render_html(r, variant="single")
