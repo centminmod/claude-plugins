@@ -113,6 +113,10 @@ def _cache_write_split(u: dict) -> tuple[int, int]:
 
 
 def _cost(u: dict, model: str) -> float:
+    # Known limitation: fast-mode turns (Opus 4.6 research preview, usage.speed
+    # == "fast") bill at 6x standard base rates. Not multiplied here — fast-mode
+    # cost is therefore underestimated by 6x for those turns. See
+    # references/pricing.md § "Fast mode" for the full note.
     r = _pricing_for(model)
     tokens_5m, tokens_1h = _cache_write_split(u)
     return (
