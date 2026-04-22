@@ -866,11 +866,14 @@ def _resolve_tz(tz_name: str | None, utc_offset: float | None,
     switch to per-event ``ZoneInfo`` math here would perturb every existing
     report — treat as a breaking change if ever proposed.
 
-    The HTML client's uPlot / Chart.js bucketing (see ``_chart_js`` helpers)
-    does per-event DST correctly via ``Intl.DateTimeFormat`` with the IANA
-    ``tz_label`` — client-side charts and static-export buckets will
-    legitimately differ by up to one hour near DST boundaries. This is not
-    a bug; it's the documented split.
+    The HTML client's uPlot / Chart.js / Highcharts / hour-of-day /
+    punchcard / time-of-day widgets use the **same fixed scalar offset**
+    as the static path: the emitted JavaScript bucketizes events with
+    ``(epoch + offset_seconds) % 86400`` arithmetic, not ``Intl.DateTimeFormat``.
+    Static and client-side bucketing agree by design. A previous revision
+    of this docstring claimed per-event DST via ``Intl.DateTimeFormat``;
+    that was never implemented — the claim was aspirational and has been
+    corrected to match the code.
 
     When ``strict`` is True and the IANA zone can't be resolved (e.g. on
     Windows without the ``tzdata`` pip package), raises ``SystemExit``
