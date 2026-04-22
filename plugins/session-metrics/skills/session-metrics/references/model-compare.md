@@ -400,7 +400,7 @@ Output-format options: `--output text` (stdout, default), `md`,
 
 ### What the output shows
 
-- **Summary strip** — input / output / total / cost ratios (B ÷ A), IFEval pass rate per side, pass-rate delta in percentage points.
+- **Summary strip** — input / output / total / cost ratios (B ÷ A), IFEval pass rate per side, pass-rate delta in percentage points, plus paired-samples statistics (McNemar mid-p, Wilson 95% CIs, low-sample-size banner when N < 20). See [*Statistical interpretation*](#statistical-interpretation-ifeval-pass-rate-delta) below.
 - **Per-turn table** — one row per paired turn with A and B tokens, ratios, a `prompt` column naming the suite prompt, and `A✓` / `B✓` columns showing IFEval pass/fail.
 - **Advisories banner** — flags `context-tier-mismatch` (e.g. one side on 1M-context tier), `cache-share-drift` (sides differ by >10 pp in cache-read share), `suite-version-mismatch`, empty-side. **Read any advisory before trusting the headline ratio.**
 
@@ -483,6 +483,67 @@ To add, remove, or preview custom prompts, see
 - **Context-tier confound.** Claude Code's default Opus 4.7 arrives tagged `claude-opus-4-7[1m]` (1M-context tier). If side A is on the default tier and side B is `[1m]`, the `context-tier-mismatch` advisory fires — the ratio then conflates tokenizer + window tier + cache-hit-rate. Run both sides on the same tier when practical.
 - **System-prompt drift.** Claude Code's system prompt evolves over time. Compares across months can drift for that reason alone; Mode 2 is especially exposed. Protocol encourages same-day capture.
 - **Prompt-suite representativeness.** The canonical 10 prompts cover the content shapes the referenced article measured. Your workload may be skewed. Add your own prompts and re-run.
+
+---
+
+## Statistical interpretation (IFEval pass-rate delta)
+
+**Design.** The two runs feed the same prompts to both models, and
+`--pair-by fingerprint` (default) matches turns by the hash of the first
+500 chars of the user prompt. **Same prompt, two outputs → paired
+samples.** The correct statistical test for paired binary outcomes is
+**McNemar's test**, not a two-proportion z-test. A naive "A 70%, B 80%,
+Δ+10pp" comparison ignores the pairing and overstates the evidence for
+a real difference.
+
+**What the report emits** (v1.13.0+, alongside the existing
+`pass_delta_pp` field):
+
+| Field | Meaning |
+|-------|---------|
+| `instruction_mcnemar_b` | Count of discordant pairs where A passes and B fails. |
+| `instruction_mcnemar_c` | Count of discordant pairs where A fails and B passes. |
+| `instruction_mcnemar_pvalue` | Two-sided **mid-p** McNemar test p-value on `(b, c)`. `None` when `b + c == 0`. Mid-p is less conservative than the exact binomial tail at small N, which matters on a 10-prompt suite. |
+| `instruction_pass_rate_a_ci` | 95% **Wilson score** CI on A's marginal pass rate, `(lo, hi)` both in [0, 1]. `None` when N is 0. |
+| `instruction_pass_rate_b_ci` | Same for B. |
+| `low_sample_size` | `True` when N < 20. |
+| `sample_size_note` | Human-readable reminder surfaced as a banner in text/MD/HTML. |
+
+**How to read them.** McNemar only counts discordant pairs — concordant
+pairs (both pass, both fail) carry no information about the delta. If
+`b = 2, c = 3`, the null says these flips are coin flips; with only 5
+discordant trials there isn't enough evidence to reject it, and
+`p ≈ 0.7`. The "+10 pp" reads as a real gap at first glance but doesn't
+survive a paired test.
+
+Wilson CIs matter most at boundary proportions (0/10 or 10/10) — the
+naive Wald interval would give a zero-width band there, which is
+obviously wrong. Wilson stays inside [0, 1] at both extremes and has
+better coverage at small N generally.
+
+**Rule of thumb.**
+
+- `N ≥ 20` and `mcnemar_pvalue < 0.05` → real effect worth quoting.
+- `N < 20` → treat pass-rate deltas as **directional**, not conclusive.
+  Report the banner. The skill surfaces this automatically.
+- `mcnemar_b + mcnemar_c == 0` → models agree on every prompt; the
+  raw delta is exactly 0 and there is nothing to test. `pvalue` is
+  reported as `None`.
+
+**Why not a two-proportion z-test?** It would treat A's 10 trials and
+B's 10 trials as independent samples, which they aren't (each prompt
+appears in both). The paired design gives strictly more power for the
+same N when the models' outcomes are correlated (which they typically
+are on the canonical suite), so using the unpaired test is
+statistically sloppy in both directions — sometimes it inflates
+evidence, sometimes it masks a real shift.
+
+**Small-N warning threshold.** The default is N < 20 because, with a
+10-prompt suite, a single-prompt flip moves the raw pass rate by 10 pp
+— roughly the same magnitude as the headline effect the tool is trying
+to measure. Below 20 the noise floor and the signal ceiling are
+indistinguishable without a significance test. The threshold is a
+heuristic, not a hard rule.
 
 ---
 

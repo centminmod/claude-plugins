@@ -23,6 +23,7 @@ import csv as csv_mod
 import hashlib
 import io
 import json
+import math
 import re
 import sys
 from datetime import datetime, timezone
@@ -528,6 +529,56 @@ def _safe_ratio(numerator: float, denominator: float) -> float | None:
     return numerator / denominator
 
 
+def _mcnemar_midp(b: int, c: int) -> float | None:
+    """Two-sided mid-p McNemar test on paired binary outcomes.
+
+    Given the discordant-pair counts ``b`` (A-pass, B-fail) and ``c``
+    (A-fail, B-pass), returns the two-sided mid-p value under the null
+    hypothesis that A and B have equal pass rates. Concordant pairs
+    (both pass, both fail) carry no information about the delta and
+    are not inputs to the test.
+
+    Mid-p is used instead of the exact binomial tail because the exact
+    test is conservative at small n (our IFEval suite is N=9–10). For
+    ``b + c == 0`` (no discordant pairs), returns ``None`` — there is
+    no evidence for or against a difference.
+
+    Stdlib-only: uses ``math.comb`` for exact binomial PMF under p=0.5.
+    """
+    n = b + c
+    if n == 0:
+        return None
+    k = min(b, c)
+    # P(X <= k) under Binomial(n, 0.5)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / (2 ** n)
+    # mid-p: subtract half of the point mass at k
+    point_k = math.comb(n, k) / (2 ** n)
+    midp_one_sided = tail - 0.5 * point_k
+    # two-sided: double, capped at 1.0
+    return min(1.0, 2.0 * midp_one_sided)
+
+
+def _wilson_ci(successes: int, n: int,
+               z: float = 1.959963984540054) -> tuple[float, float] | None:
+    """Wilson score interval for a binomial proportion.
+
+    Closed-form 95% CI (default ``z`` is the exact two-sided 0.975
+    quantile of the standard normal). Returns ``(lo, hi)`` both in
+    [0, 1], or ``None`` when ``n == 0``. Wilson is preferred over the
+    naive Wald interval because it stays inside [0, 1] and has better
+    coverage at small n and at boundary proportions (0 or 1) — both
+    common in our N=9–10 IFEval suite.
+    """
+    if n <= 0:
+        return None
+    p_hat = successes / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = (p_hat + z2 / (2 * n)) / denom
+    half = (z / denom) * math.sqrt(p_hat * (1 - p_hat) / n + z2 / (4 * n * n))
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
 def _compute_ratios(a_rec: dict, b_rec: dict) -> dict:
     """Per-turn b/a ratios for the four headline columns.
 
@@ -790,10 +841,45 @@ def _build_compare_summary(
         rate_a = pass_a / len(evaluated)
         rate_b = pass_b / len(evaluated)
         pass_delta_pp = 100.0 * (rate_b - rate_a)
+        # Paired-samples statistics. The pairing structure (same prompt
+        # evaluated by both models) makes McNemar the correct test —
+        # simple two-proportion tests would ignore the pairing and
+        # inflate the apparent variance.
+        mcnemar_b = sum(
+            1 for p in evaluated
+            if p["instruction_pass_a"] and not p["instruction_pass_b"]
+        )
+        mcnemar_c = sum(
+            1 for p in evaluated
+            if not p["instruction_pass_a"] and p["instruction_pass_b"]
+        )
+        mcnemar_p = _mcnemar_midp(mcnemar_b, mcnemar_c)
+        rate_a_ci = _wilson_ci(pass_a, len(evaluated))
+        rate_b_ci = _wilson_ci(pass_b, len(evaluated))
     else:
         pass_a = pass_b = 0
         rate_a = rate_b = None
         pass_delta_pp = None
+        mcnemar_b = mcnemar_c = 0
+        mcnemar_p = None
+        rate_a_ci = rate_b_ci = None
+
+    # Small-N warning: below N=20 the suite has no power to resolve
+    # a 10-pp shift at conventional alpha. Surface this so users don't
+    # over-interpret single-prompt flips.
+    _LOW_N_THRESHOLD = 20
+    n_eval = len(evaluated)
+    low_sample_size = 0 < n_eval < _LOW_N_THRESHOLD
+    if low_sample_size:
+        sample_size_note = (
+            f"IFEval N={n_eval} < {_LOW_N_THRESHOLD}: a single-prompt flip "
+            "(~{:.0f} pp at N={}) is within statistical noise. Treat "
+            "pass-rate deltas as directional, not conclusive.".format(
+                100.0 / n_eval, n_eval
+            )
+        )
+    else:
+        sample_size_note = None
 
     return {
         "paired_count":             len(paired),
@@ -813,6 +899,15 @@ def _build_compare_summary(
         "instruction_pass_rate_a": rate_a,
         "instruction_pass_rate_b": rate_b,
         "instruction_pass_delta_pp": pass_delta_pp,
+        # New in v1.13.0: paired-samples statistics (additive — existing
+        # consumers of the three *_rate_*/delta fields above are unaffected).
+        "instruction_mcnemar_b":      mcnemar_b,
+        "instruction_mcnemar_c":      mcnemar_c,
+        "instruction_mcnemar_pvalue": mcnemar_p,
+        "instruction_pass_rate_a_ci": rate_a_ci,
+        "instruction_pass_rate_b_ci": rate_b_ci,
+        "low_sample_size":            low_sample_size,
+        "sample_size_note":           sample_size_note,
     }
 
 
@@ -1632,6 +1727,21 @@ def _render_controlled_text(report: dict) -> str:
           f"B {s['instruction_pass_b']}/{s['instruction_evaluated']} "
           f"({(s['instruction_pass_rate_b'] or 0) * 100:.0f}%), "
           f"Δ {_fmt_delta_pp(s['instruction_pass_delta_pp'] or 0)}")
+        ci_a = s.get("instruction_pass_rate_a_ci")
+        ci_b = s.get("instruction_pass_rate_b_ci")
+        if ci_a and ci_b:
+            p(f"  IFEval 95% CI       : "
+              f"A [{ci_a[0] * 100:.0f}–{ci_a[1] * 100:.0f}%], "
+              f"B [{ci_b[0] * 100:.0f}–{ci_b[1] * 100:.0f}%] (Wilson)")
+        pval = s.get("instruction_mcnemar_pvalue")
+        if pval is not None:
+            p(f"  IFEval McNemar      : "
+              f"p={pval:.3f} "
+              f"(b={s['instruction_mcnemar_b']} A✓B✗, "
+              f"c={s['instruction_mcnemar_c']} A✗B✓, "
+              f"mid-p two-sided)")
+        if s.get("low_sample_size") and s.get("sample_size_note"):
+            p(f"  [!] {s['sample_size_note']}")
     p()
 
     if report["paired"]:
@@ -1759,6 +1869,22 @@ def _render_controlled_md(report: dict) -> str:
           f"{s['instruction_pass_b']}/{s['instruction_evaluated']} "
           f"({(s['instruction_pass_rate_b'] or 0) * 100:.0f}%) |")
         p(f"| IFEval Δ | {_fmt_delta_pp(s['instruction_pass_delta_pp'] or 0)} |")
+        ci_a = s.get("instruction_pass_rate_a_ci")
+        ci_b = s.get("instruction_pass_rate_b_ci")
+        if ci_a and ci_b:
+            p(f"| IFEval 95% CI (A) | "
+              f"[{ci_a[0] * 100:.0f}–{ci_a[1] * 100:.0f}%] (Wilson) |")
+            p(f"| IFEval 95% CI (B) | "
+              f"[{ci_b[0] * 100:.0f}–{ci_b[1] * 100:.0f}%] (Wilson) |")
+        pval = s.get("instruction_mcnemar_pvalue")
+        if pval is not None:
+            p(f"| IFEval McNemar p | "
+              f"p={pval:.3f} "
+              f"(b={s['instruction_mcnemar_b']}, "
+              f"c={s['instruction_mcnemar_c']}, mid-p) |")
+    if s.get("low_sample_size") and s.get("sample_size_note"):
+        p()
+        p(f"> **Low sample size.** {s['sample_size_note']}")
     p()
 
     if report["paired"]:
@@ -1913,6 +2039,26 @@ def _render_controlled_csv(report: dict) -> str:
     delta_pp = s.get("instruction_pass_delta_pp")
     w.writerow(["instruction_pass_delta_pp",
                 "" if delta_pp is None else f"{delta_pp:.4f}"])
+    # Paired-samples statistics (v1.13.0+). Empty cells when no predicates ran.
+    w.writerow(["instruction_mcnemar_b", s.get("instruction_mcnemar_b", 0)])
+    w.writerow(["instruction_mcnemar_c", s.get("instruction_mcnemar_c", 0)])
+    pval = s.get("instruction_mcnemar_pvalue")
+    w.writerow(["instruction_mcnemar_pvalue",
+                "" if pval is None else f"{pval:.4f}"])
+    ci_a = s.get("instruction_pass_rate_a_ci")
+    ci_b = s.get("instruction_pass_rate_b_ci")
+    w.writerow(["instruction_pass_rate_a_ci_lo",
+                "" if ci_a is None else f"{ci_a[0]:.4f}"])
+    w.writerow(["instruction_pass_rate_a_ci_hi",
+                "" if ci_a is None else f"{ci_a[1]:.4f}"])
+    w.writerow(["instruction_pass_rate_b_ci_lo",
+                "" if ci_b is None else f"{ci_b[0]:.4f}"])
+    w.writerow(["instruction_pass_rate_b_ci_hi",
+                "" if ci_b is None else f"{ci_b[1]:.4f}"])
+    w.writerow(["low_sample_size",
+                "1" if s.get("low_sample_size") else "0"])
+    note = s.get("sample_size_note")
+    w.writerow(["sample_size_note", note or ""])
 
     if report["advisories"]:
         w.writerow([])
@@ -2437,13 +2583,35 @@ def _render_compare_html_controlled(
         rate_b = (s.get("instruction_pass_rate_b") or 0) * 100
         delta_pp = s.get("instruction_pass_delta_pp") or 0
         delta_accent = "green" if delta_pp >= 0 else "amber"
+        sub_parts = [f"A {rate_a:.0f}%", _fmt_delta_pp(delta_pp)]
+        ci_b = s.get("instruction_pass_rate_b_ci")
+        if ci_b:
+            sub_parts.append(
+                f"95% CI [{ci_b[0] * 100:.0f}&ndash;{ci_b[1] * 100:.0f}%]"
+            )
+        pval = s.get("instruction_mcnemar_pvalue")
+        if pval is not None:
+            sub_parts.append(f"McNemar p={pval:.3f}")
         cards.append(_summary_card(
             "IFEval pass rate (B)",
             f"{rate_b:.0f}%",
-            f"A {rate_a:.0f}% &middot; {_fmt_delta_pp(delta_pp)}",
+            " &middot; ".join(sub_parts),
             accent=delta_accent,
         ))
     cards_html = '<div class="cards">\n' + "\n".join(cards) + '\n</div>'
+
+    # Small-N banner — placed above the cards so the number isn't
+    # over-interpreted. Additive: existing DOM selectors keep working.
+    if s.get("low_sample_size") and s.get("sample_size_note"):
+        cards_html = (
+            '<div class="ifeval-banner" role="note" '
+            'style="padding:.6em .8em;margin:0 0 .6em;border-radius:4px;'
+            'background:#fff8e1;border-left:3px solid #f59e0b;'
+            'color:#92400e;font-size:.9em;">'
+            f'<strong>Low sample size:</strong> '
+            f'{_html_escape(s["sample_size_note"])}'
+            '</div>\n'
+        ) + cards_html
 
     qvsc_html = _render_quality_vs_cost_card(s)
     hist_html = _render_histogram_card(report.get("paired", []) or [])

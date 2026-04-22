@@ -3693,12 +3693,137 @@ def test_compare_summary_has_instruction_pass_rate():
         slug="t", prompt_suite=_fake_suite(),
     )
     s = report["summary"]
+    # Existing fields — value and presence preserved.
     assert s["instruction_evaluated"] == 1
     assert s["instruction_pass_a"] == 1
     assert s["instruction_pass_b"] == 0
     assert s["instruction_pass_rate_a"] == pytest.approx(1.0)
     assert s["instruction_pass_rate_b"] == pytest.approx(0.0)
     assert s["instruction_pass_delta_pp"] == pytest.approx(-100.0)
+    # New paired-samples fields (v1.13.0+) coexist with existing ones.
+    assert "instruction_mcnemar_b" in s
+    assert "instruction_mcnemar_c" in s
+    assert "instruction_mcnemar_pvalue" in s
+    assert "instruction_pass_rate_a_ci" in s
+    assert "instruction_pass_rate_b_ci" in s
+    assert "low_sample_size" in s
+    assert "sample_size_note" in s
+    # N=1 triggers the low-sample-size banner.
+    assert s["low_sample_size"] is True
+    assert s["sample_size_note"] is not None
+
+
+# ---- Paired-samples statistics (v1.13.0+) ----------------------------------
+
+def test_mcnemar_midp_no_discordant_pairs_returns_none():
+    # Both models agree on every prompt → no evidence for a difference.
+    assert smc._mcnemar_midp(0, 0) is None
+
+
+def test_mcnemar_midp_strong_b_bias_gives_small_pvalue():
+    # b=5, c=0: under null p=0.5 this is 2^-5 = 1/32 per side. Mid-p corrects
+    # down by 0.5 * point_mass; two-sided doubles the result.
+    # Expected: 2 * (1/32 - 0.5 * 1/32) = 2 * (1/64) = 1/32 = 0.03125
+    p = smc._mcnemar_midp(5, 0)
+    assert p == pytest.approx(1.0 / 32.0, abs=1e-9)
+
+
+def test_mcnemar_midp_symmetric_case_gives_pvalue_one():
+    # b=c → no evidence for either direction → mid-p two-sided = 1.0
+    p = smc._mcnemar_midp(3, 3)
+    assert p == pytest.approx(1.0, abs=1e-9)
+
+
+def test_mcnemar_midp_capped_at_one():
+    # b=1, c=1 → the unadjusted two-sided tail exceeds 1; must be clipped.
+    p = smc._mcnemar_midp(1, 1)
+    assert p is not None
+    assert 0.0 < p <= 1.0
+
+
+def test_wilson_ci_n_zero_returns_none():
+    assert smc._wilson_ci(0, 0) is None
+
+
+def test_wilson_ci_known_case_n_10_successes_7():
+    # Wilson 95% CI for 7/10 — standard reference value is [0.397, 0.892]
+    ci = smc._wilson_ci(7, 10)
+    assert ci is not None
+    lo, hi = ci
+    assert lo == pytest.approx(0.397, abs=0.005)
+    assert hi == pytest.approx(0.892, abs=0.005)
+
+
+def test_wilson_ci_all_pass_has_nonzero_lower_bound():
+    # 10/10 pass → upper bound pinned at 1.0, lower bound strictly > 0
+    # (This is the main reason Wilson is preferred over Wald at boundaries.)
+    ci = smc._wilson_ci(10, 10)
+    assert ci is not None
+    lo, hi = ci
+    assert hi == pytest.approx(1.0, abs=1e-9)
+    assert lo > 0.6
+
+
+def test_wilson_ci_zero_pass_has_lt_one_upper_bound():
+    ci = smc._wilson_ci(0, 10)
+    assert ci is not None
+    lo, hi = ci
+    assert lo == pytest.approx(0.0, abs=1e-9)
+    assert hi < 0.4
+
+
+def test_compare_summary_flags_low_sample_size_when_n_under_20():
+    # Build a paired report with a single evaluated prompt.
+    a_turns = [_make_sentinel_turn("no_commas", 1, "no comma here")]
+    b_turns = [_make_sentinel_turn("no_commas", 1, "no comma")]
+    report = smc._build_compare_report(
+        "s_a", a_turns, [], "s_b", b_turns, [],
+        slug="t", prompt_suite=_fake_suite(),
+    )
+    s = report["summary"]
+    assert s["low_sample_size"] is True
+    assert s["sample_size_note"] is not None
+    assert "N=" in s["sample_size_note"]
+
+
+def test_compare_summary_no_low_sample_flag_when_no_predicates():
+    # Zero evaluated → low_sample_size should be False (not "yes, N=0").
+    a_sid, a_turns, _ = _load_compare_fixture("compare_opus_4_6_a.jsonl")
+    b_sid, b_turns, _ = _load_compare_fixture("compare_opus_4_7_a.jsonl")
+    report = smc._build_compare_report(
+        a_sid, a_turns, [], b_sid, b_turns, [],
+        slug="t", prompt_suite={},
+    )
+    s = report["summary"]
+    assert s["instruction_evaluated"] == 0
+    assert s["low_sample_size"] is False
+    assert s["sample_size_note"] is None
+    # p-value and CIs cleanly None when nothing was evaluated.
+    assert s["instruction_mcnemar_pvalue"] is None
+    assert s["instruction_pass_rate_a_ci"] is None
+    assert s["instruction_pass_rate_b_ci"] is None
+
+
+def test_compare_summary_paired_perfect_agreement_gives_null_pvalue():
+    """Both models pass the same prompt → no discordant pairs → p-value None."""
+    a_turns = [
+        _make_sentinel_turn("no_commas", 1, "no comma"),
+        _make_sentinel_turn("lowercase", 1, "all lowercase"),
+    ]
+    b_turns = [
+        _make_sentinel_turn("no_commas", 1, "no comma"),
+        _make_sentinel_turn("lowercase", 1, "all lowercase"),
+    ]
+    report = smc._build_compare_report(
+        "s_a", a_turns, [], "s_b", b_turns, [],
+        slug="t", prompt_suite=_fake_suite(),
+    )
+    s = report["summary"]
+    assert s["instruction_mcnemar_b"] == 0
+    assert s["instruction_mcnemar_c"] == 0
+    assert s["instruction_mcnemar_pvalue"] is None
+    # pass_delta_pp preserved: both at 100% → 0.0 pp
+    assert s["instruction_pass_delta_pp"] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_compare_summary_blank_without_sentinels():
