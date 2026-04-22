@@ -216,6 +216,10 @@ use.
 - [`references/custom-prompts.md`](references/custom-prompts.md) — Step-by-step
   guide for adding, removing, and previewing custom prompts for `--compare-run`.
   Read when the user asks how to add their own prompts or customise the suite.
+- [`references/platform-notes.md`](references/platform-notes.md) — Windows
+  `tzdata` caveat for IANA `--tz` names, the `--strict-tz` escape hatch,
+  and timezone-contract summary. Read when the user reports a timezone
+  warning, asks about Windows support, or wants CI-safe tz handling.
 
 ## How session detection works
 

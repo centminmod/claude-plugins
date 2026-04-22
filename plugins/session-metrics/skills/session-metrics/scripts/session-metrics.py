@@ -806,12 +806,17 @@ def _parse_peak_hours(value: str) -> tuple[int, int]:
 
 
 def _build_peak(peak_hours: tuple[int, int] | None,
-                peak_tz: str | None) -> dict | None:
+                peak_tz: str | None,
+                strict: bool = False) -> dict | None:
     """Build a ``peak`` section from CLI inputs, resolving the peak tz offset.
 
     Returns None when ``peak_hours`` is not set. Defaults ``peak_tz`` to
     ``America/Los_Angeles`` (where the "peak hours" terminology originates
     in community reports) when only ``peak_hours`` is provided.
+
+    When ``strict`` is True and the IANA zone can't be resolved (e.g. on
+    Windows without the ``tzdata`` pip package), raises ``SystemExit``
+    with an actionable message instead of warning and falling back to UTC.
     """
     if peak_hours is None:
         return None
@@ -821,8 +826,15 @@ def _build_peak(peak_hours: tuple[int, int] | None,
         delta = datetime.now(zi).utcoffset()
         off = delta.total_seconds() / 3600.0 if delta else 0.0
     except ZoneInfoNotFoundError:
-        print(f"[warn] unknown peak-tz {tz_name!r}; using UTC",
-              file=sys.stderr)
+        msg = (
+            f"ZoneInfo not found for peak-tz {tz_name!r}. "
+            "On Windows, install the 'tzdata' package "
+            "(pip install tzdata) for IANA tz support."
+        )
+        if strict:
+            print(f"[error] {msg}", file=sys.stderr)
+            raise SystemExit(2)
+        print(f"[warn] {msg} Falling back to UTC.", file=sys.stderr)
         off, tz_name = 0.0, "UTC"
     start, end = peak_hours
     return {
@@ -834,7 +846,8 @@ def _build_peak(peak_hours: tuple[int, int] | None,
     }
 
 
-def _resolve_tz(tz_name: str | None, utc_offset: float | None) -> tuple[float, str]:
+def _resolve_tz(tz_name: str | None, utc_offset: float | None,
+                strict: bool = False) -> tuple[float, str]:
     """Resolve the display timezone from CLI/env inputs.
 
     Priority: ``tz_name`` (IANA, DST-aware) > ``utc_offset`` (fixed float) >
@@ -859,6 +872,10 @@ def _resolve_tz(tz_name: str | None, utc_offset: float | None) -> tuple[float, s
     legitimately differ by up to one hour near DST boundaries. This is not
     a bug; it's the documented split.
 
+    When ``strict`` is True and the IANA zone can't be resolved (e.g. on
+    Windows without the ``tzdata`` pip package), raises ``SystemExit``
+    with an actionable message instead of warning and falling back to UTC.
+
     See ``test_hour_of_day_dst_boundary_uses_fixed_offset`` for the
     behaviour-lock regression test.
     """
@@ -870,7 +887,15 @@ def _resolve_tz(tz_name: str | None, utc_offset: float | None) -> tuple[float, s
             off = delta.total_seconds() / 3600.0 if delta else 0.0
             return off, tz_name
         except ZoneInfoNotFoundError:
-            print(f"[warn] unknown tz {tz_name!r}; using UTC", file=sys.stderr)
+            msg = (
+                f"ZoneInfo not found for tz {tz_name!r}. "
+                "On Windows, install the 'tzdata' package "
+                "(pip install tzdata) for IANA tz support."
+            )
+            if strict:
+                print(f"[error] {msg}", file=sys.stderr)
+                raise SystemExit(2)
+            print(f"[warn] {msg} Falling back to UTC.", file=sys.stderr)
             return 0.0, "UTC"
     if utc_offset is not None:
         sign = "+" if utc_offset >= 0 else "-"
@@ -5219,6 +5244,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(missing manifest entry, missing file, hash mismatch) "
                         "from hard errors to stderr warnings. Default: fail "
                         "loudly so tampered or corrupted installs are caught.")
+    p.add_argument("--strict-tz", action="store_true",
+                   help="When --tz / --peak-tz cannot be resolved (e.g. on "
+                        "Windows without the 'tzdata' pip package), raise "
+                        "instead of warning and falling back to UTC. Default: "
+                        "warn and fall back so reports still render. See "
+                        "references/platform-notes.md.")
     # --- Compare-mode flags ------------------------------------------------
     # ``--compare`` is the single entrypoint: any other compare-mode flag is
     # a no-op without it. Kept out of the ``--project-cost`` / single-session
@@ -5445,8 +5476,10 @@ def main() -> None:
     slug = args.slug or _env_slug() or _cwd_to_slug()
     _validate_slug(slug)
     formats: list[str] = args.output or []
-    tz_offset, tz_label = _resolve_tz(args.tz, args.utc_offset)
-    peak = _build_peak(args.peak_hours, args.peak_tz)
+    tz_offset, tz_label = _resolve_tz(args.tz, args.utc_offset,
+                                      strict=bool(args.strict_tz))
+    peak = _build_peak(args.peak_hours, args.peak_tz,
+                       strict=bool(args.strict_tz))
     chart_lib: str = args.chart_lib
     # Flip the module-level gate so _read_vendor_files knows whether to
     # raise or warn on verification failures. Set before any chart code runs.

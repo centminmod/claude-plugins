@@ -1020,6 +1020,62 @@ def test_build_peak_defaults_to_los_angeles():
     assert "community" in p["note"].lower()
 
 
+def _raise_zoneinfo_missing(*args, **kwargs):
+    raise sm.ZoneInfoNotFoundError("simulated windows-without-tzdata")
+
+
+def test_resolve_tz_missing_warns_and_falls_back(monkeypatch, capsys):
+    """Default: ZoneInfo miss warns to stderr and returns (0.0, 'UTC')."""
+    monkeypatch.setattr(sm, "ZoneInfo", _raise_zoneinfo_missing)
+    off, label = sm._resolve_tz("America/Los_Angeles", None)
+    assert off == 0.0
+    assert label == "UTC"
+    err = capsys.readouterr().err
+    assert "[warn]" in err
+    assert "tzdata" in err
+    assert "Falling back to UTC" in err
+
+
+def test_resolve_tz_strict_raises_on_missing(monkeypatch, capsys):
+    """--strict-tz: ZoneInfo miss raises SystemExit with actionable hint."""
+    monkeypatch.setattr(sm, "ZoneInfo", _raise_zoneinfo_missing)
+    with pytest.raises(SystemExit) as excinfo:
+        sm._resolve_tz("Europe/Berlin", None, strict=True)
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "[error]" in err
+    assert "tzdata" in err
+
+
+def test_build_peak_missing_warns_and_falls_back(monkeypatch, capsys):
+    monkeypatch.setattr(sm, "ZoneInfo", _raise_zoneinfo_missing)
+    p = sm._build_peak((9, 17), "America/Los_Angeles")
+    assert p is not None
+    assert p["tz_label"] == "UTC"
+    assert p["tz_offset_hours"] == 0.0
+    err = capsys.readouterr().err
+    assert "[warn]" in err
+    assert "tzdata" in err
+
+
+def test_build_peak_strict_raises_on_missing(monkeypatch, capsys):
+    monkeypatch.setattr(sm, "ZoneInfo", _raise_zoneinfo_missing)
+    with pytest.raises(SystemExit) as excinfo:
+        sm._build_peak((9, 17), "America/Los_Angeles", strict=True)
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "[error]" in err
+
+
+def test_resolve_tz_clean_input_unchanged_by_strict_flag():
+    """Behaviour-preservation: a resolvable tz is unaffected by strict=True."""
+    off_default, label_default = sm._resolve_tz("America/Los_Angeles", None)
+    off_strict, label_strict = sm._resolve_tz(
+        "America/Los_Angeles", None, strict=True)
+    assert off_default == off_strict
+    assert label_default == label_strict == "America/Los_Angeles"
+
+
 def test_weekly_rollup_has_data_flag():
     r = _build_fixture_report()
     # Fixture has 4 turns; fixture dates are in 2026-04, so whether the
