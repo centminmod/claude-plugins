@@ -31,6 +31,7 @@ parsing is required — just compare strings.
 
 | `$ARGUMENTS[0]`     | Route                                     | Then read |
 |---------------------|-------------------------------------------|-----------|
+| `all-projects`      | Instance-wide dashboard aggregating every project under `~/.claude/projects` | `## Instance dashboard (all projects)` below |
 | `compare`           | Two-session compare on JSONLs that already exist | `## Model comparison` below, then [`references/model-compare.md`](references/model-compare.md) before running |
 | `compare-run`       | Fully automated capture: spawns two `claude -p` sessions, feeds the suite, then runs `--compare` | `## Model comparison` below, then [`references/model-compare.md`](references/model-compare.md) "Workflow A — automated" |
 | `compare-prep`      | Print manual capture protocol + 10-prompt suite (fallback when headless is unavailable) | `## Model comparison` below |
@@ -155,6 +156,66 @@ fingerprint — lower-bound count), and the **Usage Insights** panel
 (prose-style pattern characterisations inspired by Anthropic's `/usage`
 command, auto-hide below threshold, exposed in JSON under `usage_insights`
 and in Markdown under `## Usage Insights`).
+
+## Instance dashboard (all projects)
+
+Reached when `$ARGUMENTS[0]` is `all-projects`, or when the user asks
+for the **total cost across every project** ("how much have I spent on
+Claude Code overall?", "what's my total spend across all projects?",
+"which project is costing me the most?").
+
+Aggregates every project under `~/.claude/projects/` (or
+`CLAUDE_PROJECTS_DIR`, or the `--projects-dir` override) into a single
+dashboard with instance-wide totals, a daily cost timeline, and a
+per-project breakdown table sorted by cost descending. Each project row
+hyperlinks to a pre-rendered per-project HTML drilldown that carries
+the full session/turn detail (same report as `--project-cost <slug>`).
+
+```bash
+# Instance-wide dashboard — HTML + MD + CSV + JSON
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --all-projects --output html md csv json
+
+# Fast path — no per-project drilldown HTMLs (rows render as plain text)
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --all-projects --no-project-drilldown --output html
+
+# Multi-instance: point at a non-default Claude Code install
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --all-projects --projects-dir /opt/claude-work/projects
+```
+
+### Output layout
+
+Exports write to a dated subfolder so successive runs don't overwrite
+each other and the whole bundle stays portable (zip it, move it, serve
+it as static files — relative drilldown links keep working):
+
+```
+exports/session-metrics/instance/YYYY-MM-DD-HHMMSS/
+  index.html    # entry point — instance dashboard
+  index.md
+  index.csv     # one row per session, with a project_slug column
+  index.json    # full instance report (no per-turn records — only per-session summaries)
+  projects/
+    <slug-1>.html   # full per-project HTML, same as --project-cost <slug-1>
+    <slug-2>.html
+    ...
+```
+
+`--no-project-drilldown` skips the `projects/` folder entirely and
+renders `index.html` with project rows as plain text (no hyperlinks) —
+useful for CI or quick-glance runs. Per-turn data is always suppressed
+at the instance scope; users drill down by clicking into a project HTML.
+
+### Multi-instance Claude Code setups
+
+Three layered overrides pick the projects directory (highest precedence first):
+
+1. `--projects-dir <path>` CLI flag
+2. `CLAUDE_PROJECTS_DIR` environment variable
+3. Default `~/.claude/projects`
+
+The resolved projects directory is rendered into the HTML header byline
+so output from multiple instances is self-documenting when viewed
+side-by-side.
 
 ## Model comparison
 

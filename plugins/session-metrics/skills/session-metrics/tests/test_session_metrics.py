@@ -4,7 +4,9 @@ Run with: uv run python -m pytest tests/ -v
 """
 import html as html_std
 import importlib.util
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -6401,3 +6403,376 @@ def test_turn_data_json_is_html_escaped():
     sid8 = r["sessions"][0]["session_id"][:8]
     payload = data[f"{sid8}-1"]
     assert payload["prompt_text"] == "</script><img src=x onerror=alert(1)>"
+
+
+# ---- Perf regression guard (opt-in) ----------------------------------------
+# Gated behind SESSION_METRICS_RUN_PERF_TESTS=1 so the default CI / uv run
+# path stays fast. Baselines live under exports/perf-baselines/ and are
+# updated by scripts/benchmark.py.
+
+@pytest.mark.perf
+@pytest.mark.skipif(
+    not os.environ.get("SESSION_METRICS_RUN_PERF_TESTS"),
+    reason="set SESSION_METRICS_RUN_PERF_TESTS=1 to enable",
+)
+def test_parse_jsonl_under_perf_budget(tmp_path):
+    """Cold-parse a 5k-turn synthetic fixture in under 2 seconds.
+
+    Deliberately generous slack (the benchmark shows ~60ms at N=1k on a
+    laptop). This guards against accidental 10x regressions in parse
+    throughput — it's a safety net, not a precision benchmark.
+    """
+    # Inline fixture generator: keeps test self-contained, no committed
+    # binary fixture needed.
+    import json as _json
+    import random as _random
+    fx = tmp_path / "perf-5k.jsonl"
+    rng = _random.Random(42)
+    with fx.open("w", encoding="utf-8") as fh:
+        for i in range(5_000):
+            fh.write(_json.dumps({
+                "type": "user", "uuid": f"u{i}",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "sessionId": "perf",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": f"p{i}"}]},
+            }) + "\n")
+            fh.write(_json.dumps({
+                "type": "assistant", "uuid": f"a{i}",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "sessionId": "perf",
+                "message": {
+                    "id": f"m{i}", "model": "claude-opus-4-7",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "x" * 50}],
+                    "usage": {
+                        "input_tokens": rng.randint(100, 2000),
+                        "output_tokens": rng.randint(50, 500),
+                        "cache_read_input_tokens": rng.randint(0, 500),
+                        "cache_creation_input_tokens": rng.randint(0, 100),
+                    },
+                },
+            }) + "\n")
+    t0 = time.perf_counter()
+    entries = sm._parse_jsonl(fx)
+    elapsed = time.perf_counter() - t0
+    assert len(entries) == 10_000
+    assert elapsed < 2.0, f"parse took {elapsed:.2f}s (budget 2.0s)"
+
+
+# --- Instance mode (--all-projects) ------------------------------------------
+#
+# Covers _list_all_projects discovery, _build_instance_report aggregation,
+# _run_all_projects orchestration, and the five instance-branch renderers.
+
+def _write_turn(fh, *, session_id: str, uuid: str, ts: str, model: str,
+                input_tokens: int, output_tokens: int,
+                cache_read: int = 0, cache_write: int = 0,
+                msg_id: str | None = None) -> None:
+    """Append one assistant turn + its preceding user prompt to an open fh."""
+    import json as _json
+    # User prompt (so _load_session picks up user_ts for time-of-day)
+    fh.write(_json.dumps({
+        "type": "user",
+        "uuid": f"u{uuid}",
+        "timestamp": ts,
+        "sessionId": session_id,
+        "message": {"role": "user",
+                    "content": [{"type": "text", "text": "hi"}]},
+    }) + "\n")
+    fh.write(_json.dumps({
+        "type": "assistant",
+        "uuid": f"a{uuid}",
+        "timestamp": ts,
+        "sessionId": session_id,
+        "message": {
+            "id": msg_id or f"m{uuid}",
+            "model": model,
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": cache_write,
+            },
+        },
+    }) + "\n")
+
+
+def _make_instance_fixture(root: Path, specs: dict[str, list[dict]]) -> Path:
+    """Materialise a fake ``~/.claude/projects/`` tree under ``root``.
+
+    ``specs`` is ``{slug: [session_spec, ...]}`` where each session_spec is
+    ``{"id": str, "turns": [{model, in, out, cache_read?, cache_write?}]}``.
+
+    Returns the projects dir path (``root``) to be passed as the
+    ``_PROJECTS_DIR_OVERRIDE``.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    base_ts = 1_700_000_000
+    for slug, sessions in specs.items():
+        proj = root / slug
+        proj.mkdir(parents=True, exist_ok=True)
+        for si, sess in enumerate(sessions):
+            sid = sess["id"]
+            path = proj / f"{sid}.jsonl"
+            with path.open("w", encoding="utf-8") as fh:
+                for ti, t in enumerate(sess["turns"]):
+                    ts_epoch = base_ts + si * 3600 + ti * 60
+                    ts_iso = (
+                        time.strftime("%Y-%m-%dT%H:%M:%S",
+                                      time.gmtime(ts_epoch)) + "Z"
+                    )
+                    _write_turn(
+                        fh, session_id=sid, uuid=f"{slug}_{si}_{ti}",
+                        ts=ts_iso, model=t["model"],
+                        input_tokens=t.get("in", 0),
+                        output_tokens=t.get("out", 0),
+                        cache_read=t.get("cache_read", 0),
+                        cache_write=t.get("cache_write", 0),
+                        msg_id=f"{slug}-{si}-{ti}",
+                    )
+    return root
+
+
+@pytest.fixture
+def instance_env(tmp_path, monkeypatch):
+    """Isolate instance-mode side effects (projects dir, parse cache, cwd)."""
+    projects_dir = tmp_path / "projects"
+    monkeypatch.setattr(sm, "_PROJECTS_DIR_OVERRIDE", projects_dir)
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    monkeypatch.chdir(tmp_path)  # so _export_dir() lands under tmp_path
+    return tmp_path, projects_dir
+
+
+def test_list_all_projects_skips_subagents_and_hidden(instance_env):
+    tmp_path, projects_dir = instance_env
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "sess-alpha-1",
+                              "turns": [{"model": "claude-opus-4-7",
+                                         "in": 100, "out": 50}]}],
+        "-home-user-beta":  [{"id": "sess-beta-1",
+                              "turns": [{"model": "claude-sonnet-4-7",
+                                         "in": 200, "out": 80}]}],
+    })
+    # Junk that should be skipped
+    (projects_dir / ".hidden").mkdir()
+    (projects_dir / ".hidden" / "fake.jsonl").write_text("{}\n")
+    (projects_dir / "subagents").mkdir()
+    (projects_dir / "not a slug!").mkdir()
+    (projects_dir / "empty-shell").mkdir()  # no JSONLs → skipped
+    # Directory that passes _SLUG_RE but has no JSONLs
+    (projects_dir / "-home-user-empty").mkdir()
+
+    discovered = sm._list_all_projects()
+    slugs = {s for s, _ in discovered}
+    assert slugs == {"-home-user-alpha", "-home-user-beta"}
+    # Every returned entry is a directory under projects_dir
+    for slug, path in discovered:
+        assert path.parent == projects_dir
+        assert path.is_dir()
+
+
+def test_run_all_projects_aggregates_correctly(instance_env, capsys):
+    tmp_path, projects_dir = instance_env
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "a1", "turns": [
+            {"model": "claude-opus-4-7", "in": 1000, "out": 500}]}],
+        "-home-user-beta":  [{"id": "b1", "turns": [
+            {"model": "claude-sonnet-4-7", "in": 2000, "out": 1000}]}],
+    })
+
+    sm._run_all_projects(
+        formats=["html", "md", "csv", "json"],
+        tz_offset=0.0, tz_label="UTC",
+        use_cache=False, chart_lib="none",
+        include_subagents=False, drilldown=False,
+    )
+
+    # Dated subfolder under exports/session-metrics/instance/
+    runs = list((tmp_path / "exports" / "session-metrics"
+                 / "instance").iterdir())
+    assert len(runs) == 1
+    run = runs[0]
+    for fmt in ("html", "md", "csv", "json"):
+        assert (run / f"index.{fmt}").exists(), f"missing index.{fmt}"
+    # No drilldown folder
+    assert not (run / "projects").exists()
+
+
+def test_instance_report_shape(instance_env):
+    tmp_path, projects_dir = instance_env
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "a1", "turns": [
+            {"model": "claude-opus-4-7", "in": 1000, "out": 500}]}],
+        "-home-user-beta":  [{"id": "b1", "turns": [
+            {"model": "claude-sonnet-4-7", "in": 2000, "out": 1000}]}],
+    })
+    # Drive _run_all_projects with no formats so only in-memory assertions matter
+    captured = {}
+    real_dispatch = sm._dispatch_instance
+
+    def spy(instance_report, project_reports, formats, **kw):
+        captured["ir"] = instance_report
+        captured["prs"] = project_reports
+        return real_dispatch(instance_report, project_reports, formats, **kw)
+
+    import pytest as _pytest
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sm, "_dispatch_instance", spy)
+        sm._run_all_projects(
+            formats=[], tz_offset=0.0, tz_label="UTC",
+            use_cache=False, chart_lib="none",
+            include_subagents=False, drilldown=False,
+        )
+    ir = captured["ir"]
+    assert ir["mode"] == "instance"
+    assert ir["slug"] == "all-projects"
+    assert ir["project_count"] == 2
+    assert ir["session_count"] == 2
+    assert isinstance(ir["projects"], list) and len(ir["projects"]) == 2
+    # No per-turn leakage: session summaries have turn_count but no "turns" key
+    for proj in ir["projects"]:
+        for s in proj.get("sessions", []):
+            assert "turns" not in s
+            assert "turn_count" in s
+    # Totals actually aggregated
+    assert ir["totals"]["input"] == 1000 + 2000
+    assert ir["totals"]["output"] == 500 + 1000
+    # Models merged
+    assert set(ir["models"].keys()) == {
+        "claude-opus-4-7", "claude-sonnet-4-7"}
+
+
+def test_instance_breakdown_sorted_by_cost_desc(instance_env):
+    tmp_path, projects_dir = instance_env
+    # Make three projects with markedly different costs (use Opus to amplify)
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "a1", "turns": [  # small
+            {"model": "claude-opus-4-7", "in": 100, "out": 50}]}],
+        "-home-user-beta":  [{"id": "b1", "turns": [  # huge
+            {"model": "claude-opus-4-7", "in": 100_000, "out": 50_000}]}],
+        "-home-user-gamma": [{"id": "c1", "turns": [  # medium
+            {"model": "claude-opus-4-7", "in": 10_000, "out": 5_000}]}],
+    })
+    captured = {}
+
+    def spy(instance_report, project_reports, formats, **kw):
+        captured["ir"] = instance_report
+
+    import pytest as _pytest
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sm, "_dispatch_instance", spy)
+        sm._run_all_projects(
+            formats=[], tz_offset=0.0, tz_label="UTC",
+            use_cache=False, chart_lib="none",
+            include_subagents=False, drilldown=False,
+        )
+    slugs_in_order = [p["slug"] for p in captured["ir"]["projects"]]
+    assert slugs_in_order == [
+        "-home-user-beta", "-home-user-gamma", "-home-user-alpha"
+    ], f"unsorted: {slugs_in_order}"
+    costs = [p["cost_usd"] for p in captured["ir"]["projects"]]
+    assert costs == sorted(costs, reverse=True)
+
+
+def _run_instance_capture_html(instance_env, *, drilldown: bool) -> tuple[str, Path]:
+    """Helper: run instance mode, return (html_text, run_dir)."""
+    tmp_path, projects_dir = instance_env
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "a1", "turns": [
+            {"model": "claude-opus-4-7", "in": 1000, "out": 500}]}],
+        "-home-user-beta":  [{"id": "b1", "turns": [
+            {"model": "claude-sonnet-4-7", "in": 2000, "out": 1000}]}],
+    })
+    sm._run_all_projects(
+        formats=["html"], tz_offset=0.0, tz_label="UTC",
+        use_cache=False, chart_lib="none",
+        include_subagents=False, drilldown=drilldown,
+    )
+    runs = list((tmp_path / "exports" / "session-metrics"
+                 / "instance").iterdir())
+    assert len(runs) == 1
+    run = runs[0]
+    html_path = run / "index.html"
+    return html_path.read_text(encoding="utf-8"), run
+
+
+def test_render_html_instance_suppresses_drawer(instance_env):
+    html, _ = _run_instance_capture_html(instance_env, drilldown=False)
+    # The per-turn drawer is a detail-page artefact — it must not appear
+    # in the instance index. Same for the turn-level data blob.
+    assert 'id="turn-drawer"' not in html
+    assert 'id="turn-data-json"' not in html
+
+
+def test_render_html_instance_hyperlinks_to_project_drilldowns(instance_env):
+    html, run = _run_instance_capture_html(instance_env, drilldown=True)
+    # One href per project, pointing at a relative projects/<slug>.html
+    assert 'href="projects/-home-user-alpha.html"' in html
+    assert 'href="projects/-home-user-beta.html"' in html
+    # Drilldown files actually exist on disk
+    assert (run / "projects" / "-home-user-alpha.html").exists()
+    assert (run / "projects" / "-home-user-beta.html").exists()
+
+
+def test_render_html_instance_no_drilldown_flag(instance_env):
+    html, run = _run_instance_capture_html(instance_env, drilldown=False)
+    assert 'href="projects/' not in html
+    assert not (run / "projects").exists()
+
+
+def test_render_csv_instance_has_project_slug_column(instance_env):
+    tmp_path, projects_dir = instance_env
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "a1", "turns": [
+            {"model": "claude-opus-4-7", "in": 1000, "out": 500}]}],
+        "-home-user-beta":  [{"id": "b1", "turns": [
+            {"model": "claude-sonnet-4-7", "in": 2000, "out": 1000}]}],
+    })
+    sm._run_all_projects(
+        formats=["csv"], tz_offset=0.0, tz_label="UTC",
+        use_cache=False, chart_lib="none",
+        include_subagents=False, drilldown=False,
+    )
+    run = next(iter(
+        (tmp_path / "exports" / "session-metrics" / "instance").iterdir()))
+    content = (run / "index.csv").read_text(encoding="utf-8")
+    header = content.splitlines()[0]
+    assert header.startswith("project_slug,")
+    # Two per-session data rows — filter to rows whose first column looks
+    # like a project slug (starts with "-"), which skips the "# TOTALS" /
+    # "# PROJECTS" sub-section headers that follow.
+    data_rows = [ln for ln in content.splitlines()
+                 if ln and ln[0] == "-" and "," in ln]
+    assert len(data_rows) >= 2, f"expected >=2 slug rows; got {data_rows}"
+    # Drop the "projects breakdown" rollup (one row per project) so only
+    # per-session rows remain — they have the session_id in column 1.
+    per_session = [row for row in data_rows
+                   if row.split(",")[1] in {"a1", "b1"}]
+    assert len(per_session) == 2
+    slugs_seen = {row.split(",")[0] for row in per_session}
+    assert slugs_seen == {"-home-user-alpha", "-home-user-beta"}
+
+
+def test_render_md_instance_has_projects_breakdown(instance_env):
+    tmp_path, projects_dir = instance_env
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "a1", "turns": [
+            {"model": "claude-opus-4-7", "in": 1000, "out": 500}]}],
+        "-home-user-beta":  [{"id": "b1", "turns": [
+            {"model": "claude-sonnet-4-7", "in": 2000, "out": 1000}]}],
+    })
+    sm._run_all_projects(
+        formats=["md"], tz_offset=0.0, tz_label="UTC",
+        use_cache=False, chart_lib="none",
+        include_subagents=False, drilldown=False,
+    )
+    run = next(iter(
+        (tmp_path / "exports" / "session-metrics" / "instance").iterdir()))
+    md = (run / "index.md").read_text(encoding="utf-8")
+    # Contains the instance dashboard header + both project rows
+    assert "all-projects" in md.lower() or "instance" in md.lower()
+    assert "-home-user-alpha" in md
+    assert "-home-user-beta" in md

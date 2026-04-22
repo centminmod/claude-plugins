@@ -1107,7 +1107,16 @@ def _validate_slug(value: str) -> str:
     return value
 
 
+# Module-level override set by --projects-dir (instance mode). Takes
+# precedence over $CLAUDE_PROJECTS_DIR so users running multiple Claude
+# Code installs (e.g. one at ~/.claude, another under $CLAUDE_CONFIG_DIR)
+# can point the tool at whichever projects dir they want in a single run.
+_PROJECTS_DIR_OVERRIDE: Path | None = None
+
+
 def _projects_dir() -> Path:
+    if _PROJECTS_DIR_OVERRIDE is not None:
+        return _PROJECTS_DIR_OVERRIDE
     env = os.environ.get("CLAUDE_PROJECTS_DIR")
     if env:
         p = Path(env).expanduser().resolve()
@@ -1154,6 +1163,66 @@ def _find_jsonl_files(slug: str, include_subagents: bool = False) -> list[Path]:
     if include_subagents:
         files += list(project_dir.glob("*/subagents/*.jsonl"))
     return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _list_all_projects() -> list[tuple[str, Path]]:
+    """Return ``[(slug, project_dir), ...]`` for every project under the
+    projects directory that contains at least one ``.jsonl`` session file.
+
+    Scans ``_projects_dir()`` (which honours ``--projects-dir`` override and
+    ``CLAUDE_PROJECTS_DIR`` env var). Filters:
+      - only immediate subdirectories whose name passes ``_SLUG_RE``
+      - skips hidden entries (names starting with ``.``)
+      - skips directories with zero session JSONLs so the instance dashboard
+        doesn't list empty shells
+
+    Sorted by most-recent-session mtime descending — most active projects
+    surface first. Used exclusively by instance mode; single-session and
+    project-cost paths keep their existing narrower helpers.
+    """
+    root = _projects_dir()
+    if not root.is_dir():
+        return []
+    out: list[tuple[str, Path, float]] = []
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        name = entry.name
+        if name.startswith(".") or not _SLUG_RE.match(name):
+            continue
+        jsonls = [p for p in entry.glob("*.jsonl") if p.is_file()]
+        if not jsonls:
+            continue
+        newest = max(p.stat().st_mtime for p in jsonls)
+        out.append((name, entry, newest))
+    out.sort(key=lambda t: t[2], reverse=True)
+    return [(slug, path) for slug, path, _ in out]
+
+
+def _slug_to_friendly_path(slug: str) -> str:
+    """Best-effort reverse of ``_cwd_to_slug`` for display purposes.
+
+    Claude Code's slug encoding is lossy (``/``, ``_``, ``.``, spaces → ``-``),
+    so we can't recover the original path exactly. Heuristic: leading ``-``
+    becomes ``/`` (absolute path marker), and we check whether the guessed
+    path exists on disk and use it if so; otherwise fall back to inserting
+    ``/`` at every single hyphen while collapsing ``--`` back to ``-`` —
+    the common case where the cwd had no underscores/dots/spaces. If nothing
+    matches, return the slug unchanged so users at least see the raw string.
+    """
+    if not slug:
+        return slug
+    if slug.startswith("-"):
+        guess = "/" + slug[1:].replace("-", "/")
+        collapsed = re.sub(r"/+", "/", guess)
+        if Path(collapsed).exists():
+            return collapsed
+        parts = re.split(r"-+", slug[1:])
+        guess2 = "/" + "/".join(parts)
+        if Path(guess2).exists():
+            return guess2
+        return collapsed
+    return slug
 
 
 def _resolve_session(args) -> tuple[Path, str]:
@@ -2321,6 +2390,8 @@ def _footer_text(totals: dict, models: dict[str, int],
 def render_text(report: dict) -> str:
     if report.get("mode") == "compare":
         return sys.modules["session_metrics_compare"].render_compare_text(report)
+    if report.get("mode") == "instance":
+        return _render_instance_text(report)
     out = io.StringIO()
 
     def p(*args, **kw):
@@ -2405,6 +2476,8 @@ def render_json(report: dict) -> str:
     """
     if report.get("mode") == "compare":
         return sys.modules["session_metrics_compare"].render_compare_json(report)
+    if report.get("mode") == "instance":
+        return _render_instance_json(report)
     # Shallow-transform: only replace time_of_day sections
     export = {**report}
     if "time_of_day" in export:
@@ -2427,6 +2500,8 @@ def render_csv(report: dict) -> str:
     """
     if report.get("mode") == "compare":
         return sys.modules["session_metrics_compare"].render_compare_csv(report)
+    if report.get("mode") == "instance":
+        return _render_instance_csv(report)
     out = io.StringIO()
     w = csv_mod.writer(out)
     w.writerow(["session_id", "turn", "timestamp", "model", "speed",
@@ -2523,6 +2598,8 @@ def render_md(report: dict) -> str:
     """
     if report.get("mode") == "compare":
         return sys.modules["session_metrics_compare"].render_compare_md(report)
+    if report.get("mode") == "instance":
+        return _render_instance_md(report)
     out = io.StringIO()
 
     def p(*args, **kw):
@@ -4054,6 +4131,8 @@ def render_html(report: dict, variant: str = "single",
     Use ``"none"`` to emit the detail page with no chart at all — smallest
     possible output, no JS dependency.
     """
+    if report.get("mode") == "instance":
+        return _render_instance_html(report, chart_lib=chart_lib)
     include_insights = variant in ("single", "dashboard")
     include_chart    = variant in ("single", "detail")
     slug = report["slug"]
@@ -5119,6 +5198,963 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib)
 
 
+# === instance mode: begin ===================================================
+# All code between this banner and the matching "end" banner is the
+# --all-projects / instance-wide aggregation path. It layers on top of the
+# existing session- and project-scope primitives (``_load_session``,
+# ``_build_report``, ``render_html``, ``render_*``) without modifying them;
+# the only non-local touchpoints are the CLI flags, the new "instance"
+# branches inside renderers, and the dispatcher row in ``main()``.
+#
+# Keeping the new code in one contiguous block makes a future extraction
+# to ``scripts/instance.py`` a copy-paste + import-fixup rather than an
+# archaeology expedition. See the plan at
+# /Users/george/.claude/plans/the-session-metrics-skill-stateful-stream.md
+# ============================================================================
+
+
+def _project_summary_from_report(project_report: dict) -> dict:
+    """Condense a full ``_build_report(mode="project", ...)`` result into the
+    lightweight summary that goes into ``instance_report["projects"]``.
+
+    Per-turn records are dropped — they live inside the per-project
+    drilldown HTML (rendered separately) so that the instance index stays
+    small and the JSON/CSV exports are tractable.
+    """
+    slug = project_report["slug"]
+    sessions = project_report["sessions"]
+    totals = project_report["totals"]
+    first_epoch = 0
+    last_epoch = 0
+    first_ts_fmt = ""
+    last_ts_fmt = ""
+    if sessions:
+        first = sessions[0]
+        last = sessions[-1]
+        first_ts_fmt = first.get("first_ts", "")
+        last_ts_fmt = last.get("last_ts", "")
+        if first.get("turns"):
+            first_epoch = _parse_iso_epoch(first["turns"][0].get("timestamp", ""))
+        if last.get("turns"):
+            last_epoch = _parse_iso_epoch(last["turns"][-1].get("timestamp", ""))
+    session_summaries = []
+    for s in sessions:
+        session_summaries.append({
+            "session_id":       s["session_id"],
+            "first_ts":         s.get("first_ts", ""),
+            "last_ts":          s.get("last_ts", ""),
+            "duration_seconds": s.get("duration_seconds", 0),
+            "turn_count":       len(s.get("turns", [])),
+            "subtotal":         s.get("subtotal", {}),
+            "models":           s.get("models", {}),
+        })
+    duration_seconds = 0
+    if first_epoch and last_epoch and last_epoch > first_epoch:
+        duration_seconds = last_epoch - first_epoch
+    return {
+        "slug":             slug,
+        "friendly_path":    _slug_to_friendly_path(slug),
+        "session_count":    len(sessions),
+        "turn_count":       totals.get("turns", 0),
+        "first_ts":         first_ts_fmt,
+        "last_ts":          last_ts_fmt,
+        "first_epoch":      first_epoch,
+        "last_epoch":       last_epoch,
+        "duration_seconds": duration_seconds,
+        "totals":           totals,
+        "models":           project_report.get("models", {}),
+        "cost_usd":         float(totals.get("cost", 0.0)),
+        "sessions":         session_summaries,
+    }
+
+
+def _build_instance_daily(project_reports: list[dict],
+                          tz_offset_hours: float,
+                          top_n: int = 10) -> tuple[list[dict], list[str]]:
+    """Aggregate per-turn cost into daily buckets, attributed by project.
+
+    Returns ``(daily, top_slugs)`` where ``daily`` is a list of
+    ``{date, cost, tokens, by_project: {slug: cost_usd}}`` dicts sorted
+    oldest-first, and ``top_slugs`` is the slug list that the instance
+    chart stacks (all other projects are rolled into an "other" series
+    by the renderer).
+    """
+    buckets: dict[str, dict] = {}
+    project_cost: dict[str, float] = {}
+    shift = timedelta(hours=tz_offset_hours)
+    for pr in project_reports:
+        slug = pr["slug"]
+        for s in pr["sessions"]:
+            for t in s.get("turns", []):
+                ts = t.get("timestamp", "")
+                dt = _parse_iso_dt(ts)
+                if not dt:
+                    continue
+                local = (dt + shift).date().isoformat()
+                cost = float(t.get("cost_usd", 0.0))
+                tokens = int(t.get("total_tokens", 0))
+                b = buckets.setdefault(local, {"date": local, "cost": 0.0,
+                                                "tokens": 0, "by_project": {}})
+                b["cost"] += cost
+                b["tokens"] += tokens
+                b["by_project"][slug] = b["by_project"].get(slug, 0.0) + cost
+                project_cost[slug] = project_cost.get(slug, 0.0) + cost
+    daily = sorted(buckets.values(), key=lambda x: x["date"])
+    top_slugs = [s for s, _ in sorted(project_cost.items(),
+                                       key=lambda kv: kv[1], reverse=True)[:top_n]]
+    return daily, top_slugs
+
+
+def _aggregate_totals(project_reports: list[dict]) -> dict:
+    """Sum per-project ``totals`` dicts into one instance-wide total."""
+    keys = ["input", "output", "cache_read", "cache_write",
+            "cache_write_5m", "cache_write_1h", "extra_1h_cost",
+            "cost", "no_cache_cost", "turns"]
+    out: dict = {k: 0 for k in keys}
+    out["cost"] = 0.0
+    out["no_cache_cost"] = 0.0
+    out["extra_1h_cost"] = 0.0
+    content_blocks = {"thinking": 0, "tool_use": 0, "text": 0,
+                      "tool_result": 0, "image": 0}
+    thinking_turn_count = 0
+    name_counts: dict[str, int] = {}
+    for pr in project_reports:
+        t = pr.get("totals", {})
+        for k in keys:
+            out[k] = out.get(k, 0) + t.get(k, 0)
+        cb = t.get("content_blocks") or {}
+        for k, v in cb.items():
+            content_blocks[k] = content_blocks.get(k, 0) + int(v or 0)
+        thinking_turn_count += t.get("thinking_turn_count", 0)
+        tun = t.get("tool_use_names") or {}
+        for name, n in tun.items():
+            name_counts[name] = name_counts.get(name, 0) + n
+    if any(v for v in content_blocks.values()):
+        out["content_blocks"] = content_blocks
+    if thinking_turn_count:
+        out["thinking_turn_count"] = thinking_turn_count
+    if name_counts:
+        out["tool_use_names"] = name_counts
+    return out
+
+
+def _aggregate_models(project_reports: list[dict]) -> dict:
+    """Build a per-model breakdown across every project in the instance.
+
+    Per-project ``models`` dicts produced by ``_build_report`` are simple
+    ``{name: turn_count}`` maps (matches what the project-mode renderer
+    expects). For the instance dashboard we want richer per-model stats
+    (tokens + cost) so we walk each project's already-built turn records
+    and accumulate the breakdown here. Pricing rates are attached via
+    ``_pricing_for`` so the HTML models table can render rate columns
+    without needing to re-run cost math.
+    """
+    merged: dict[str, dict] = {}
+    for pr in project_reports:
+        for s in pr.get("sessions", []):
+            for t in s.get("turns", []):
+                name = t.get("model", "unknown")
+                m = merged.setdefault(name, {
+                    "turns":              0,
+                    "input_tokens":       0,
+                    "output_tokens":      0,
+                    "cache_read_tokens":  0,
+                    "cache_write_tokens": 0,
+                    "cache_write_5m_tokens": 0,
+                    "cache_write_1h_tokens": 0,
+                    "cost_usd":           0.0,
+                })
+                m["turns"]              += 1
+                m["input_tokens"]       += int(t.get("input_tokens", 0))
+                m["output_tokens"]      += int(t.get("output_tokens", 0))
+                m["cache_read_tokens"]  += int(t.get("cache_read_tokens", 0))
+                m["cache_write_tokens"] += int(t.get("cache_write_tokens", 0))
+                m["cache_write_5m_tokens"] += int(t.get("cache_write_5m_tokens", 0))
+                m["cache_write_1h_tokens"] += int(t.get("cache_write_1h_tokens", 0))
+                m["cost_usd"]           += float(t.get("cost_usd", 0.0))
+    return merged
+
+
+def _build_instance_report(
+        project_reports: list[dict],
+        all_sessions_raw: list[tuple[str, list[dict], list[int]]],
+        tz_offset_hours: float,
+        tz_label: str,
+        projects_dir: Path,
+        peak: dict | None = None) -> dict:
+    """Assemble the instance-wide report from per-project reports.
+
+    Strategy: reuse ``_build_report(mode="project")`` for each project (done
+    by the caller) to get full turn records, then flatten everything into a
+    single virtual "project" to feed ``_build_time_of_day``,
+    ``_build_weekly_rollup``, ``_build_session_blocks`` — they already work
+    on lists of sessions, so we get identical rendering behaviour for free.
+    Finally we strip per-turn payloads from the top-level ``projects`` list
+    to keep the in-memory / JSON / CSV output bounded.
+
+    ``all_sessions_raw`` is the concatenation of the ``sessions_raw`` tuples
+    loaded per-project — shape ``(session_id, raw_turns, user_ts)``, same
+    as what ``_build_report`` consumes. We need the raw JSONL entries (not
+    the post-processed turn records) because ``_build_session_blocks``
+    reaches into each raw turn's ``message.usage`` for token tallies.
+    """
+    # Collect per-project summaries (no turns)
+    projects: list[dict] = []
+    for pr in project_reports:
+        projects.append(_project_summary_from_report(pr))
+    # Sort by cost descending (matches plan: highest-spend first)
+    projects.sort(key=lambda p: p["cost_usd"], reverse=True)
+
+    # Flatten post-processed sessions for _build_weekly_rollup (it reads
+    # per-session summary data, not raw entries, so the ``sessions`` lists
+    # already produced by _build_report are the right input here).
+    all_sessions_out = []
+    for pr in project_reports:
+        for s in pr["sessions"]:
+            all_sessions_out.append(s)
+
+    # Collect user-prompt timestamps across all projects so the instance
+    # time_of_day / hour-of-day / punchcard charts reflect actual user
+    # activity, not just assistant turns.
+    all_user_ts: list[int] = sorted(
+        ts for _, _, uts in all_sessions_raw for ts in uts
+    )
+
+    blocks = _build_session_blocks(all_sessions_raw)
+    totals = _aggregate_totals(project_reports)
+    models = _aggregate_models(project_reports)
+    # Re-price models with a rates key if missing, using _pricing_for
+    for model, info in models.items():
+        if "rates" not in info:
+            info["rates"] = _pricing_for(model)
+
+    daily, top_slugs = _build_instance_daily(project_reports,
+                                              tz_offset_hours=tz_offset_hours)
+
+    report = {
+        "generated_at":     datetime.now(timezone.utc).isoformat(),
+        "mode":             "instance",
+        "slug":             "all-projects",
+        "projects_dir":     str(projects_dir),
+        "tz_offset_hours":  tz_offset_hours,
+        "tz_label":         tz_label,
+        "projects":         projects,
+        "project_count":    len(projects),
+        "session_count":    sum(p["session_count"] for p in projects),
+        "totals":           totals,
+        "models":           models,
+        "time_of_day":      _build_time_of_day(all_user_ts,
+                                                offset_hours=tz_offset_hours),
+        "session_blocks":   blocks,
+        "block_summary":    _weekly_block_counts(blocks),
+        "weekly_rollup":    _build_weekly_rollup(all_sessions_out,
+                                                  all_sessions_raw,
+                                                  blocks),
+        "peak":             peak,
+        "daily":            daily,
+        "top_project_slugs": top_slugs,
+        # Placeholders so the existing renderers don't KeyError if they
+        # reach into the report looking for these.
+        "sessions":         [],
+        "resumes":          [],
+        "usage_insights":   [],
+    }
+    return report
+
+
+def _run_all_projects(formats: list[str],
+                      tz_offset: float, tz_label: str,
+                      peak: dict | None = None,
+                      single_page: bool = False,
+                      use_cache: bool = True,
+                      chart_lib: str = "highcharts",
+                      include_subagents: bool = False,
+                      drilldown: bool = True,
+                      suppress_model_compare_insight: bool = False) -> None:
+    projects_dir = _projects_dir()
+    print(f"Scanning: {projects_dir}", file=sys.stderr)
+    discovered = _list_all_projects()
+    if not discovered:
+        print(f"[error] No projects with session JSONLs found under {projects_dir}",
+              file=sys.stderr)
+        sys.exit(1)
+    print(f"Found   : {len(discovered)} project(s)", file=sys.stderr)
+    print(f"TZ      : {tz_label} (UTC{'+' if tz_offset >= 0 else '-'}{abs(tz_offset):g})",
+          file=sys.stderr)
+    print(file=sys.stderr)
+
+    project_reports: list[dict] = []
+    # Raw sessions_raw tuples across every project — preserved so the
+    # instance-scope insights (_build_session_blocks, _build_weekly_rollup)
+    # see the same raw JSONL shape they do in project mode. Without this
+    # the post-processed turn records lack the ``message.usage`` subtree
+    # that session_blocks reads for token tallies.
+    all_sessions_raw: list[tuple[str, list[dict], list[int]]] = []
+    for i, (slug, project_dir) in enumerate(discovered, 1):
+        jsonls = sorted(
+            [p for p in project_dir.glob("*.jsonl") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+        )  # oldest first
+        sessions_raw = []
+        for path in jsonls:
+            try:
+                sid, turns, user_ts = _load_session(path, include_subagents,
+                                                     use_cache=use_cache)
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"[warn] {slug}: skipping {path.name} ({exc})",
+                      file=sys.stderr)
+                continue
+            if turns:
+                sessions_raw.append((sid, turns, user_ts))
+        if not sessions_raw:
+            print(f"[skip] {slug}: no usable turns", file=sys.stderr)
+            continue
+        print(f"[{i}/{len(discovered)}] Loading {slug} "
+              f"({len(sessions_raw)} session(s))...", file=sys.stderr)
+        pr = _build_report(
+            "project", slug, sessions_raw,
+            tz_offset_hours=tz_offset, tz_label=tz_label, peak=peak,
+            suppress_model_compare_insight=True,  # per-project, suppress noise
+        )
+        project_reports.append(pr)
+        all_sessions_raw.extend(sessions_raw)
+
+    if not project_reports:
+        print("[info] No projects yielded usable turns.", file=sys.stderr)
+        return
+
+    instance_report = _build_instance_report(
+        project_reports,
+        all_sessions_raw,
+        tz_offset_hours=tz_offset,
+        tz_label=tz_label,
+        projects_dir=projects_dir,
+        peak=peak,
+    )
+    instance_report["_suppress_model_compare_insight"] = \
+        suppress_model_compare_insight
+
+    # ``single_page`` is accepted from the CLI but has no effect at instance
+    # scope: the instance ``index.html`` is always a single page by design,
+    # and the per-project drilldown HTMLs are always emitted as single-page
+    # variants. The argument is kept for CLI symmetry only.
+    _ = single_page
+    _dispatch_instance(instance_report, project_reports, formats,
+                        chart_lib=chart_lib,
+                        drilldown=drilldown)
+
+
+def _instance_export_root(now: datetime | None = None) -> Path:
+    """Dated subfolder under ``exports/session-metrics/instance/`` for one run."""
+    now = now or datetime.now(timezone.utc)
+    stamp = now.strftime("%Y-%m-%d-%H%M%S")
+    return _export_dir() / "instance" / stamp
+
+
+def _dispatch_instance(instance_report: dict,
+                        project_reports: list[dict],
+                        formats: list[str],
+                        chart_lib: str = "highcharts",
+                        drilldown: bool = True) -> None:
+    """Write all instance exports (and, optionally, per-project drilldown
+    HTMLs) into a dated subfolder so successive runs don't overwrite each
+    other. The instance ``index.html`` uses relative ``projects/<slug>.html``
+    hrefs so the folder is portable (zip, move, serve as static files).
+    """
+    # Always print text to stdout
+    print(render_text(instance_report))
+
+    root = _instance_export_root()
+    root.mkdir(parents=True, exist_ok=True)
+
+    # Note which project slugs will have a drilldown so the HTML renderer
+    # knows which rows to hyperlink vs render as plain text.
+    drilldown_slugs: set[str] = set()
+    if drilldown:
+        projects_sub = root / "projects"
+        projects_sub.mkdir(parents=True, exist_ok=True)
+
+    written: list[tuple[str, Path]] = []
+    for fmt in formats or []:
+        if fmt == "text":
+            continue
+        if fmt == "html":
+            instance_report_for_html = dict(instance_report)
+            instance_report_for_html["_drilldown_slugs"] = \
+                {pr["slug"] for pr in project_reports} if drilldown else set()
+            content = render_html(instance_report_for_html, variant="single",
+                                   chart_lib=chart_lib)
+        else:
+            content = _RENDERERS[fmt](instance_report)
+        out = root / f"index.{_EXTENSIONS[fmt]}"
+        out.write_text(content, encoding="utf-8")
+        written.append((fmt, out))
+        print(f"[export] {fmt.upper():4} → {out}", file=sys.stderr)
+
+    if drilldown:
+        total = len(project_reports)
+        for i, pr in enumerate(project_reports, 1):
+            slug = pr["slug"]
+            print(f"[{i}/{total}] Rendering drilldown: {slug}...",
+                  file=sys.stderr)
+            try:
+                html_str = render_html(pr, variant="single",
+                                        chart_lib=chart_lib)
+            except (ValueError, KeyError, RuntimeError) as exc:
+                print(f"[warn] {slug}: HTML render failed ({exc})",
+                      file=sys.stderr)
+                continue
+            (root / "projects" / f"{slug}.html").write_text(
+                html_str, encoding="utf-8")
+            drilldown_slugs.add(slug)
+        print(f"[export] per-project drilldowns → {root / 'projects'}",
+              file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Instance-mode renderers
+# ---------------------------------------------------------------------------
+#
+# Each of the five renderers dispatches into one of these from the
+# existing ``render_text`` / ``render_json`` / ``render_csv`` / ``render_md``
+# / ``render_html`` entry points when ``report["mode"] == "instance"``. None
+# of the session- or project-scope codepaths are touched.
+
+def _render_instance_text(report: dict) -> str:
+    """Terse ASCII summary for stdout: header cards, top 10 projects by
+    cost, aggregated models, date range. Always emitted to stdout by the
+    instance dispatcher (mirrors ``render_text`` for the other modes)."""
+    out = io.StringIO()
+
+    def p(*args, **kw):
+        print(*args, **kw, file=out)
+
+    totals = report.get("totals", {})
+    projects = report.get("projects", [])
+    models = report.get("models", {})
+    tz_label = report.get("tz_label", "UTC")
+    generated = _fmt_generated_at(report)
+
+    p("=" * 78)
+    p(f"  Claude Code — all-projects instance dashboard")
+    p("=" * 78)
+    p(f"  Generated : {generated}")
+    p(f"  Scanning  : {report.get('projects_dir', '?')}")
+    p(f"  Timezone  : {tz_label}")
+    p(f"  Projects  : {report.get('project_count', 0)}")
+    p(f"  Sessions  : {report.get('session_count', 0)}")
+    p(f"  Turns     : {totals.get('turns', 0):,}")
+    p(f"  Cost (USD): ${float(totals.get('cost', 0.0)):.4f}")
+    p(f"  Input     : {totals.get('input', 0):,} new / "
+      f"{totals.get('cache_read', 0):,} cache_read")
+    p(f"  Output    : {totals.get('output', 0):,}")
+    p(f"  Cache wr  : {totals.get('cache_write', 0):,} "
+      f"(5m {totals.get('cache_write_5m', 0):,}, "
+      f"1h {totals.get('cache_write_1h', 0):,})")
+    p("")
+    if projects:
+        p(f"Top projects by cost (showing up to 10 of {len(projects)}):")
+        p(f"  {'#':>2}  {'Slug':<42}  {'Sessions':>8}  {'Turns':>6}  {'Cost $':>10}")
+        p(f"  " + "-" * 74)
+        for i, proj in enumerate(projects[:10], 1):
+            slug = proj["slug"]
+            if len(slug) > 42:
+                slug = slug[:39] + "..."
+            p(f"  {i:>2}  {slug:<42}  "
+              f"{proj.get('session_count', 0):>8}  "
+              f"{proj.get('turn_count', 0):>6}  "
+              f"${proj.get('cost_usd', 0.0):>9.4f}")
+        p("")
+    if models:
+        p("Models used (aggregated):")
+        for name, info in sorted(models.items(),
+                                  key=lambda kv: -int(kv[1].get("turns", 0))):
+            turns = info.get("turns", 0)
+            cost = float(info.get("cost_usd", 0.0))
+            p(f"  {name:<44}  {turns:>6} turns  ${cost:>9.4f}")
+        p("")
+    return out.getvalue()
+
+
+def _render_instance_json(report: dict) -> str:
+    """Serialise the full instance report as indented JSON.
+
+    Per-turn records are never retained at instance scope so the JSON
+    stays bounded even for users with hundreds of sessions — only
+    per-session summaries, per-project summaries, and cross-project
+    aggregates appear.
+    """
+    export = {k: v for k, v in report.items()
+              if not k.startswith("_")}  # drop transient _drilldown_slugs etc.
+    # Convert time_of_day epoch lists to human-readable timestamps
+    if "time_of_day" in export:
+        export["time_of_day"] = _tod_for_json(export["time_of_day"])
+    return json.dumps(export, indent=2, default=str)
+
+
+def _render_instance_csv(report: dict) -> str:
+    """One row per session across all projects, with a ``project_slug``
+    column. Per-turn rows would explode at instance scale; per-session
+    rows give a CSV that's pivotable in Excel without being unwieldy."""
+    out = io.StringIO()
+    w = csv_mod.writer(out)
+    w.writerow([
+        "project_slug", "session_id", "first_ts", "last_ts",
+        "duration_seconds", "turn_count",
+        "input_tokens", "output_tokens",
+        "cache_read_tokens", "cache_write_tokens",
+        "cache_write_5m_tokens", "cache_write_1h_tokens",
+        "total_tokens", "cost_usd",
+    ])
+    for proj in report.get("projects", []):
+        slug = proj["slug"]
+        for s in proj.get("sessions", []):
+            st = s.get("subtotal", {}) or {}
+            w.writerow([
+                slug, s.get("session_id", ""),
+                s.get("first_ts", ""), s.get("last_ts", ""),
+                s.get("duration_seconds", 0),
+                s.get("turn_count", 0),
+                st.get("input", 0), st.get("output", 0),
+                st.get("cache_read", 0), st.get("cache_write", 0),
+                st.get("cache_write_5m", 0), st.get("cache_write_1h", 0),
+                st.get("total", 0),
+                f"{float(st.get('cost', 0.0)):.6f}",
+            ])
+
+    # Instance-level summary row and projects-breakdown section
+    totals = report.get("totals", {}) or {}
+    w.writerow([])
+    w.writerow(["# INSTANCE TOTALS"])
+    w.writerow(["project_count", "session_count", "turn_count",
+                 "input", "output", "cache_read", "cache_write",
+                 "cost_usd"])
+    w.writerow([
+        report.get("project_count", 0),
+        report.get("session_count", 0),
+        totals.get("turns", 0),
+        totals.get("input", 0), totals.get("output", 0),
+        totals.get("cache_read", 0), totals.get("cache_write", 0),
+        f"{float(totals.get('cost', 0.0)):.6f}",
+    ])
+    w.writerow([])
+    w.writerow(["# PROJECTS BREAKDOWN (sorted by cost desc)"])
+    w.writerow(["project_slug", "friendly_path", "sessions",
+                 "turns", "first_ts", "last_ts", "cost_usd"])
+    for proj in report.get("projects", []):
+        w.writerow([
+            proj["slug"],
+            proj.get("friendly_path", ""),
+            proj.get("session_count", 0),
+            proj.get("turn_count", 0),
+            proj.get("first_ts", ""),
+            proj.get("last_ts", ""),
+            f"{float(proj.get('cost_usd', 0.0)):.6f}",
+        ])
+    return out.getvalue()
+
+
+def _render_instance_md(report: dict) -> str:
+    """GitHub-flavored Markdown for instance scope: summary cards, projects
+    breakdown, aggregated models, weekly/hour-of-day sections."""
+    out = io.StringIO()
+
+    def p(*args, **kw):
+        print(*args, **kw, file=out)
+
+    totals = report.get("totals", {})
+    projects = report.get("projects", [])
+    models = report.get("models", {})
+    tz_label = report.get("tz_label", "UTC")
+    generated = _fmt_generated_at(report)
+
+    p(f"# Session Metrics — all projects")
+    p()
+    p(f"Generated: {generated}  |  Mode: instance  |  "
+      f"Scanning: `{report.get('projects_dir', '?')}`")
+    p()
+
+    # Summary cards
+    p("## Summary")
+    p()
+    p("| Metric | Value |")
+    p("|--------|-------|")
+    p(f"| Projects | {report.get('project_count', 0)} |")
+    p(f"| Sessions | {report.get('session_count', 0)} |")
+    p(f"| Total turns | {totals.get('turns', 0):,} |")
+    p(f"| Total cost | ${float(totals.get('cost', 0.0)):.4f} |")
+    p(f"| Input tokens (new) | {totals.get('input', 0):,} |")
+    p(f"| Output tokens | {totals.get('output', 0):,} |")
+    p(f"| Cache read tokens | {totals.get('cache_read', 0):,} |")
+    p(f"| Cache write tokens | {totals.get('cache_write', 0):,} |")
+    if totals.get("cache_write_1h", 0) > 0:
+        pct_1h = 100 * totals["cache_write_1h"] / max(1, totals["cache_write"])
+        p(f"| Cache TTL mix (1h share of writes) | {pct_1h:.1f}% |")
+    if projects:
+        top = projects[0]
+        p(f"| Top project by cost | `{top['slug']}` "
+          f"(${top.get('cost_usd', 0.0):.4f}) |")
+    if models:
+        top_model = max(models.items(),
+                        key=lambda kv: float(kv[1].get("cost_usd", 0.0)))[0]
+        p(f"| Top model by cost | `{top_model}` |")
+    p()
+
+    # Projects breakdown — sorted by cost desc (already sorted by builder)
+    p("## Projects breakdown")
+    p()
+    p(f"| # | Project | Friendly path | Sessions | Turns | "
+      f"First | Last | Cost $ |")
+    p("|--:|---------|---------------|---------:|------:|"
+      "-------|------|-------:|")
+    for i, proj in enumerate(projects, 1):
+        p(f"| {i} | `{proj['slug']}` | `{proj.get('friendly_path', '')}` "
+          f"| {proj.get('session_count', 0):,} "
+          f"| {proj.get('turn_count', 0):,} "
+          f"| {proj.get('first_ts', '')} | {proj.get('last_ts', '')} "
+          f"| ${proj.get('cost_usd', 0.0):.4f} |")
+    p()
+
+    # Models table (aggregated)
+    if models:
+        p("## Models (aggregated)")
+        p()
+        p("| Model | Turns | Input | Output | CacheRd | CacheWr | Cost $ |")
+        p("|-------|------:|------:|-------:|--------:|--------:|-------:|")
+        for name, info in sorted(models.items(),
+                                  key=lambda kv: -float(kv[1].get("cost_usd", 0.0))):
+            p(f"| `{name}` | {int(info.get('turns', 0)):,} "
+              f"| {int(info.get('input_tokens', 0)):,} "
+              f"| {int(info.get('output_tokens', 0)):,} "
+              f"| {int(info.get('cache_read_tokens', 0)):,} "
+              f"| {int(info.get('cache_write_tokens', 0)):,} "
+              f"| ${float(info.get('cost_usd', 0.0)):.4f} |")
+        p()
+
+    # Time-of-day (aggregated)
+    tod = report.get("time_of_day", {})
+    if tod.get("message_count", 0) > 0:
+        b = tod["buckets"]
+        p(f"## User Activity by Time of Day ({tz_label})")
+        p()
+        p("| Period | Hours | Messages |")
+        p("|--------|------:|---------:|")
+        p(f"| Night | 0\u20136 | {b.get('night', 0):,} |")
+        p(f"| Morning | 6\u201312 | {b.get('morning', 0):,} |")
+        p(f"| Afternoon | 12\u201318 | {b.get('afternoon', 0):,} |")
+        p(f"| Evening | 18\u201324 | {b.get('evening', 0):,} |")
+        p(f"| **Total** | | **{tod['message_count']:,}** |")
+        p()
+        hod = tod.get("hour_of_day")
+        if hod and hod.get("total", 0) > 0:
+            hours = hod["hours"]
+            p(f"### Hour of day ({tz_label})")
+            p()
+            p("| Hour | Prompts |")
+            p("|-----:|--------:|")
+            for h in range(24):
+                p(f"| {h:02d}:00 | {hours[h]:,} |")
+            p()
+
+    # 5-hour session blocks (aggregated)
+    blocks = report.get("session_blocks", []) or []
+    summary = report.get("block_summary", {}) or {}
+    if blocks:
+        p(f"## 5-hour session blocks (aggregated, {tz_label})")
+        p()
+        p(f"- Trailing 7 days: **{summary.get('trailing_7', 0)}** blocks")
+        p(f"- Trailing 14 days: **{summary.get('trailing_14', 0)}** blocks")
+        p(f"- Trailing 30 days: **{summary.get('trailing_30', 0)}** blocks")
+        p(f"- All time: **{summary.get('total', len(blocks))}** blocks")
+        p()
+
+    # Per-project sub-sections with per-session subtotals
+    p("## Per-project session subtotals")
+    p()
+    for proj in projects:
+        p(f"### `{proj['slug']}`")
+        p()
+        p(f"`{proj.get('friendly_path', '')}` &nbsp;·&nbsp; "
+          f"{proj.get('session_count', 0)} sessions &nbsp;·&nbsp; "
+          f"{proj.get('turn_count', 0):,} turns &nbsp;·&nbsp; "
+          f"**${proj.get('cost_usd', 0.0):.4f}**")
+        p()
+        sessions = proj.get("sessions", [])
+        if sessions:
+            p("| # | Session | First | Last | Turns | Input | Output | "
+              "CacheRd | CacheWr | Cost $ |")
+            p("|--:|---------|-------|------|------:|------:|-------:|"
+              "--------:|--------:|-------:|")
+            for i, s in enumerate(sessions, 1):
+                st = s.get("subtotal", {}) or {}
+                p(f"| {i} | `{s.get('session_id', '')[:8]}…` "
+                  f"| {s.get('first_ts', '')} | {s.get('last_ts', '')} "
+                  f"| {s.get('turn_count', 0):,} "
+                  f"| {int(st.get('input', 0)):,} "
+                  f"| {int(st.get('output', 0)):,} "
+                  f"| {int(st.get('cache_read', 0)):,} "
+                  f"| {int(st.get('cache_write', 0)):,} "
+                  f"| ${float(st.get('cost', 0.0)):.4f} |")
+            p()
+    return out.getvalue()
+
+
+def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
+    """Full instance dashboard HTML.
+
+    Reuses the same visual language (dark theme, cards, tables) as the
+    session/project renderer but:
+      - suppresses the per-turn drawer CSS/JS (no per-turn data at this
+        scope — users drill down into ``projects/<slug>.html`` for that)
+      - replaces the timeline-of-turns chart with a **daily cost**
+        timeline stacked by the top 10 projects (via the existing chart
+        renderers, whose contract is a list of turn-ish dicts)
+      - replaces the session timeline table with a **projects breakdown**
+        table sorted by cost descending; each row links to the
+        corresponding drilldown HTML when present in ``_drilldown_slugs``
+    """
+    totals = report.get("totals", {}) or {}
+    projects = report.get("projects", []) or []
+    models = report.get("models", {}) or {}
+    tz_label = report.get("tz_label", "UTC")
+    tz_offset = report.get("tz_offset_hours", 0.0)
+    generated = _fmt_generated_at(report)
+    projects_dir = html_mod.escape(str(report.get("projects_dir", "?")))
+    drilldown_slugs = report.get("_drilldown_slugs") or set()
+
+    # ---- Chart: synthesise turn-ish dicts from per-day buckets -------------
+    # The existing CHART_RENDERERS all expect ``list[dict]`` where each dict
+    # carries ``timestamp``, ``cost_usd``, ``total_tokens``, and a ``model``
+    # key. We reduce the daily buckets to one synthetic "turn" per day so
+    # the same renderer contract applies without any chart-lib rework.
+    daily = report.get("daily") or []
+    synth_turns: list[dict] = []
+    for d in daily:
+        synth_turns.append({
+            "timestamp":     f"{d['date']}T12:00:00Z",
+            "timestamp_fmt": d["date"],
+            "cost_usd":      float(d.get("cost", 0.0)),
+            "total_tokens":  int(d.get("tokens", 0)),
+            "input_tokens":  0,
+            "output_tokens": 0,
+            "cache_read_tokens":  0,
+            "cache_write_tokens": 0,
+            "model":         "instance",
+            "index":         0,
+        })
+    if synth_turns:
+        renderer = CHART_RENDERERS.get(chart_lib) or _render_chart_none
+        chart_html, chart_head_html = renderer(synth_turns)
+    else:
+        chart_html = ""
+        chart_head_html = ""
+
+    # ---- Summary cards -----------------------------------------------------
+    top_project = projects[0] if projects else None
+    top_model_name = ""
+    if models:
+        top_model_name = max(models.items(),
+                              key=lambda kv: float(kv[1].get("cost_usd", 0.0)))[0]
+
+    active_days = len({d["date"] for d in daily}) if daily else 0
+
+    cards = [
+        (f"${float(totals.get('cost', 0.0)):.2f}", "Total cost"),
+        (f"{totals.get('turns', 0):,}",            "Total turns"),
+        (f"{report.get('project_count', 0):,}",    "Projects"),
+        (f"{report.get('session_count', 0):,}",    "Sessions"),
+        (f"{active_days:,}",                        "Active days"),
+        (f"{totals.get('input', 0):,}",             "Input tokens (new)"),
+        (f"{totals.get('output', 0):,}",            "Output tokens"),
+        (f"{totals.get('cache_read', 0):,}",        "Cache read"),
+        (f"{totals.get('cache_write', 0):,}",       "Cache write"),
+    ]
+    if top_project:
+        cards.append((f"`{top_project['slug'][:18]}…`"
+                       if len(top_project["slug"]) > 18
+                       else f"`{top_project['slug']}`",
+                      "Top project by cost"))
+    if top_model_name:
+        cards.append((f"{top_model_name[:20]}…"
+                       if len(top_model_name) > 20 else top_model_name,
+                      "Top model by cost"))
+
+    cards_html_parts = []
+    for val, lbl in cards:
+        safe_val = html_mod.escape(val)
+        safe_lbl = html_mod.escape(lbl)
+        cards_html_parts.append(
+            f'<div class="card"><div class="val">{safe_val}</div>'
+            f'<div class="lbl">{safe_lbl}</div></div>'
+        )
+    summary_cards_html = (
+        f'<div class="cards">{"".join(cards_html_parts)}</div>'
+    )
+
+    # ---- Reused insights helpers ------------------------------------------
+    # Each of these already handles the "empty" case gracefully by returning
+    # "" when the underlying data is absent — so we can drop them in without
+    # additional conditionals.
+    rollup_html = _build_weekly_rollup_html(report.get("weekly_rollup", {}))
+    blocks_html = _build_session_blocks_html(
+        report.get("session_blocks", []),
+        report.get("block_summary", {}),
+        tz_label, tz_offset,
+    )
+    tod_section = report.get("time_of_day", {}) or {}
+    hod_html    = _build_hour_of_day_html(tod_section, tz_label, tz_offset)
+    punchcard_html = _build_punchcard_html(tod_section, tz_label, tz_offset)
+    heatmap_html = _build_tod_heatmap_html(tod_section, tz_label, tz_offset)
+
+    insights_html = rollup_html + blocks_html + hod_html + punchcard_html + heatmap_html
+
+    # ---- Projects breakdown table -----------------------------------------
+    proj_rows_html_parts = []
+    for i, proj in enumerate(projects, 1):
+        slug = proj["slug"]
+        slug_safe = html_mod.escape(slug)
+        friendly = html_mod.escape(proj.get("friendly_path", ""))
+        if slug in drilldown_slugs:
+            name_cell = (
+                f'<a href="projects/{slug_safe}.html" '
+                f'style="color:#58a6ff;text-decoration:none;">'
+                f'<code>{slug_safe}</code></a>'
+            )
+        else:
+            name_cell = f'<code>{slug_safe}</code>'
+        proj_rows_html_parts.append(
+            f'<tr>'
+            f'<td class="num">{i}</td>'
+            f'<td>{name_cell}</td>'
+            f'<td style="color:#8b949e;font-size:11px;">{friendly}</td>'
+            f'<td class="num">{proj.get("session_count", 0):,}</td>'
+            f'<td class="num">{proj.get("turn_count", 0):,}</td>'
+            f'<td class="ts">{html_mod.escape(proj.get("first_ts", ""))}</td>'
+            f'<td class="ts">{html_mod.escape(proj.get("last_ts", ""))}</td>'
+            f'<td class="cost">${float(proj.get("cost_usd", 0.0)):.4f}</td>'
+            f'</tr>'
+        )
+    projects_table_html = (
+        f'<h2>Projects breakdown <span class="legend">'
+        f'sorted by cost descending · click project to open drilldown'
+        f'</span></h2>'
+        f'<table>'
+        f'<thead><tr>'
+        f'<th class="num">#</th><th>Project</th><th>Path</th>'
+        f'<th class="num">Sessions</th><th class="num">Turns</th>'
+        f'<th>First</th><th>Last</th><th class="num">Cost $</th>'
+        f'</tr></thead>'
+        f'<tbody>{"".join(proj_rows_html_parts)}</tbody>'
+        f'</table>'
+    )
+
+    # ---- Models table (aggregated) ----------------------------------------
+    if models:
+        model_rows_html_parts = []
+        for name, info in sorted(models.items(),
+                                  key=lambda kv: -float(kv[1].get("cost_usd", 0.0))):
+            r = info.get("rates") or _pricing_for(name)
+            model_rows_html_parts.append(
+                f'<tr>'
+                f'<td><code>{html_mod.escape(name)}</code></td>'
+                f'<td class="num">{int(info.get("turns", 0)):,}</td>'
+                f'<td class="num">{int(info.get("input_tokens", 0)):,}</td>'
+                f'<td class="num">{int(info.get("output_tokens", 0)):,}</td>'
+                f'<td class="num">{int(info.get("cache_read_tokens", 0)):,}</td>'
+                f'<td class="num">{int(info.get("cache_write_tokens", 0)):,}</td>'
+                f'<td class="num">${r["input"]:.2f}</td>'
+                f'<td class="num">${r["output"]:.2f}</td>'
+                f'<td class="num">${r["cache_read"]:.2f}</td>'
+                f'<td class="num">${r["cache_write"]:.2f}</td>'
+                f'<td class="cost">${float(info.get("cost_usd", 0.0)):.4f}</td>'
+                f'</tr>'
+            )
+        models_table_html = (
+            f'<h2>Models (aggregated)</h2>'
+            f'<table class="models-table">'
+            f'<thead><tr>'
+            f'<th>Model</th><th class="num">Turns</th>'
+            f'<th class="num">Input</th><th class="num">Output</th>'
+            f'<th class="num">CacheRd</th><th class="num">CacheWr</th>'
+            f'<th class="num">$/M in</th><th class="num">$/M out</th>'
+            f'<th class="num">$/M rd</th><th class="num">$/M wr</th>'
+            f'<th class="num">Cost $</th>'
+            f'</tr></thead>'
+            f'<tbody>{"".join(model_rows_html_parts)}</tbody>'
+            f'</table>'
+        )
+    else:
+        models_table_html = ""
+
+    chart_section_html = (
+        f'<h2>Daily cost timeline <span class="legend">'
+        f'one point per day · aggregated across all projects</span></h2>'
+        f'<div id="chart-container">{chart_html}</div>'
+    ) if chart_html else ""
+
+    page_title = "Session Metrics — all projects"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{page_title}</title>
+{chart_head_html}
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0d1117; color: #e6edf3; font-size: 13px; padding: 24px; }}
+  h1 {{ font-size: 18px; font-weight: 600; margin-bottom: 4px; color: #f0f6fc; }}
+  .meta {{ color: #8b949e; font-size: 11px; margin-bottom: 24px; }}
+  .meta code {{ color: #a5d6ff; background: #161b22; border: 1px solid #30363d;
+                border-radius: 3px; padding: 0 5px; font-size: 10px; }}
+  .cards {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }}
+  .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+           padding: 14px 18px; min-width: 140px; }}
+  .card .val {{ font-size: 22px; font-weight: 700; color: #58a6ff; }}
+  .card .lbl {{ font-size: 11px; color: #8b949e; margin-top: 2px; }}
+  h2 {{ font-size: 14px; font-weight: 600; color: #f0f6fc; margin: 24px 0 10px; }}
+  h2 .legend {{ font-size: 11px; font-weight: 400; color: #8b949e;
+                margin-left: 10px; }}
+  #chart-container {{ background: #161b22; border: 1px solid #30363d;
+                      border-radius: 8px; margin-bottom: 28px; min-height: 420px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 12px;
+           margin-bottom: 28px; }}
+  th {{ background: #161b22; color: #8b949e; font-weight: 500; text-align: left;
+        padding: 6px 10px; border-bottom: 1px solid #30363d; white-space: nowrap; }}
+  td {{ padding: 4px 10px; border-bottom: 1px solid #21262d; vertical-align: middle; }}
+  tr:hover td {{ background: #161b22; }}
+  td.num, th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  td.ts {{ color: #8b949e; white-space: nowrap; }}
+  td.cost {{ text-align: right; font-variant-numeric: tabular-nums;
+             white-space: nowrap; color: #d29922; }}
+  code {{ color: #a5d6ff; font-size: 11px; }}
+  /* Reused insight helpers pull in the same styles as single/project mode. */
+  .insight-card {{ background: #161b22; border: 1px solid #30363d;
+                   border-radius: 8px; padding: 14px 18px; margin-bottom: 16px; }}
+  .insight-card h3 {{ font-size: 13px; font-weight: 600; color: #f0f6fc;
+                      margin-bottom: 6px; }}
+  .weekly-rollup td, .session-blocks td, .hod-table td, .punchcard td,
+  .heatmap td {{ font-variant-numeric: tabular-nums; }}
+</style>
+</head>
+<body>
+<h1>{page_title}</h1>
+<p class="meta">Generated {generated} &nbsp;·&nbsp; Scanning: <code>{projects_dir}</code>
+ &nbsp;·&nbsp; {report.get("project_count", 0)} projects,
+ {report.get("session_count", 0)} sessions,
+ {totals.get("turns", 0):,} turns</p>
+{summary_cards_html}
+{chart_section_html}
+{projects_table_html}
+{insights_html}
+{models_table_html}
+</body>
+</html>"""
+
+
+# === instance mode: end =====================================================
+
+
 def _dispatch(report: dict, formats: list[str],
                single_page: bool = False,
                chart_lib: str = "highcharts",
@@ -5207,6 +6243,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project-cost", "-p", action="store_true",
                    help="Show all sessions in chronological order with per-session "
                         "subtotals and a grand project total.")
+    p.add_argument("--all-projects", action="store_true",
+                   help="Instance-wide dashboard: aggregate every project under the "
+                        "projects directory into one report. Writes HTML/MD/CSV/JSON "
+                        "and (unless --no-project-drilldown) a per-project HTML "
+                        "drilldown for each project into a dated subfolder under "
+                        "exports/session-metrics/instance/.")
+    p.add_argument("--no-project-drilldown", action="store_true",
+                   help="With --all-projects: skip the per-project HTML drilldown "
+                        "pass. Fast path for CI / quick-glance runs. The instance "
+                        "HTML still renders, but project rows are plain text "
+                        "without hyperlinks.")
+    p.add_argument("--projects-dir", metavar="PATH",
+                   help="Override the Claude Code projects directory (normally "
+                        "~/.claude/projects or $CLAUDE_PROJECTS_DIR). Highest "
+                        "precedence. Makes it trivial to script multi-instance "
+                        "dashboards: run --all-projects once per path.")
     p.add_argument("--output", "-o", nargs="+", metavar="FMT",
                    choices=["text", "json", "csv", "md", "html"],
                    help="Export formats in addition to stdout text. "
@@ -5690,6 +6742,24 @@ def main() -> None:
             redact_user_prompts=args.redact_user_prompts,
             effort_a=effort_a_compare,
             effort_b=effort_b_compare,
+        )
+        return
+
+    if args.all_projects:
+        # Apply the --projects-dir override (if any) before any discovery
+        # call. ``_projects_dir()`` reads this module-level var first, so
+        # setting it here cascades through _list_all_projects, _load_session,
+        # and every downstream helper without threading an arg through them.
+        if args.projects_dir:
+            global _PROJECTS_DIR_OVERRIDE
+            _PROJECTS_DIR_OVERRIDE = Path(args.projects_dir).expanduser()
+        _run_all_projects(
+            formats, tz_offset, tz_label,
+            peak=peak, single_page=args.single_page,
+            use_cache=not args.no_cache, chart_lib=chart_lib,
+            include_subagents=args.include_subagents,
+            drilldown=not args.no_project_drilldown,
+            suppress_model_compare_insight=args.no_model_compare_insight,
         )
         return
 
