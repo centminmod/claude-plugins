@@ -135,6 +135,54 @@ Combine them freely:
 
 ---
 
+## Your first instance dashboard (every project on your machine)
+
+**New in v1.14.0.** The plugin also aggregates every project under
+`~/.claude/projects/` into a single **instance dashboard** — total
+cost-to-date across everything Claude Code has touched on this
+machine, with drill-downs into each individual project.
+
+**Natural-language ask:**
+
+> how much have I spent on Claude Code across all my projects?
+
+**Explicit invocation:**
+
+```
+/session-metrics all-projects
+```
+
+**Direct shell:**
+
+```bash
+uv run python ~/.claude/plugins/cache/centminmod/session-metrics/<version>/skills/session-metrics/scripts/session-metrics.py --all-projects --output html md csv json
+```
+
+You get a dated subfolder under `exports/session-metrics/instance/YYYY-MM-DD-HHMMSS/`
+containing:
+
+- `index.html` — the instance dashboard (summary cards, daily cost
+  timeline chart stacked by tokens, projects breakdown table sorted
+  by cost descending, models table, weekly/hour-of-day rollups).
+- `projects/<slug>.html` — full per-project HTML drilldowns,
+  hyperlinked from each row of the breakdown table. Click any
+  project to open its per-turn report.
+- `index.md` / `index.csv` / `index.json` — same data in portable formats.
+
+### Useful instance-mode flags
+
+| Flag | Purpose |
+|------|---------|
+| `--no-project-drilldown` | Skip the per-project HTMLs and render only `index.html`. Completes in seconds. Useful in CI or for quick-glance runs. |
+| `--projects-dir /path/to/projects` | Point at a non-default projects directory — e.g. a second Claude Code install under `CLAUDE_CONFIG_DIR=/opt/claude-work`. Also honours the `CLAUDE_PROJECTS_DIR` env var. |
+| `--chart-lib uplot\|chartjs\|none` | Same chart-library choice as session/project mode. |
+
+The folder is fully portable: zip it, move it, serve it as static
+files — the hyperlinks between `index.html` and `projects/<slug>.html`
+are relative paths and stay working anywhere.
+
+---
+
 ## Your first model comparison
 
 The scenario: Anthropic shipped Opus 4.7. Community reports say it

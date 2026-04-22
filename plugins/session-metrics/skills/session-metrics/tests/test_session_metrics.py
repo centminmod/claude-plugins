@@ -6811,3 +6811,131 @@ def test_render_md_instance_has_projects_breakdown(instance_env):
     assert "all-projects" in md.lower() or "instance" in md.lower()
     assert "-home-user-alpha" in md
     assert "-home-user-beta" in md
+
+
+# --- v1.14.1: instance daily token breakdown + chart axis label -------------
+#
+# Pre-v1.14.1 the daily buckets only tracked cost + total_tokens, so the
+# instance HTML chart flatlined the four stacked-bar series (input, output,
+# cache_read, cache_write) at 0 and the x-axis was labelled "Turn" even
+# though each data point was a calendar day. These tests pin the fix.
+
+def test_build_instance_daily_tracks_per_token_breakdowns(instance_env):
+    """_build_instance_daily must accumulate input/output/cache_read/
+    cache_write totals per day so the instance chart can render real
+    stacked-bar data rather than hardcoded zeros."""
+    tmp_path, projects_dir = instance_env
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "a1", "turns": [
+            {"model": "claude-opus-4-7", "in": 1000, "out": 500,
+             "cache_read": 400, "cache_write": 200}]}],
+        "-home-user-beta":  [{"id": "b1", "turns": [
+            {"model": "claude-sonnet-4-7", "in": 2000, "out": 1000,
+             "cache_read": 800, "cache_write": 300}]}],
+    })
+    captured = {}
+
+    def spy(instance_report, project_reports, formats, **kw):
+        captured["ir"] = instance_report
+
+    import pytest as _pytest
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sm, "_dispatch_instance", spy)
+        sm._run_all_projects(
+            formats=[], tz_offset=0.0, tz_label="UTC",
+            use_cache=False, chart_lib="none",
+            include_subagents=False, drilldown=False,
+        )
+    daily = captured["ir"]["daily"]
+    assert daily, "expected at least one daily bucket"
+    # Every bucket carries the four per-token subcategories
+    required_keys = {"date", "cost", "tokens",
+                     "input", "output", "cache_read", "cache_write"}
+    for b in daily:
+        assert required_keys.issubset(b.keys()), \
+            f"missing keys in bucket {b}"
+        # And they're integers, non-negative
+        for k in ("input", "output", "cache_read", "cache_write"):
+            assert isinstance(b[k], int) and b[k] >= 0
+
+    # Summing across days must reproduce the grand totals
+    assert sum(b["input"] for b in daily)       == 3000   # 1000 + 2000
+    assert sum(b["output"] for b in daily)      == 1500   # 500  + 1000
+    assert sum(b["cache_read"] for b in daily)  == 1200   # 400  + 800
+    assert sum(b["cache_write"] for b in daily) == 500    # 200  + 300
+
+
+@pytest.mark.parametrize("chart_lib", ["highcharts", "uplot", "chartjs"])
+def test_render_chart_accepts_x_title_override(chart_lib):
+    """All three JS chart renderers must accept an x_title kwarg so the
+    instance dashboard can label the axis 'Day' instead of the default
+    'Turn'. The 'none' renderer accepts x_title for API parity but is
+    exercised trivially below.
+
+    We generate >_CHART_PAGE (60) points so the pagination header renders —
+    Chart.js only surfaces x_title in the pagination label, whereas
+    Highcharts and uPlot also embed it directly in the chart JS.
+    """
+    # 61 synthetic turns → forces multi-page pagination so every renderer
+    # has an opportunity to emit the x_title string somewhere in its body.
+    turns = [
+        {"timestamp":     f"2026-04-{((i % 28) + 1):02d}T12:00:00Z",
+         "timestamp_fmt": f"2026-04-{((i % 28) + 1):02d}",
+         "input_tokens": 100 + i, "output_tokens": 50 + i,
+         "cache_read_tokens": 40, "cache_write_tokens": 20,
+         "total_tokens": 210 + 2 * i, "cost_usd": 0.001 * (i + 1),
+         "model": "claude-opus-4-7"}
+        for i in range(sm._CHART_PAGE + 1)  # 61 points → 2 pages
+    ]
+    renderer = sm.CHART_RENDERERS[chart_lib]
+    body_turn, _ = renderer(turns)              # default "Turn"
+    body_day,  _ = renderer(turns, x_title="Day")
+    # The default body references "Turn" in its pagination header / labels
+    assert "Turn" in body_turn, (
+        f"{chart_lib}: default x_title 'Turn' missing from body"
+    )
+    # The overridden body must reference "Day" and not bleed through to 'Turn'
+    assert "Day" in body_day, (
+        f"{chart_lib}: x_title override 'Day' absent from body"
+    )
+    assert body_turn != body_day, (
+        f"{chart_lib}: body unchanged when x_title overridden"
+    )
+
+
+def test_render_chart_none_accepts_x_title():
+    """The 'none' renderer ignores x_title but must not raise on it."""
+    out = sm._render_chart_none([], x_title="Day")
+    assert out == ("", "")
+
+
+def test_render_html_instance_chart_uses_day_axis_label(instance_env):
+    """End-to-end: instance HTML chart section must label the axis as
+    'Day' (not 'Turn'), matching the 'one point per day' semantics."""
+    tmp_path, projects_dir = instance_env
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "a1", "turns": [
+            {"model": "claude-opus-4-7", "in": 1000, "out": 500,
+             "cache_read": 400, "cache_write": 200}]}],
+        "-home-user-beta":  [{"id": "b1", "turns": [
+            {"model": "claude-sonnet-4-7", "in": 2000, "out": 1000,
+             "cache_read": 800, "cache_write": 300}]}],
+    })
+    sm._run_all_projects(
+        formats=["html"], tz_offset=0.0, tz_label="UTC",
+        use_cache=False, chart_lib="highcharts",
+        include_subagents=False, drilldown=False,
+    )
+    run = next(iter(
+        (tmp_path / "exports" / "session-metrics" / "instance").iterdir()))
+    html = (run / "index.html").read_text(encoding="utf-8")
+    # Highcharts writes the axis label into a `var X_TITLE = '…';`
+    # line inside the chart IIFE — assert it reads 'Day'.
+    assert "var X_TITLE = 'Day'" in html, (
+        "instance HTML chart x-axis label must be 'Day', not 'Turn'"
+    )
+    # And the body must NOT mention 'Turns 1–60' pagination labels —
+    # the instance scope's pagination, when shown, should say 'Days'.
+    assert "Turns 1\u20131" not in html and "Turns 1-1" not in html, (
+        "instance chart pagination header must say 'Days', not 'Turns'"
+    )

@@ -3722,18 +3722,24 @@ def _extract_chart_series(all_turns: list[dict]) -> dict:
     }
 
 
-def _render_chart_highcharts(all_turns: list[dict]) -> tuple[str, str]:
+def _render_chart_highcharts(all_turns: list[dict],
+                             x_title: str = "Turn") -> tuple[str, str]:
     """Highcharts renderer. Returns ``(chart_body_html, head_html)``.
 
     ``chart_body_html`` is the full ``<div id="chart-container">…</div>`` block
     dropped in the report body; ``head_html`` is the vendored library bundle
     wrapped in a ready-to-inline ``<script>`` tag for ``<head>``.
+
+    ``x_title`` controls the x-axis label and the pagination header
+    (e.g. "Turns 1–60 of 126"). Defaults to "Turn" for session/project
+    scope; the instance dashboard passes "Day" since each data point
+    is a calendar day rather than a per-turn record.
     """
     if not all_turns:
         return ("", "")
     s = _extract_chart_series(all_turns)
     body = _build_chart_html(
-        s["cats"], s["crd"], s["cwr"], s["out"], s["inp"], s["cost"], "Turn",
+        s["cats"], s["crd"], s["cwr"], s["out"], s["inp"], s["cost"], x_title,
         models=s["models"],
     )
     return (body, f"<script>{_hc_scripts()}</script>")
@@ -3771,7 +3777,8 @@ def _build_lib_chart_pages(series: dict, x_title: str) -> tuple[str, str]:
     return ("\n".join(divs), data_json)
 
 
-def _render_chart_uplot(all_turns: list[dict]) -> tuple[str, str]:
+def _render_chart_uplot(all_turns: list[dict],
+                        x_title: str = "Turn") -> tuple[str, str]:
     """uPlot renderer (MIT). Returns ``(body_html, head_html)``.
 
     uPlot has no built-in stacked-bars API — we pre-compute cumulative
@@ -3779,11 +3786,14 @@ def _render_chart_uplot(all_turns: list[dict]) -> tuple[str, str]:
     baseline (the bottom-most series is drawn last so it sits on top
     visually).  Cost is a separate line series on a right-hand y-axis.
     Pagination + lazy rendering match the Highcharts renderer.
+
+    ``x_title`` controls the x-series label and the pagination header.
+    See :func:`_render_chart_highcharts` for the instance-scope rationale.
     """
     if not all_turns:
         return ("", "")
     series = _extract_chart_series(all_turns)
-    containers_html, data_json = _build_lib_chart_pages(series, "Turn")
+    containers_html, data_json = _build_lib_chart_pages(series, x_title)
 
     css = _read_vendor_css("uplot")
     js  = _read_vendor_js("uplot")
@@ -3847,7 +3857,7 @@ def _render_chart_uplot(all_turns: list[dict]) -> tuple[str, str]:
            }} }},
       ],
       series: [
-        {{ label: 'Turn' }},
+        {{ label: '{x_title}' }},
         {{ label: 'Input (new)', stroke: '#1f6feb',
            fill: 'rgba(31,111,235,0.85)', paths: bars, points: {{ show: false }},
            value: function (u, v, sIdx, dIdx) {{
@@ -3917,18 +3927,23 @@ def _render_chart_uplot(all_turns: list[dict]) -> tuple[str, str]:
     return (body, head_html)
 
 
-def _render_chart_chartjs(all_turns: list[dict]) -> tuple[str, str]:
+def _render_chart_chartjs(all_turns: list[dict],
+                          x_title: str = "Turn") -> tuple[str, str]:
     """Chart.js v4 renderer (MIT). Returns ``(body_html, head_html)``.
 
     Mixed bar+line: four ``type: 'bar'`` datasets share ``stack: 'tokens'``
     on the left y-axis (``stacked: true``), one ``type: 'line'`` dataset
     rides on the right y-axis ``y1`` for cost. Pagination + lazy
     rendering match the Highcharts renderer.
+
+    ``x_title`` controls the pagination header text (Chart.js itself has
+    no x-axis title configured here; the instance dashboard still needs
+    "Days 1–60 of N" instead of the default "Turns 1–60 of N").
     """
     if not all_turns:
         return ("", "")
     series = _extract_chart_series(all_turns)
-    containers_html, data_json = _build_lib_chart_pages(series, "Turn")
+    containers_html, data_json = _build_lib_chart_pages(series, x_title)
 
     js = _read_vendor_js("chartjs")
     if not js:
@@ -4034,10 +4049,14 @@ def _render_chart_chartjs(all_turns: list[dict]) -> tuple[str, str]:
     return (body, head_html)
 
 
-def _render_chart_none(all_turns: list[dict]) -> tuple[str, str]:
+def _render_chart_none(all_turns: list[dict],
+                       x_title: str = "Turn") -> tuple[str, str]:
     """No-chart renderer. Emits an empty body + empty head — useful when the
-    caller wants a minimal detail page with no JS dependencies."""
-    del all_turns
+    caller wants a minimal detail page with no JS dependencies.
+
+    ``x_title`` accepted for API parity with the other renderers; ignored.
+    """
+    del all_turns, x_title
     return ("", "")
 
 
@@ -5274,10 +5293,15 @@ def _build_instance_daily(project_reports: list[dict],
     """Aggregate per-turn cost into daily buckets, attributed by project.
 
     Returns ``(daily, top_slugs)`` where ``daily`` is a list of
-    ``{date, cost, tokens, by_project: {slug: cost_usd}}`` dicts sorted
-    oldest-first, and ``top_slugs`` is the slug list that the instance
-    chart stacks (all other projects are rolled into an "other" series
-    by the renderer).
+    ``{date, cost, tokens, input, output, cache_read, cache_write,
+    by_project: {slug: cost_usd}}`` dicts sorted oldest-first, and
+    ``top_slugs`` is the slug list that the instance chart stacks
+    (all other projects are rolled into an "other" series by the renderer).
+
+    The four per-token subcategories (``input`` / ``output`` / ``cache_read``
+    / ``cache_write``) are tracked separately so the instance daily-cost
+    chart can feed a real stacked-bar breakdown to the chart renderer,
+    rather than flatlining those four series at 0 (the pre-v1.14.1 bug).
     """
     buckets: dict[str, dict] = {}
     project_cost: dict[str, float] = {}
@@ -5293,10 +5317,18 @@ def _build_instance_daily(project_reports: list[dict],
                 local = (dt + shift).date().isoformat()
                 cost = float(t.get("cost_usd", 0.0))
                 tokens = int(t.get("total_tokens", 0))
-                b = buckets.setdefault(local, {"date": local, "cost": 0.0,
-                                                "tokens": 0, "by_project": {}})
+                b = buckets.setdefault(local, {
+                    "date": local, "cost": 0.0, "tokens": 0,
+                    "input": 0, "output": 0,
+                    "cache_read": 0, "cache_write": 0,
+                    "by_project": {},
+                })
                 b["cost"] += cost
                 b["tokens"] += tokens
+                b["input"]       += int(t.get("input_tokens", 0) or 0)
+                b["output"]      += int(t.get("output_tokens", 0) or 0)
+                b["cache_read"]  += int(t.get("cache_read_tokens", 0) or 0)
+                b["cache_write"] += int(t.get("cache_write_tokens", 0) or 0)
                 b["by_project"][slug] = b["by_project"].get(slug, 0.0) + cost
                 project_cost[slug] = project_cost.get(slug, 0.0) + cost
     daily = sorted(buckets.values(), key=lambda x: x["date"])
@@ -5935,16 +5967,23 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
             "timestamp_fmt": d["date"],
             "cost_usd":      float(d.get("cost", 0.0)),
             "total_tokens":  int(d.get("tokens", 0)),
-            "input_tokens":  0,
-            "output_tokens": 0,
-            "cache_read_tokens":  0,
-            "cache_write_tokens": 0,
+            # v1.14.1: pipe real per-day token buckets through to the
+            # chart renderer. Prior to this change all four series were
+            # hardcoded to 0, producing a flatlined stacked-bar chart
+            # where only the Cost $ line carried real data.
+            "input_tokens":       int(d.get("input", 0)),
+            "output_tokens":      int(d.get("output", 0)),
+            "cache_read_tokens":  int(d.get("cache_read", 0)),
+            "cache_write_tokens": int(d.get("cache_write", 0)),
             "model":         "instance",
             "index":         0,
         })
     if synth_turns:
         renderer = CHART_RENDERERS.get(chart_lib) or _render_chart_none
-        chart_html, chart_head_html = renderer(synth_turns)
+        # At instance scope each data point is a calendar day — override
+        # the chart renderers' default "Turn" axis label so the x-axis
+        # title + pagination header ("Days 1–60 of N") match reality.
+        chart_html, chart_head_html = renderer(synth_turns, x_title="Day")
     else:
         chart_html = ""
         chart_head_html = ""
