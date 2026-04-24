@@ -4293,7 +4293,7 @@ tr.turn-row:focus{outline:1px solid var(--accent);outline-offset:-1px}
 .chart-controls span{font-size:11px;color:var(--accent);min-width:28px}
 
 /* Turn drawer (preview) */
-.drawer{position:fixed;top:0;right:0;height:100vh;width:min(520px,100%);transform:translateX(100%);transition:transform .25s cubic-bezier(.2,.8,.2,1);z-index:1000;display:flex;flex-direction:column;overflow:hidden;border-left:1px solid var(--border)}
+.drawer{position:fixed;top:0;right:0;height:100vh;width:min(520px,100%);transform:translateX(100%);transition:transform .25s cubic-bezier(.2,.8,.2,1);z-index:1000;display:flex;flex-direction:column;overflow:hidden;border-left:1px solid var(--border);background:var(--bg)}
 .drawer.open{transform:translateX(0)}
 .drawer-head{padding:24px 24px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:baseline;gap:16px}
 .drawer-head h3{margin:0;font-family:'Inter Tight','Inter',sans-serif;font-weight:600;font-size:20px}
