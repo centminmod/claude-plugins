@@ -427,6 +427,7 @@ _XML_MARKER_RE     = re.compile(
 # even when a session has a few 10k-char monologues. Prompt text is bounded by
 # the natural shape of user input and typically doesn't need a cap.
 _ASSISTANT_TEXT_CAP = 2000
+_PROMPT_TEXT_CAP   = 1000
 
 
 def _truncate(text: str, n: int) -> str:
@@ -4720,10 +4721,10 @@ def _chartrail_script() -> str:
   var progress = document.getElementById('rail-progress-fill');
   if (!scroll || !inner || !yaxis) return;
 
-  // Max tokens = input + output + cache_read + cache_write per turn
+  // Max tokens = inp + out + cr + cw per turn
   var maxTok = 0;
   rows.forEach(function (t) {
-    var tot = (t.input||0) + (t.output||0) + (t.cache_read||0) + (t.cache_write||0);
+    var tot = (t.inp||0) + (t.out||0) + (t.cr||0) + (t.cw||0);
     if (tot > maxTok) maxTok = tot;
   });
   if (!maxTok) maxTok = 1;
@@ -4748,13 +4749,13 @@ def _chartrail_script() -> str:
 
   var parts = [];
   rows.forEach(function (t, i) {
-    if (t.is_resume) {
-      var label = t.is_terminal ? 'Session exited' : 'Session resumed';
+    if (t.resm) {
+      var label = t.term ? 'Session exited' : 'Session resumed';
       parts.push('<div class="tcol resume' +
-        (t.session_break && i > 0 ? ' session-break' : '') +
+        (t.sbrk && i > 0 ? ' session-break' : '') +
         '" title="' + esc(label + ' at ' + (t.ts || '')) + '">' +
-        (t.session_break && i > 0
-          ? '<div class="tc-seslabel">' + esc(t.session_label || '') + '</div>'
+        (t.sbrk && i > 0
+          ? '<div class="tc-seslabel">' + esc(t.slbl || '') + '</div>'
           : '') +
         '<div class="tc-bar" aria-hidden="true"></div>' +
         '<div class="tc-foot"><span class="tc-n">' +
@@ -4764,19 +4765,19 @@ def _chartrail_script() -> str:
         '</div>');
       return;
     }
-    var pctI  = (t.input      /maxTok) * 100;
-    var pctO  = (t.output     /maxTok) * 100;
-    var pctCw = (t.cache_write/maxTok) * 100;
-    var pctCr = (t.cache_read /maxTok) * 100;
-    var tot = (t.input||0) + (t.output||0) + (t.cache_read||0) + (t.cache_write||0);
+    var pctI  = (t.inp /maxTok) * 100;
+    var pctO  = (t.out /maxTok) * 100;
+    var pctCw = (t.cw  /maxTok) * 100;
+    var pctCr = (t.cr  /maxTok) * 100;
+    var tot = (t.inp||0) + (t.out||0) + (t.cr||0) + (t.cw||0);
     var title = 'Turn ' + t.n + ' \u00b7 ' + (t.time || '') + ' \u00b7 ' +
-                (t.model || '') + ' \u00b7 tokens ' + tot.toLocaleString() +
+                (t.mdl || '') + ' \u00b7 tokens ' + tot.toLocaleString() +
                 ' \u00b7 $' + (t.cost || 0).toFixed(4);
     parts.push('<div class="tcol' +
-      (t.session_break && i > 0 ? ' session-break' : '') +
+      (t.sbrk && i > 0 ? ' session-break' : '') +
       '" data-turn="' + esc(t.key) + '" tabindex="0" title="' + esc(title) + '">' +
-      (t.session_break && i > 0
-        ? '<div class="tc-seslabel">' + esc(t.session_label || '') + '</div>'
+      (t.sbrk && i > 0
+        ? '<div class="tc-seslabel">' + esc(t.slbl || '') + '</div>'
         : '') +
       '<div class="tc-bar" aria-hidden="true">' +
       '<span class="seg i"  style="height:' + pctI.toFixed(2) + '%"></span>' +
@@ -5481,64 +5482,64 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
             for t in s["turns"]:
                 if t.get("is_resume_marker"):
                     chartrail_data.append({
-                        "n":             t["index"],
-                        "key":           "",
-                        "ts":            t.get("timestamp_fmt", ""),
-                        "time":          (t.get("timestamp_fmt", "").split(" ")
-                                           [-1][:5]),
-                        "model":         "",
-                        "input":         0,
-                        "output":        0,
-                        "cache_read":    0,
-                        "cache_write":   0,
-                        "total":         0,
-                        "cost":          0.0,
-                        "session_id":    sid8,
-                        "session_label": sess_label,
-                        "session_break": first_in_session,
-                        "is_resume":     True,
-                        "is_terminal":   bool(t.get("is_terminal_exit_marker")),
+                        "n":    t["index"],
+                        "key":  "",
+                        "ts":   t.get("timestamp_fmt", ""),
+                        "time": (t.get("timestamp_fmt", "").split(" ")
+                                  [-1][:5]),
+                        "mdl":  "",
+                        "inp":  0,
+                        "out":  0,
+                        "cr":   0,
+                        "cw":   0,
+                        "tot":  0,
+                        "cost": 0.0,
+                        "sid":  sid8,
+                        "slbl": sess_label,
+                        "sbrk": first_in_session,
+                        "resm": True,
+                        "term": bool(t.get("is_terminal_exit_marker")),
                     })
                     first_in_session = False
                     continue
                 key = f'{sid8}-{t["index"]}'
                 turn_data[key] = {
-                    "idx":               t["index"],
-                    "ts":                t.get("timestamp_fmt", ""),
-                    "model":             t.get("model", ""),
-                    "prompt_snippet":    t.get("prompt_snippet", ""),
-                    "prompt_text":       t.get("prompt_text", ""),
-                    "slash_command":     t.get("slash_command", ""),
-                    "tools":             t.get("tool_use_detail", []) or [],
-                    "content":           t.get("content_blocks") or {},
-                    "cost":              t.get("cost_usd", 0.0),
-                    "no_cache_cost":     t.get("no_cache_cost_usd", 0.0),
-                    "input":             t.get("input_tokens", 0),
-                    "output":            t.get("output_tokens", 0),
-                    "cache_read":        t.get("cache_read_tokens", 0),
-                    "cache_write":       t.get("cache_write_tokens", 0),
-                    "cache_write_ttl":   t.get("cache_write_ttl", ""),
-                    "assistant_snippet": t.get("assistant_snippet", ""),
-                    "assistant_text":    t.get("assistant_text", ""),
+                    "idx":   t["index"],
+                    "ts":    t.get("timestamp_fmt", ""),
+                    "mdl":   t.get("model", ""),
+                    "ps":    t.get("prompt_snippet", ""),
+                    "pt":    _truncate(t.get("prompt_text", ""), _PROMPT_TEXT_CAP),
+                    "sc":    t.get("slash_command", ""),
+                    "tl":    t.get("tool_use_detail", []) or [],
+                    "cb":    t.get("content_blocks") or {},
+                    "cost":  t.get("cost_usd", 0.0),
+                    "nc":    t.get("no_cache_cost_usd", 0.0),
+                    "inp":   t.get("input_tokens", 0),
+                    "out":   t.get("output_tokens", 0),
+                    "cr":    t.get("cache_read_tokens", 0),
+                    "cw":    t.get("cache_write_tokens", 0),
+                    "cwt":   t.get("cache_write_ttl", ""),
+                    "asnip": t.get("assistant_snippet", ""),
+                    "atxt":  t.get("assistant_text", ""),
                 }
                 chartrail_data.append({
-                    "n":             t["index"],
-                    "key":           key,
-                    "ts":            t.get("timestamp_fmt", ""),
-                    "time":          (t.get("timestamp_fmt", "").split(" ")
-                                       [-1][:5]),
-                    "model":         t.get("model", ""),
-                    "input":         t.get("input_tokens", 0),
-                    "output":        t.get("output_tokens", 0),
-                    "cache_read":    t.get("cache_read_tokens", 0),
-                    "cache_write":   t.get("cache_write_tokens", 0),
-                    "total":         t.get("total_tokens", 0),
-                    "cost":          t.get("cost_usd", 0.0),
-                    "session_id":    sid8,
-                    "session_label": sess_label,
-                    "session_break": first_in_session,
-                    "is_resume":     False,
-                    "is_terminal":   False,
+                    "n":    t["index"],
+                    "key":  key,
+                    "ts":   t.get("timestamp_fmt", ""),
+                    "time": (t.get("timestamp_fmt", "").split(" ")
+                              [-1][:5]),
+                    "mdl":  t.get("model", ""),
+                    "inp":  t.get("input_tokens", 0),
+                    "out":  t.get("output_tokens", 0),
+                    "cr":   t.get("cache_read_tokens", 0),
+                    "cw":   t.get("cache_write_tokens", 0),
+                    "tot":  t.get("total_tokens", 0),
+                    "cost": t.get("cost_usd", 0.0),
+                    "sid":  sid8,
+                    "slbl": sess_label,
+                    "sbrk": first_in_session,
+                    "resm": False,
+                    "term": False,
                 })
                 first_in_session = False
                 if t.get("prompt_text"):
@@ -5679,33 +5680,33 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 
   function openTurn(key) {
     var t = data[key]; if (!t) return;
-    setText('idx', t.idx); setText('ts', t.ts); setText('model', t.model);
+    setText('idx', t.idx); setText('ts', t.ts); setText('model', t.mdl);
     var slashWrap = sel('slash-wrap');
     var slashWrapDt = sel('slash-wrap-dt');
     var slashEl = sel('slash');
-    if (t.slash_command) {
+    if (t.sc) {
       if (slashWrap) slashWrap.hidden = false;
       if (slashWrapDt) slashWrapDt.hidden = false;
-      if (slashEl) slashEl.textContent = t.slash_command;
+      if (slashEl) slashEl.textContent = t.sc;
     } else {
       if (slashWrap) slashWrap.hidden = true;
       if (slashWrapDt) slashWrapDt.hidden = true;
     }
 
-    var snip = t.prompt_snippet || '(no prompt captured)';
+    var snip = t.ps || '(no prompt captured)';
     setText('prompt-snippet', snip);
     var full = sel('prompt-full'), moreBtn = drawer.querySelector('.drawer-more:not(.drawer-more-a)');
-    if (t.prompt_text && t.prompt_text.length > (t.prompt_snippet || '').length) {
+    if (t.pt && t.pt.length > (t.ps || '').length) {
       moreBtn.hidden = false; moreBtn.dataset.state = 'collapsed';
       moreBtn.textContent = 'Show full prompt';
-      full.hidden = true; full.textContent = t.prompt_text;
+      full.hidden = true; full.textContent = t.pt;
       sel('prompt-snippet').hidden = false;
     } else {
       moreBtn.hidden = true; full.hidden = true; full.textContent = '';
       sel('prompt-snippet').hidden = false;
     }
 
-    var tools = t.tools || [];
+    var tools = t.tl || [];
     var toolsSect = sel('tools-sec');
     var toolsList = sel('tools');
     setText('tool-count', tools.length);
@@ -5727,7 +5728,7 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
     } else { toolsSect.hidden = true; }
 
     var dl = sel('content-dl'); dl.innerHTML = '';
-    var cb = t.content || {};
+    var cb = t.cb || {};
     var labels = {thinking:'Thinking', tool_use:'Tool use', text:'Text',
                   tool_result:'Tool result', image:'Image'};
     Object.keys(labels).forEach(function (k) {
@@ -5742,14 +5743,14 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
       dl.appendChild(dt2); dl.appendChild(dd2);
     }
 
-    setText('tok-input',       formatNum(t.input));
-    setText('tok-output',      formatNum(t.output));
-    setText('tok-cache-read',  formatNum(t.cache_read));
-    var cw = formatNum(t.cache_write);
-    if (t.cache_write_ttl) cw += '  (' + t.cache_write_ttl + ')';
+    setText('tok-input',       formatNum(t.inp));
+    setText('tok-output',      formatNum(t.out));
+    setText('tok-cache-read',  formatNum(t.cr));
+    var cw = formatNum(t.cw);
+    if (t.cwt) cw += '  (' + t.cwt + ')';
     setText('tok-cache-write', cw);
     setText('cost', '$' + (t.cost || 0).toFixed(4));
-    var savings = (t.no_cache_cost || 0) - (t.cost || 0);
+    var savings = (t.nc || 0) - (t.cost || 0);
     var sEl = sel('cache-savings');
     if (savings > 0) { sEl.textContent = 'Cache savings vs no-cache: $' + savings.toFixed(4); sEl.hidden = false; }
     else { sEl.textContent = ''; sEl.hidden = true; }
@@ -5758,14 +5759,14 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
     var asstSnip = sel('assistant-snippet');
     var asstFull = sel('assistant-full');
     var asstMore = drawer.querySelector('.drawer-more-a');
-    if (t.assistant_snippet) {
+    if (t.asnip) {
       asstSect.hidden = false;
       asstSnip.hidden = false;
-      asstSnip.textContent = t.assistant_snippet;
-      if (t.assistant_text && t.assistant_text.length > t.assistant_snippet.length) {
+      asstSnip.textContent = t.asnip;
+      if (t.atxt && t.atxt.length > t.asnip.length) {
         asstMore.hidden = false; asstMore.dataset.state = 'collapsed';
         asstMore.textContent = 'Show full response';
-        asstFull.hidden = true; asstFull.textContent = t.assistant_text;
+        asstFull.hidden = true; asstFull.textContent = t.atxt;
       } else {
         asstMore.hidden = true; asstFull.hidden = true; asstFull.textContent = '';
       }

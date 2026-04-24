@@ -6320,11 +6320,11 @@ def test_html_has_turn_data_json_blob():
         key = f"{sid8}-{idx}"
         assert key in data, f"missing payload for {key}"
         p = data[key]
-        for must_have in ("idx", "ts", "model", "prompt_snippet",
-                          "prompt_text", "slash_command", "tools",
-                          "content", "cost", "input", "output",
-                          "cache_read", "cache_write",
-                          "assistant_snippet", "assistant_text"):
+        for must_have in ("idx", "ts", "mdl", "ps",
+                          "pt", "sc", "tl",
+                          "cb", "cost", "inp", "out",
+                          "cr", "cw",
+                          "asnip", "atxt"):
             assert must_have in p, f"payload {key} missing {must_have}"
 
 
@@ -6437,7 +6437,7 @@ def test_turn_data_json_is_html_escaped():
     data = _json.loads(blob.replace("<\\/", "</"))
     sid8 = r["sessions"][0]["session_id"][:8]
     payload = data[f"{sid8}-1"]
-    assert payload["prompt_text"] == "</script><img src=x onerror=alert(1)>"
+    assert payload["pt"] == "</script><img src=x onerror=alert(1)>"
 
 
 # ---- Perf regression guard (opt-in) ----------------------------------------
