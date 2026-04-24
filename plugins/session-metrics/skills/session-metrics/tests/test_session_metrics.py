@@ -1387,11 +1387,11 @@ def test_render_html_dashboard_omits_chart_and_highcharts():
 def test_render_html_detail_omits_insights():
     r = _build_fixture_report()
     html = sm.render_html(r, variant="detail", nav_sibling="dashboard.html")
-    assert 'id="chart-container'   in html
-    assert "Highcharts"            in html
-    assert 'id="session-blocks"'   not in html
-    assert 'class="cards"'         not in html
-    assert 'href="dashboard.html"' in html
+    assert 'class="chartrail-card"' in html   # chartrail replaces Highcharts 3D in detail
+    assert "Highcharts"             not in html
+    assert 'id="session-blocks"'    not in html
+    assert 'class="cards"'          not in html
+    assert 'href="dashboard.html"'  in html
 
 
 def test_session_duration_stats_computes_burn_rate():
@@ -6333,8 +6333,8 @@ def test_html_has_turn_drawer_element():
     r = _build_fixture_report()
     for variant in ("single", "detail"):
         html = sm.render_html(r, variant=variant)
-        assert 'id="turn-drawer"' in html
-        assert 'class="turn-drawer-backdrop"' in html
+        assert 'id="drawer"' in html
+        assert 'id="drawer-backdrop"' in html
         # Data-slot attributes the JS populates at open time.
         for slot in ("idx", "ts", "model", "prompt-snippet", "prompt-full",
                      "tools", "tool-count", "content-dl", "cost",
@@ -6350,10 +6350,10 @@ def test_html_has_prompts_section_when_prompts_present():
     """Prompts section renders when at least one turn has a real prompt."""
     r = _build_fixture_report()
     html = sm.render_html(r, variant="single")
-    assert '<table class="prompts-table">' in html
-    # Every prompts row must carry data-turn-id so click-to-open works.
+    assert '<div class="prompts">' in html
+    # Every prompts row must carry data-turn so click-to-open works.
     import re as _re
-    rows = _re.findall(r'<tr class="prompts-row" data-turn-id="([^"]+)"', html)
+    rows = _re.findall(r'<tr data-turn="([^"]+)"', html)
     assert len(rows) >= 1
     # Each row's key must match a Timeline row id="turn-<key>".
     for key in rows:
@@ -6368,10 +6368,10 @@ def test_html_omits_prompts_section_when_no_prompts():
         t["prompt_text"]    = ""
         t["prompt_snippet"] = ""
     html = sm.render_html(r, variant="single")
-    # CSS selectors for .prompts-table live in <style> always, but the actual
-    # markup (<table class="prompts-table">) must be gone.
-    assert '<table class="prompts-table">' not in html
-    assert '<details class="prompts-details"' not in html
+    # CSS selectors for .prompts live in <style> always, but the actual
+    # markup (<div class="prompts">) must be gone.
+    assert '<div class="prompts">' not in html
+    assert '<tr data-turn=' not in html
 
 
 def test_html_preserves_resume_marker_row_class():
@@ -6410,8 +6410,8 @@ def test_dashboard_variant_has_no_drawer_or_prompts_section():
     no turn-data JSON blob."""
     r = _build_fixture_report()
     html = sm.render_html(r, variant="dashboard")
-    assert 'id="turn-drawer"' not in html
-    assert '<table class="prompts-table">' not in html
+    assert 'id="drawer"' not in html
+    assert '<div class="prompts">' not in html
     assert '<script type="application/json" id="turn-data">' not in html
 
 
@@ -6738,7 +6738,7 @@ def test_render_html_instance_suppresses_drawer(instance_env):
     html, _ = _run_instance_capture_html(instance_env, drilldown=False)
     # The per-turn drawer is a detail-page artefact — it must not appear
     # in the instance index. Same for the turn-level data blob.
-    assert 'id="turn-drawer"' not in html
+    assert 'id="drawer"' not in html
     assert 'id="turn-data-json"' not in html
 
 
@@ -6910,8 +6910,8 @@ def test_render_chart_none_accepts_x_title():
 
 
 def test_render_html_instance_chart_uses_day_axis_label(instance_env):
-    """End-to-end: instance HTML chart section must label the axis as
-    'Day' (not 'Turn'), matching the 'one point per day' semantics."""
+    """End-to-end: instance HTML uses the daily cost rail (not Highcharts 3D).
+    One bar per calendar day showing daily cost, horizontally scrollable."""
     tmp_path, projects_dir = instance_env
     _make_instance_fixture(projects_dir, {
         "-home-user-alpha": [{"id": "a1", "turns": [
@@ -6929,13 +6929,17 @@ def test_render_html_instance_chart_uses_day_axis_label(instance_env):
     run = next(iter(
         (tmp_path / "exports" / "session-metrics" / "instance").iterdir()))
     html = (run / "index.html").read_text(encoding="utf-8")
-    # Highcharts writes the axis label into a `var X_TITLE = '…';`
-    # line inside the chart IIFE — assert it reads 'Day'.
-    assert "var X_TITLE = 'Day'" in html, (
-        "instance HTML chart x-axis label must be 'Day', not 'Turn'"
+    # Instance page uses the daily cost rail, not Highcharts 3D.
+    assert "Highcharts.chart(" not in html, (
+        "instance HTML must not contain Highcharts 3D chart"
     )
-    # And the body must NOT mention 'Turns 1–60' pagination labels —
-    # the instance scope's pagination, when shown, should say 'Days'.
-    assert "Turns 1\u20131" not in html and "Turns 1-1" not in html, (
-        "instance chart pagination header must say 'Days', not 'Turns'"
+    assert 'id="costail-data"' in html, (
+        "instance HTML must contain the daily cost rail JSON data blob"
+    )
+    assert 'id="costail-scroll"' in html, (
+        "instance HTML must contain the daily cost rail scroll container"
+    )
+    # The per-session chartrail must not appear on the instance page.
+    assert 'id="chartrail-data"' not in html, (
+        "instance HTML must not contain the per-session chartrail"
     )

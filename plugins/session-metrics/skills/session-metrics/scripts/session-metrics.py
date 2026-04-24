@@ -2858,40 +2858,28 @@ def _build_session_duration_html(sessions: list[dict], tz_label: str,
     for s, st in rows_data:
         sid = s["session_id"][:8]
         rows_html.append(
-            f'<tr><td style="padding:4px 10px;color:#e6edf3;font-family:monospace">{sid}\u2026</td>'
-            f'<td style="padding:4px 10px;color:#8b949e">{fmt_local(st["first_epoch"])}</td>'
-            f'<td style="padding:4px 10px;text-align:right;color:#e6edf3;'
-            f'font-variant-numeric:tabular-nums">{_fmt_duration(st["wall_sec"])}</td>'
-            f'<td style="padding:4px 10px;text-align:right;color:#e6edf3;'
-            f'font-variant-numeric:tabular-nums">{st["turns"]:,}</td>'
-            f'<td style="padding:4px 10px;text-align:right;color:#f0f6fc;'
-            f'font-variant-numeric:tabular-nums">${s["subtotal"]["cost"]:.3f}</td>'
-            f'<td style="padding:4px 10px;text-align:right;color:#8b949e;'
-            f'font-variant-numeric:tabular-nums">{st["tokens_per_min"]:,.0f}</td>'
-            f'<td style="padding:4px 10px;text-align:right;color:#8b949e;'
-            f'font-variant-numeric:tabular-nums">${st["cost_per_min"]:.3f}</td></tr>'
+            f'<tr><td class="mono">{sid}\u2026</td>'
+            f'<td class="mono">{fmt_local(st["first_epoch"])}</td>'
+            f'<td class="num mono">{_fmt_duration(st["wall_sec"])}</td>'
+            f'<td class="num">{st["turns"]:,}</td>'
+            f'<td class="num"><strong>${s["subtotal"]["cost"]:.3f}</strong></td>'
+            f'<td class="num muted">{st["tokens_per_min"]:,.0f}</td>'
+            f'<td class="num muted">${st["cost_per_min"]:.3f}</td></tr>'
         )
-    return f"""\
-<div id="session-duration" style="background:#161b22;border:1px solid #30363d;
-     border-radius:8px;padding:20px 24px;margin-bottom:28px">
-  <div style="color:#f0f6fc;font-size:13px;font-weight:600;text-transform:uppercase;
-       letter-spacing:0.05em;margin-bottom:14px">Session duration \u2014 newest first</div>
-  <table style="width:100%;border-collapse:collapse;font-size:12px">
-    <thead>
-      <tr style="color:#8b949e;text-transform:uppercase;font-size:10px;
-          letter-spacing:0.05em;border-bottom:1px solid #30363d">
-        <th style="padding:6px 10px;text-align:left">Session</th>
-        <th style="padding:6px 10px;text-align:left">First turn ({tz_label})</th>
-        <th style="padding:6px 10px;text-align:right">Wall</th>
-        <th style="padding:6px 10px;text-align:right">Turns</th>
-        <th style="padding:6px 10px;text-align:right">Cost</th>
-        <th style="padding:6px 10px;text-align:right">tok/min</th>
-        <th style="padding:6px 10px;text-align:right">$/min</th>
-      </tr>
-    </thead>
-    <tbody>{"".join(rows_html)}</tbody>
-  </table>
-</div>"""
+    return (
+        f'<section class="section" id="session-duration-section">\n'
+        f'  <div class="section-title"><h2>Session duration</h2>'
+        f'<span class="hint">top 10 by wall time ({tz_label})</span></div>\n'
+        f'  <div class="rollup" id="session-duration">\n'
+        f'  <table>\n'
+        f'    <thead><tr>\n'
+        f'      <th>Session</th><th>First turn ({tz_label})</th>'
+        f'<th class="num">Wall</th><th class="num">Turns</th>'
+        f'<th class="num">Cost</th><th class="num">tok/min</th><th class="num">$/min</th>\n'
+        f'    </tr></thead>\n'
+        f'    <tbody>{"".join(rows_html)}</tbody>\n'
+        f'  </table>\n  </div>\n</section>'
+    )
 
 
 def _fmt_delta_pct(cur: float, prev: float) -> tuple[str, str]:
@@ -2931,33 +2919,25 @@ def _build_weekly_rollup_html(rollup: dict) -> str:
     for label, cur_s, prev_s, cur_v, prev_v in metrics:
         delta, color = _fmt_delta_pct(cur_v, prev_v)
         rows.append(
-            f'<tr><td style="padding:6px 12px;color:#e6edf3">{label}</td>'
-            f'<td style="padding:6px 12px;text-align:right;color:#f0f6fc;'
-            f'font-variant-numeric:tabular-nums">{cur_s}</td>'
-            f'<td style="padding:6px 12px;text-align:right;color:#8b949e;'
-            f'font-variant-numeric:tabular-nums">{prev_s}</td>'
-            f'<td style="padding:6px 12px;text-align:right;color:{color};'
-            f'font-variant-numeric:tabular-nums">{delta}</td></tr>'
+            f'<tr><td>{label}</td>'
+            f'<td class="num"><strong>{cur_s}</strong></td>'
+            f'<td class="num muted">{prev_s}</td>'
+            f'<td class="num" style="color:{color}">{delta}</td></tr>'
         )
 
-    return f"""\
-<div id="weekly-rollup" style="background:#161b22;border:1px solid #30363d;
-     border-radius:8px;padding:20px 24px;margin-bottom:28px">
-  <div style="color:#f0f6fc;font-size:13px;font-weight:600;text-transform:uppercase;
-       letter-spacing:0.05em;margin-bottom:14px">Weekly roll-up</div>
-  <table style="width:100%;border-collapse:collapse;font-size:12px">
-    <thead>
-      <tr style="color:#8b949e;text-transform:uppercase;font-size:10px;
-          letter-spacing:0.05em;border-bottom:1px solid #30363d">
-        <th style="padding:6px 12px;text-align:left">Metric</th>
-        <th style="padding:6px 12px;text-align:right">Last 7d</th>
-        <th style="padding:6px 12px;text-align:right">Prior 7d</th>
-        <th style="padding:6px 12px;text-align:right">\u0394</th>
-      </tr>
-    </thead>
-    <tbody>{"".join(rows)}</tbody>
-  </table>
-</div>"""
+    return (
+        '<section class="section" id="weekly-rollup-section">\n'
+        '  <div class="section-title"><h2>Weekly rollup</h2>'
+        '<span class="hint">trailing 7d vs prior 7d</span></div>\n'
+        '  <div class="rollup" id="weekly-rollup">\n'
+        '  <table>\n'
+        '    <thead><tr>'
+        '<th>Metric</th><th class="num">Last 7d</th>'
+        '<th class="num">Prior 7d</th><th class="num">\u0394</th>'
+        '</tr></thead>\n'
+        f'    <tbody>{"".join(rows)}</tbody>\n'
+        '  </table>\n  </div>\n</section>'
+    )
 
 
 def _build_session_blocks_html(
@@ -2984,62 +2964,42 @@ def _build_session_blocks_html(
     s30 = summary.get("trailing_30", 0)
     tot = summary.get("total", len(blocks))
     recent = list(reversed(blocks[-12:]))
-    rows = "".join(
-        f'<tr><td style="padding:4px 10px;color:#e6edf3">{fmt_local(b["anchor_epoch"])}</td>'
-        f'<td style="padding:4px 10px;color:#8b949e;text-align:right;'
-        f'font-variant-numeric:tabular-nums">{b["elapsed_min"]:.0f}m</td>'
-        f'<td style="padding:4px 10px;color:#e6edf3;text-align:right;'
-        f'font-variant-numeric:tabular-nums">{b["turn_count"]:,}</td>'
-        f'<td style="padding:4px 10px;color:#e6edf3;text-align:right;'
-        f'font-variant-numeric:tabular-nums">{b["user_msg_count"]:,}</td>'
-        f'<td style="padding:4px 10px;color:#f0f6fc;text-align:right;'
-        f'font-variant-numeric:tabular-nums">${b["cost_usd"]:.3f}</td>'
-        f'<td style="padding:4px 10px;color:#8b949e;text-align:right;'
-        f'font-variant-numeric:tabular-nums">{len(b["sessions_touched"])}</td></tr>'
+
+    # Determine max cost for the block-row bars (preview .block-row pattern)
+    max_cost = max((b["cost_usd"] for b in recent), default=0.0) or 1.0
+    block_rows = "".join(
+        f'<div class="block-row">'
+        f'<span class="label">{fmt_local(b["anchor_epoch"])}</span>'
+        f'<div class="bar"><div class="bar-fill" '
+        f'style="width:{min(100, int(b["cost_usd"] / max_cost * 100))}%"></div></div>'
+        f'<span class="num mono">${b["cost_usd"]:.3f}</span>'
+        f'<span class="num mono">{b["turn_count"]:,} turns</span>'
+        f'</div>'
         for b in recent
     )
 
-    def card(label: str, value: str, hint: str = "") -> str:
-        hint_html = (f'<span style="color:#8b949e;font-size:10px;margin-left:6px">'
-                     f'{hint}</span>') if hint else ""
-        return (
-            f'<div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;'
-            f'padding:12px 16px;min-width:140px">'
-            f'<div style="color:#8b949e;font-size:10px;text-transform:uppercase;'
-            f'letter-spacing:0.05em;margin-bottom:4px">{label}</div>'
-            f'<div style="color:#f0f6fc;font-size:24px;font-weight:600;'
-            f'font-variant-numeric:tabular-nums">{value}{hint_html}</div></div>'
-        )
+    # Kpi-style stat cards for the trailing-window counts
+    stat_card = lambda label, value: (
+        f'<div class="kpi cat-time" style="min-height:auto;padding:12px 16px;min-width:140px">'
+        f'<div class="kpi-label">{label}</div>'
+        f'<div class="kpi-val">{value}</div></div>'
+    )
 
-    return f"""\
-<div id="session-blocks" style="background:#161b22;border:1px solid #30363d;
-     border-radius:8px;padding:20px 24px;margin-bottom:28px">
-  <div style="color:#f0f6fc;font-size:13px;font-weight:600;text-transform:uppercase;
-       letter-spacing:0.05em;margin-bottom:14px">5-hour session blocks</div>
-  <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px">
-    {card("Last 7 days", f"{s7}")}
-    {card("Last 14 days", f"{s14}")}
-    {card("Last 30 days", f"{s30}")}
-    {card("All time", f"{tot}")}
-  </div>
-  <div style="color:#8b949e;font-size:11px;margin-bottom:8px">
-    Recent blocks ({tz_label}) \u2014 a new block starts 5h after the previous anchor.
-  </div>
-  <table style="width:100%;border-collapse:collapse;font-size:12px">
-    <thead>
-      <tr style="color:#8b949e;text-transform:uppercase;font-size:10px;
-          letter-spacing:0.05em;border-bottom:1px solid #30363d">
-        <th style="padding:6px 10px;text-align:left">Anchor</th>
-        <th style="padding:6px 10px;text-align:right">Duration</th>
-        <th style="padding:6px 10px;text-align:right">Turns</th>
-        <th style="padding:6px 10px;text-align:right">Prompts</th>
-        <th style="padding:6px 10px;text-align:right">Cost</th>
-        <th style="padding:6px 10px;text-align:right">Sessions</th>
-      </tr>
-    </thead>
-    <tbody>{rows}</tbody>
-  </table>
-</div>"""
+    return (
+        '<section class="section" id="session-blocks-section">\n'
+        '  <div class="section-title"><h2>5-hour session blocks</h2>'
+        f'<span class="hint">recent blocks · {tz_label}</span></div>\n'
+        '  <div id="session-blocks" class="blocks">\n'
+        '  <div class="grid kpi-grid" '
+        'style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:16px">\n'
+        f'    {stat_card("Last 7 days", s7)}\n'
+        f'    {stat_card("Last 14 days", s14)}\n'
+        f'    {stat_card("Last 30 days", s30)}\n'
+        f'    {stat_card("All time", tot)}\n'
+        '  </div>\n'
+        f'  {block_rows}\n'
+        '  </div>\n</section>'
+    )
 
 
 def _build_hour_of_day_html(tod: dict, tz_label: str = "UTC",
@@ -3078,19 +3038,20 @@ def _build_hour_of_day_html(tod: dict, tz_label: str = "UTC",
         )
 
     return f"""\
-<div id="hod-chart" style="background:#161b22;border:1px solid #30363d;
-     border-radius:8px;padding:20px 24px;margin-bottom:28px">
+<section class="section" id="hod-section">
+  <div class="section-title"><h2>Hour of day</h2>
+    <span class="hint">user messages</span></div>
+  <div id="hod-chart" class="chart-card">
   <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;flex-wrap:wrap">
-    <span style="color:#f0f6fc;font-size:13px;font-weight:600;text-transform:uppercase;
-          letter-spacing:0.05em">Hour of day</span>
-    <select id="hod-tz" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;
-            border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer">{tz_options}</select>
-    <span style="color:#8b949e;font-size:11px">Peak:
-      <strong id="hod-peak" style="color:#e6edf3">-</strong></span>
+    <select id="hod-tz" class="tod-tz" style="background:var(--bg);color:var(--fg);
+            border:1px solid var(--border);border-radius:6px;padding:6px 10px;
+            font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">{tz_options}</select>
+    <span class="mono muted" style="font-size:11px">Peak:
+      <strong id="hod-peak" class="mono" style="opacity:1">-</strong></span>
     {peak_legend}
   </div>
-  <div id="hod-wrap" style="position:relative;height:140px;
-       border-bottom:1px solid #30363d;padding-bottom:2px">
+  <div id="hod-wrap" style="position:relative;height:160px;
+       border-bottom:1px solid var(--border-dim);padding-bottom:2px">
     <div id="hod-peak-band1" style="position:absolute;top:0;bottom:0;
          background:rgba(239,197,75,0.12);border-left:1px dashed rgba(239,197,75,0.35);
          border-right:1px dashed rgba(239,197,75,0.35);display:none;pointer-events:none"></div>
@@ -3100,11 +3061,11 @@ def _build_hour_of_day_html(tod: dict, tz_label: str = "UTC",
     <div id="hod-bars" style="position:relative;display:flex;align-items:flex-end;
          gap:2px;height:100%"></div>
   </div>
-  <div style="display:flex;gap:2px;margin-top:6px;color:#8b949e;
-       font-size:10px;font-variant-numeric:tabular-nums">
+  <div class="mono muted" style="display:flex;gap:2px;margin-top:6px;font-size:10px">
     {"".join(f'<div style="flex:1;text-align:center">{h:02d}</div>' for h in range(24))}
   </div>
-</div>
+  </div>
+</section>
 <script>
 (function(){{
   var TS={ts_json};
@@ -3113,8 +3074,8 @@ def _build_hour_of_day_html(tod: dict, tz_label: str = "UTC",
   var bs=[];
   for(var i=0;i<24;i++){{
     var b=document.createElement('div');
-    b.style.cssText='flex:1;background:#8b5cf6;border-radius:2px 2px 0 0;'+
-      'min-height:1px;transition:height 0.25s ease;position:relative';
+    b.style.cssText='flex:1;background:var(--accent);border-radius:2px 2px 0 0;'+
+      'min-height:1px;transition:height 0.25s ease;position:relative;opacity:.9';
     b.title=(i<10?'0':'')+i+':00';
     bars.appendChild(b);bs.push(b);
   }}
@@ -3180,38 +3141,34 @@ def _build_punchcard_html(tod: dict, tz_label: str = "UTC",
     days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     cells = []
     for r in range(7):
-        row = []
-        row.append(f'<div style="color:#8b949e;font-size:10px;width:30px;'
-                   f'text-align:right;padding-right:6px;align-self:center">{days[r]}</div>')
+        row = [f'<div class="punch-day">{days[r]}</div>']
         for h in range(24):
-            row.append(f'<div class="pc-cell" data-r="{r}" data-h="{h}" '
-                       f'style="flex:1;height:18px;display:flex;align-items:center;'
-                       f'justify-content:center">'
-                       f'<div class="pc-dot" style="width:2px;height:2px;background:#30363d;'
-                       f'border-radius:50%;transition:all 0.2s ease"></div></div>')
-        cells.append('<div style="display:flex;align-items:center">' + "".join(row) + "</div>")
-    hour_header = ('<div style="display:flex;color:#8b949e;font-size:10px;margin-bottom:4px">'
-                   '<div style="width:30px"></div>'
-                   + "".join(f'<div style="flex:1;text-align:center">{h:02d}</div>' for h in range(24))
+            row.append(f'<div class="punch-cell" data-r="{r}" data-h="{h}">'
+                       f'<div class="punch-dot"></div></div>')
+        cells.append('<div class="punch-row">' + "".join(row) + "</div>")
+    hour_header = ('<div class="punch-row punch-head">'
+                   '<div class="punch-day"></div>'
+                   + "".join(f'<div class="punch-hour">{h:02d}</div>' for h in range(24))
                    + '</div>')
     return f"""\
-<div id="punchcard" style="background:#161b22;border:1px solid #30363d;
-     border-radius:8px;padding:20px 24px;margin-bottom:28px">
-  <div style="display:flex;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap">
-    <span style="color:#f0f6fc;font-size:13px;font-weight:600;text-transform:uppercase;
-          letter-spacing:0.05em">Weekday \u00d7 hour</span>
-    <select id="pc-tz" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;
-            border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer">{tz_options}</select>
-    <span style="color:#8b949e;font-size:11px">Busiest:
-      <strong id="pc-busy" style="color:#e6edf3">-</strong></span>
+<section class="section">
+  <div class="section-title"><h2>Weekday \u00d7 hour</h2>
+    <span class="hint">punchcard of user messages</span></div>
+  <div id="punchcard" class="punch">
+    <div class="punch-head-row">
+      <select id="pc-tz" class="tz-select">{tz_options}</select>
+      <span class="muted">Busiest: <strong id="pc-busy" class="mono">-</strong></span>
+    </div>
+    <div class="punch-grid">
+      {hour_header}
+      {"".join(cells)}
+    </div>
   </div>
-  {hour_header}
-  {"".join(cells)}
-</div>
+</section>
 <script>
 (function(){{
   var TS={ts_json};
-  var cells=document.querySelectorAll('#punchcard .pc-cell');
+  var cells=document.querySelectorAll('#punchcard .punch-cell');
   function render(off){{
     var m=[];for(var r=0;r<7;r++){{m.push(new Array(24));for(var k=0;k<24;k++)m[r][k]=0;}}
     var s=off*3600,mx=0,busyR=0,busyH=0;
@@ -3224,15 +3181,17 @@ def _build_punchcard_html(tod: dict, tz_label: str = "UTC",
       if(m[w][h]>mx){{mx=m[w][h];busyR=w;busyH=h;}}
     }}
     mx=mx||1;
+    var accent=getComputedStyle(document.body).getPropertyValue('--accent').trim()||'#A58BFF';
+    var dim=getComputedStyle(document.body).getPropertyValue('--border').trim()||'#30363d';
     cells.forEach(function(el){{
       var r=+el.dataset.r,h=+el.dataset.h,v=m[r][h];
       var dot=el.firstChild;
       if(v===0){{
-        dot.style.width='2px';dot.style.height='2px';dot.style.background='#30363d';
+        dot.style.width='2px';dot.style.height='2px';dot.style.background=dim;
       }}else{{
         var sz=Math.max(4,Math.min(14,4+v/mx*10));
-        dot.style.width=sz+'px';dot.style.height=sz+'px';dot.style.background='#8b5cf6';
-        el.title=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][r]+' '+(h<10?'0':'')+h+':00 — '+v;
+        dot.style.width=sz+'px';dot.style.height=sz+'px';dot.style.background=accent;
+        el.title=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][r]+' '+(h<10?'0':'')+h+':00 \u2014 '+v;
       }}
     }});
     var DAYS=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
@@ -3301,55 +3260,38 @@ def _build_tod_heatmap_html(tod: dict, tz_label: str = "UTC",
     tz_options = _tz_dropdown_options(default_offset_hours, tz_label)
 
     return f"""\
-<div id="tod-container" style="background:#161b22;border:1px solid #30363d;
-     border-radius:8px;padding:20px 24px;margin-bottom:28px">
-  <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;flex-wrap:wrap">
-    <span style="color:#f0f6fc;font-size:13px;font-weight:600;text-transform:uppercase;
-          letter-spacing:0.05em">User Messages by Time of Day</span>
-    <select id="tod-tz" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;
-            border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer">{tz_options}</select>
-    <span style="color:#8b949e;font-size:11px">Total:
-      <strong id="tod-total" style="color:#e6edf3">0</strong></span>
-  </div>
-  <div style="display:flex;flex-direction:column;gap:10px">
-    <div style="display:flex;align-items:center;gap:10px">
-      <span style="color:#8b949e;font-size:12px;width:110px;text-align:right">Morning (6\u201312)</span>
-      <div style="flex:1;position:relative;height:22px;background:#21262d;border-radius:3px">
-        <div id="tod-bar-morning" style="height:100%;background:#8b5cf6;border-radius:3px;
-             min-width:2px;transition:width 0.25s ease"></div>
-      </div>
-      <span id="tod-cnt-morning" style="color:#e6edf3;font-size:12px;min-width:48px;
-            text-align:right;font-variant-numeric:tabular-nums">0</span>
+<section class="section">
+  <div class="section-title"><h2>User messages by time of day</h2>
+    <span class="hint">day-part distribution</span></div>
+  <div id="tod-container" class="tod">
+    <div class="tod-head">
+      <select id="tod-tz" class="tod-tz">{tz_options}</select>
+      <span class="muted">Total: <strong id="tod-total" class="tod-total mono">0</strong></span>
     </div>
-    <div style="display:flex;align-items:center;gap:10px">
-      <span style="color:#8b949e;font-size:12px;width:110px;text-align:right">Afternoon (12\u201318)</span>
-      <div style="flex:1;position:relative;height:22px;background:#21262d;border-radius:3px">
-        <div id="tod-bar-afternoon" style="height:100%;background:#8b5cf6;border-radius:3px;
-             min-width:2px;transition:width 0.25s ease"></div>
+    <div class="tod-rows">
+      <div class="tod-row">
+        <span class="tod-label">Morning (6\u201312)</span>
+        <div class="tod-track"><div id="tod-bar-morning" class="tod-fill"></div></div>
+        <span id="tod-cnt-morning" class="tod-cnt mono">0</span>
       </div>
-      <span id="tod-cnt-afternoon" style="color:#e6edf3;font-size:12px;min-width:48px;
-            text-align:right;font-variant-numeric:tabular-nums">0</span>
-    </div>
-    <div style="display:flex;align-items:center;gap:10px">
-      <span style="color:#8b949e;font-size:12px;width:110px;text-align:right">Evening (18\u201324)</span>
-      <div style="flex:1;position:relative;height:22px;background:#21262d;border-radius:3px">
-        <div id="tod-bar-evening" style="height:100%;background:#8b5cf6;border-radius:3px;
-             min-width:2px;transition:width 0.25s ease"></div>
+      <div class="tod-row">
+        <span class="tod-label">Afternoon (12\u201318)</span>
+        <div class="tod-track"><div id="tod-bar-afternoon" class="tod-fill"></div></div>
+        <span id="tod-cnt-afternoon" class="tod-cnt mono">0</span>
       </div>
-      <span id="tod-cnt-evening" style="color:#e6edf3;font-size:12px;min-width:48px;
-            text-align:right;font-variant-numeric:tabular-nums">0</span>
-    </div>
-    <div style="display:flex;align-items:center;gap:10px">
-      <span style="color:#8b949e;font-size:12px;width:110px;text-align:right">Night (0\u20136)</span>
-      <div style="flex:1;position:relative;height:22px;background:#21262d;border-radius:3px">
-        <div id="tod-bar-night" style="height:100%;background:#8b5cf6;border-radius:3px;
-             min-width:2px;transition:width 0.25s ease"></div>
+      <div class="tod-row">
+        <span class="tod-label">Evening (18\u201324)</span>
+        <div class="tod-track"><div id="tod-bar-evening" class="tod-fill"></div></div>
+        <span id="tod-cnt-evening" class="tod-cnt mono">0</span>
       </div>
-      <span id="tod-cnt-night" style="color:#e6edf3;font-size:12px;min-width:48px;
-            text-align:right;font-variant-numeric:tabular-nums">0</span>
+      <div class="tod-row">
+        <span class="tod-label">Night (0\u20136)</span>
+        <div class="tod-track"><div id="tod-bar-night" class="tod-fill"></div></div>
+        <span id="tod-cnt-night" class="tod-cnt mono">0</span>
+      </div>
     </div>
   </div>
-</div>
+</section>
 <script>
 (function(){{
   var TS={ts_json};
@@ -3808,7 +3750,7 @@ def _render_chart_uplot(all_turns: list[dict],
                   border-top: 1px solid #30363d; padding: 6px 8px; }
       .u-legend .u-marker { border-radius: 2px; }
       .u-axis { color: #8b949e; }
-      .u-cursor-pt { border-color: #58a6ff !important; }
+      .u-cursor-pt { border-color: var(--accent, #58a6ff) !important; }
     """
 
     init = f"""\
@@ -4130,6 +4072,947 @@ def _build_usage_insights_md(insights: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Theme layer — 4 themes (Beacon / Console / Lattice / Pulse) bundled in
+# every HTML export, with a top-right picker. Ported from
+# examples/claude-design-html-templates/variants-v1/{dashboard,detail}.html
+# and layered over the existing class names (.cards/.card/.timeline-table/
+# .turn-drawer/.prompts-table/.usage-insights/...) so the rewrite preserves
+# every data contract the test suite asserts on while still producing the
+# preview's visual output under each theme.
+#
+# Three helpers:
+#   _theme_css()                 — full <style>...</style> block (base + 4 themes)
+#   _theme_picker_markup()       — 4-button switcher for top-right
+#   _theme_bootstrap_head_js()   — pre-paint hash/localStorage read (in <head>)
+#   _theme_bootstrap_body_js()   — click handler + nav-forward (end of <body>)
+# ---------------------------------------------------------------------------
+
+def _theme_css() -> str:
+    """Return the full themed stylesheet as a ``<style>...</style>`` block.
+
+    Structure:
+    - base reset + shared layout primitives (shell, page-header, topbar, nav,
+      switcher, kpi grid, chart-card, punch, tod, rollup, blocks, chart-rail,
+      timeline-table, drawer, prompts, foot)
+    - four ``body.theme-<name>`` override blocks with matching colour tokens
+    - legacy-class overlays (``.cards``/``.card``/``.usage-insights``/
+      ``.turn-drawer``/``.prompts-table``/``.models-table``/timeline
+      ``<table>`` inside ``.timeline-table`` etc.) mapped into theme
+      surfaces so the Python renderer's existing f-string output keeps
+      working under every theme.
+
+    Intentionally kept as a non-f-string raw string so literal CSS braces
+    don't need escaping.
+    """
+    return r"""<style>
+/* =========================================================================
+   BASE — shared reset, layout primitives, components
+   ========================================================================= */
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{min-height:100vh;font-family:'Inter',system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;transition:background-color .15s ease,color .15s ease;font-size:13px;zoom:1.25}
+a{color:inherit;text-decoration:none}
+.mono{font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.muted{opacity:.6}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+
+/* Outer frame */
+.shell{max-width:1440px;margin:0 auto;padding:32px 40px 80px}
+.page-header{display:flex;align-items:baseline;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:32px}
+.page-header h1{margin:0;font-family:'Inter Tight','Inter',sans-serif;font-weight:600;font-size:28px;letter-spacing:-.02em}
+.page-header .meta{font-family:'JetBrains Mono',monospace;font-size:12px;opacity:.65;text-align:right}
+.crumbs{display:flex;gap:12px;align-items:center;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;opacity:.65;margin-bottom:10px;flex-wrap:wrap}
+.crumbs .sep{opacity:.35}
+
+.topbar{position:sticky;top:0;z-index:40;display:flex;justify-content:space-between;align-items:center;padding:14px 24px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+.topbar .brand{display:flex;gap:10px;align-items:center;font-family:'JetBrains Mono',monospace;font-size:12px;letter-spacing:.16em;text-transform:uppercase}
+.topbar .brand .dot{width:8px;height:8px;border-radius:50%}
+.topbar .nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.navlink{padding:6px 12px;border-radius:999px;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase;transition:all .15s ease}
+.navlink.current{pointer-events:none}
+
+.switcher{display:flex;gap:4px;padding:4px;border-radius:999px;margin-left:12px;flex-shrink:0}
+.switcher button{padding:6px 12px;border-radius:999px;font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;transition:all .15s ease;cursor:pointer;border:none;background:transparent}
+
+.section{margin-top:40px}
+.section-title{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-bottom:16px}
+.section-title h2{margin:0;font-family:'Inter Tight','Inter',sans-serif;font-weight:600;font-size:18px;letter-spacing:-.01em}
+.section-title .hint{font-family:'JetBrains Mono',monospace;font-size:11px;opacity:.55}
+
+/* KPI grid + preview KPI cards */
+.kpi-grid{display:grid;gap:16px;grid-template-columns:repeat(4,1fr)}
+.kpi{padding:18px;border-radius:14px;position:relative;overflow:hidden;display:flex;flex-direction:column;gap:6px;min-height:100px}
+.kpi .kpi-label{font-size:11px;letter-spacing:.1em;text-transform:uppercase;opacity:.7}
+.kpi .kpi-val{font-family:'Inter Tight','Inter',sans-serif;font-weight:600;font-size:26px;letter-spacing:-.02em;line-height:1}
+.kpi .kpi-sub{font-family:'JetBrains Mono',monospace;font-size:10px;opacity:.6;margin-top:auto}
+.kpi .kpi-delta{font-family:'JetBrains Mono',monospace;font-size:10px}
+.kpi .kpi-delta.up{color:#4ADE80}
+.kpi .kpi-delta.down{color:#F87171}
+
+/* Legacy ".cards"/".card" — maps into KPI-style surfaces */
+.cards{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));margin:0 0 24px 0}
+.cards .card{padding:14px 18px;border-radius:10px;min-width:0;position:relative}
+.cards .card .val{font-family:'Inter Tight','Inter',sans-serif;font-weight:700;font-size:22px;line-height:1.1}
+.cards .card .lbl{font-size:11px;margin-top:4px;opacity:.7;letter-spacing:.02em}
+
+/* Insights details panel (preview) */
+details.insights{border-radius:12px;padding:0;overflow:hidden;margin-bottom:20px}
+details.insights summary{cursor:pointer;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;list-style:none;font-family:'Inter Tight','Inter',sans-serif;font-weight:500;font-size:14px}
+details.insights summary::-webkit-details-marker{display:none}
+details.insights summary .toggle{font-family:'JetBrains Mono',monospace;font-size:11px;opacity:.5;transition:transform .2s ease}
+details.insights[open] summary .toggle{transform:rotate(90deg)}
+details.insights .body{padding:4px 20px 20px;font-size:13px;line-height:1.65;opacity:.88}
+details.insights .body ul{margin:0;padding-left:22px}
+details.insights .body li{margin:6px 0}
+
+/* Legacy .usage-insights wrapper — styled through theme rules */
+.usage-insights{margin:0 0 24px;padding:14px 18px;border-radius:12px}
+.usage-insights .ui-top{font-size:13px;line-height:1.55;margin:0}
+.usage-insights .ui-top strong{font-size:15px;font-weight:600;margin-right:6px}
+.usage-insights details{margin-top:10px;padding-top:8px;border-top:1px solid var(--border-dim)}
+.usage-insights details > summary{list-style:none;cursor:pointer;font-size:12px;padding:4px 0;user-select:none;opacity:.75}
+.usage-insights details > summary::-webkit-details-marker{display:none}
+.usage-insights details > summary::before{content:"\25b8  ";font-size:10px;margin-right:4px}
+.usage-insights details[open] > summary::before{content:"\25be  "}
+.usage-insights ul.ui-list{list-style:none;padding:6px 0 0;margin:0}
+.usage-insights ul.ui-list li{padding:7px 0;font-size:12px;line-height:1.5;border-top:1px dashed var(--border-dim)}
+.usage-insights ul.ui-list li:first-child{border-top:none}
+.usage-insights ul.ui-list li strong{font-weight:600;margin-right:6px}
+
+/* Rollup / blocks / chart cards / punch / tod */
+.rollup{padding:16px 20px;border-radius:12px}
+.rollup table{width:100%;border-collapse:collapse;font-size:12px;font-family:'JetBrains Mono',monospace}
+.rollup th,.rollup td{padding:8px 10px;text-align:right}
+.rollup th:first-child,.rollup td:first-child{text-align:left}
+.rollup thead th{font-weight:500;font-size:10px;letter-spacing:.1em;text-transform:uppercase;opacity:.55;border-bottom:1px solid var(--border);padding-bottom:10px}
+.rollup tbody tr:hover td{background:var(--hover,transparent)}
+
+.blocks{padding:16px 20px;border-radius:12px}
+.block-row{display:grid;grid-template-columns:120px 1fr 80px 80px;gap:14px;align-items:center;padding:8px 0;font-size:12px;border-bottom:1px solid var(--border-dim)}
+.block-row:last-child{border-bottom:0}
+.block-row .label{font-family:'JetBrains Mono',monospace;opacity:.75}
+.block-row .bar{height:8px;border-radius:4px;background:var(--bar-bg);overflow:hidden}
+.block-row .bar-fill{height:100%;border-radius:4px;background:var(--accent)}
+
+.chart-card{padding:16px 20px;border-radius:12px}
+.chart-card .chart-body{width:100%;height:200px}
+.chart-card svg{width:100%;height:100%;display:block}
+
+.punch{padding:16px 20px;border-radius:12px;overflow-x:auto}
+.punch-grid{min-width:580px}
+.punch-row{display:flex;align-items:center;gap:3px;margin-bottom:3px}
+.punch-day{flex:0 0 38px;font-family:'JetBrains Mono',monospace;font-size:10px;opacity:.45;text-align:right;padding-right:6px;white-space:nowrap}
+.punch-hour{flex:1;font-family:'JetBrains Mono',monospace;font-size:9px;opacity:.45;text-align:center;overflow:hidden}
+.punch-cell{flex:1;aspect-ratio:1;border-radius:3px;background:var(--punch-empty);display:flex;align-items:center;justify-content:center;min-width:0}
+.punch-dot{border-radius:50%;transition:all .2s ease}
+.punch-head-row{display:flex;align-items:center;gap:14px;margin-bottom:10px;flex-wrap:wrap}
+.tz-select{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer}
+.tz-select:focus{outline:none;border-color:var(--accent)}
+
+.tod{padding:16px 20px;border-radius:12px}
+.tod-head{display:flex;align-items:center;gap:14px;margin-bottom:14px;flex-wrap:wrap}
+.tod-head .tod-tz{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer}
+.tod-head .tod-tz:focus{outline:none;border-color:var(--accent)}
+.tod-head .tod-total{font-family:'JetBrains Mono',monospace;font-size:11px;opacity:.65}
+.tod-head .tod-total strong{opacity:1;font-weight:500}
+.tod-rows{display:flex;flex-direction:column;gap:8px}
+.tod-row{display:grid;grid-template-columns:130px 1fr 60px;align-items:center;gap:12px}
+.tod-row .tod-label{font-family:'Inter',sans-serif;font-size:12px;opacity:.65;text-align:right}
+.tod-row .tod-track{position:relative;height:20px;background:var(--punch-empty);border-radius:4px;overflow:hidden}
+.tod-row .tod-fill{position:absolute;top:0;left:0;height:100%;background:var(--accent);border-radius:4px;min-width:2px;transition:width .25s ease}
+.tod-row .tod-cnt{font-family:'JetBrains Mono',monospace;font-size:12px;text-align:right;opacity:.9;font-variant-numeric:tabular-nums}
+
+/* Tables (legacy generic) — kept for Timeline / Prompts / Models */
+table{width:100%;border-collapse:collapse;font-size:12px}
+h1{font-size:22px;font-weight:600;margin:0 0 6px}
+h2{font-size:15px;font-weight:600;margin:24px 0 12px;font-family:'Inter Tight','Inter',sans-serif;letter-spacing:-.005em}
+h2 .legend{font-size:11px;font-weight:400;margin-left:10px;opacity:.6}
+h2 .legend code{border-radius:3px;padding:0 4px;font-size:10px}
+h2 .legend b{font-weight:600;opacity:.9}
+
+.meta{font-size:11px;margin-bottom:20px;opacity:.65}
+.meta code{border-radius:3px;padding:0 5px;font-size:10px}
+
+th{font-weight:500;text-align:left;padding:8px 10px;white-space:nowrap;font-size:11px;letter-spacing:.04em;opacity:.75}
+td{padding:6px 10px;vertical-align:middle}
+tr:hover td{background:var(--hover,transparent)}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+td.ts{white-space:nowrap;opacity:.75}
+td.model{font-size:11px}
+td.cost{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.bar{display:inline-block;height:7px;border-radius:2px;margin-right:6px;vertical-align:middle}
+tr.session-header{cursor:pointer}
+tr.session-header td{padding:10px 12px;font-size:12px}
+tr.session-header:hover td{filter:brightness(1.15)}
+.toggle-arrow{display:inline-block;font-size:10px;transition:transform .15s;margin-right:4px}
+tr.session-header.open .toggle-arrow{transform:rotate(90deg)}
+tr.subtotal td{font-weight:600}
+.models-table{padding:14px 16px;border-radius:12px}
+.models-table table{font-size:12px;font-family:'JetBrains Mono',monospace}
+.models-table code{font-size:11px}
+.models-table th,.models-table td{padding:7px 12px}
+
+td.mode-fast{font-size:10px;font-weight:600}
+td.mode-std{font-size:10px;opacity:.55}
+
+/* TTL + content-block badges (existing contract) */
+.badge-ttl{display:inline-block;margin-left:6px;padding:0 5px;font-size:9px;font-weight:600;letter-spacing:.06em;border-radius:3px;vertical-align:middle;cursor:help}
+.badge-ttl.ttl-1h{background:rgba(165,139,255,.18);color:var(--accent)}
+.badge-ttl.ttl-mix{background:rgba(251,191,36,.18);color:#FBBF24}
+td.content-blocks,th.content-blocks{font-variant-numeric:tabular-nums;font-family:'JetBrains Mono',monospace;font-size:11px;white-space:nowrap;cursor:help;opacity:.85}
+td.content-blocks.muted{opacity:.35;cursor:default}
+
+.legend-block{font-size:11px;margin:-4px 0 12px;padding:8px 12px;border-radius:6px;line-height:1.6;opacity:.85}
+.legend-block b{font-weight:600}
+.legend-block code{border-radius:3px;padding:0 4px;font-size:10px}
+
+.chart-page-label{font-size:11px;padding:8px 12px 0;margin-top:4px;opacity:.65}
+
+/* Resume markers */
+tr.resume-marker-row td{padding:6px 10px;border-top:1px dashed var(--border);border-bottom:1px dashed var(--border)}
+tr.resume-marker-row td.resume-marker-idx{color:var(--accent);opacity:.7}
+tr.resume-marker-row td.resume-marker-cell{text-align:center;font-size:12px;opacity:.8}
+.resume-marker-pill{display:inline-flex;align-items:center;gap:8px;padding:3px 10px;border-radius:12px;cursor:help;background:rgba(165,139,255,.08);border:1px solid rgba(165,139,255,.28)}
+.resume-marker-pill strong{color:var(--accent);font-weight:600;font-size:12px;letter-spacing:.2px}
+.resume-marker-pill .resume-marker-icon{color:var(--accent);font-size:14px;line-height:1}
+.resume-marker-pill .resume-marker-time{font-size:11px;opacity:.7;font-variant-numeric:tabular-nums}
+.resume-marker-pill.terminal{background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.4)}
+.resume-marker-pill.terminal strong,.resume-marker-pill.terminal .resume-marker-icon{color:#FBBF24}
+
+tr.turn-row{cursor:pointer}
+tr.turn-row:focus{outline:1px solid var(--accent);outline-offset:-1px}
+
+/* Chart container + controls */
+#chart-container{border-radius:12px;margin-bottom:24px;min-height:420px;overflow:hidden}
+.chart-controls{display:flex;gap:10px;align-items:center;padding:10px 16px 0;flex-wrap:wrap}
+.chart-controls label{font-size:11px;display:flex;align-items:center;gap:5px;cursor:pointer;opacity:.75}
+.chart-controls input[type=range]{width:120px;accent-color:var(--accent)}
+.chart-controls span{font-size:11px;color:var(--accent);min-width:28px}
+
+/* Turn drawer (preview) */
+.drawer{position:fixed;top:0;right:0;height:100vh;width:min(520px,100%);transform:translateX(100%);transition:transform .25s cubic-bezier(.2,.8,.2,1);z-index:1000;display:flex;flex-direction:column;overflow:hidden;border-left:1px solid var(--border)}
+.drawer.open{transform:translateX(0)}
+.drawer-head{padding:24px 24px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:baseline;gap:16px}
+.drawer-head h3{margin:0;font-family:'Inter Tight','Inter',sans-serif;font-weight:600;font-size:20px}
+.drawer-head .x{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;font-size:18px;opacity:.6;background:none;border:0;cursor:pointer;color:inherit}
+.drawer-head .x:hover{opacity:1;background:var(--hover,rgba(255,255,255,.05))}
+.drawer-body{flex:1;overflow-y:auto;padding:20px 24px 32px}
+.drawer-sec{margin-bottom:20px}
+.drawer-sec h4{margin:0 0 8px;font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;opacity:.55;font-weight:500}
+.drawer-kv{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-family:'JetBrains Mono',monospace;font-size:12px;margin:0}
+.drawer-kv dt{opacity:.55}
+.drawer-kv dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;word-break:break-word}
+.drawer-prompt{padding:14px;border-radius:8px;background:var(--surface-deep,var(--border-dim));font-family:'JetBrains Mono',Menlo,Consolas,monospace;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;max-height:260px;overflow-y:auto;border:1px solid var(--border)}
+.drawer-more{margin-top:8px;border:1px solid var(--border);padding:4px 10px;font-size:11px;border-radius:4px;cursor:pointer;color:var(--accent);background:none}
+.drawer-more:hover{border-color:var(--accent)}
+.drawer-tools-list{list-style:none;padding:0;margin:0;font-family:'JetBrains Mono',monospace;font-size:11px}
+.drawer-tools-list li{padding:5px 0;border-top:1px dashed var(--border-dim)}
+.drawer-tools-list li:first-child{border-top:none}
+.drawer-tool-preview{font-size:10px;opacity:.7;margin-left:6px;word-break:break-word}
+.drawer-savings{color:#3fb950;font-size:11px;margin-top:6px;font-family:'JetBrains Mono',monospace}
+.drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .2s ease;z-index:999}
+.drawer-backdrop.open{opacity:1;pointer-events:auto}
+
+/* Chart-rail (horizontally-scrollable per-turn column chart) */
+.chartrail-card{padding:20px 20px 16px;border-radius:20px;position:relative;--bar-h:200px;--head-h:0px;--foot-h:44px;--col-gap:4px}
+.chartrail-legend{display:flex;gap:16px;flex-wrap:wrap;font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;opacity:.7;margin-bottom:14px}
+.chartrail-legend .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+.chartrail-legend .sw.i{background:var(--accent)}
+.chartrail-legend .sw.o{background:#5EE2C6}
+.chartrail-legend .sw.cr{background:var(--accent);opacity:.3}
+.chartrail-legend .sw.cw{background:#FBBF24}
+.chartrail-legend .sw.cost{background:#F87171;border-radius:50%;width:8px;height:8px}
+.chartrail-wrap{position:relative;display:grid;grid-template-columns:56px 1fr;gap:12px;align-items:start}
+.chartrail-yaxis{position:relative;height:var(--bar-h);margin-top:var(--head-h);font-family:'JetBrains Mono',monospace;font-size:10px;opacity:.55}
+.chartrail-yaxis .tick{position:absolute;right:4px;transform:translateY(-50%);white-space:nowrap}
+.chartrail-yaxis .tick::after{content:"";position:absolute;right:-10px;top:50%;width:6px;height:1px;background:var(--border)}
+.chartrail-scroll{position:relative;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin;scroll-behavior:smooth;scroll-snap-type:x mandatory;padding-bottom:8px}
+.chartrail-scroll::-webkit-scrollbar{height:6px}
+.chartrail-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.chartrail-scroll::-webkit-scrollbar-track{background:transparent}
+.chartrail-inner{display:flex;gap:var(--col-gap,4px);align-items:flex-start;min-width:100%}
+.tcol{flex:0 0 auto;width:40px;padding:6px 2px;scroll-snap-align:start;cursor:pointer;position:relative;display:flex;flex-direction:column;outline:none;border-radius:8px;border:1px solid transparent;background:transparent;transition:background .15s ease,border-color .15s ease,transform .15s ease}
+.tcol:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.tcol:hover,.tcol.active{background:var(--hover,rgba(165,139,255,.06));border-color:var(--border)}
+.tcol.active{border-color:var(--accent)}
+.tcol .tc-bar{position:relative;width:100%;height:var(--bar-h);display:flex;flex-direction:column-reverse;justify-content:flex-start;border-radius:4px;overflow:hidden;background:rgba(255,255,255,.015)}
+.tcol .tc-bar .seg{width:100%;display:block;flex-shrink:0;transition:opacity .15s ease}
+.tcol .tc-bar .seg.i{background:var(--accent)}
+.tcol .tc-bar .seg.o{background:#5EE2C6}
+.tcol .tc-bar .seg.cw{background:#FBBF24}
+.tcol .tc-bar .seg.cr{background:var(--accent);opacity:.3}
+.tcol .tc-bar .seg.cost{background:var(--accent)}
+.tcol .tc-foot{height:var(--foot-h);padding-top:6px;display:flex;flex-direction:column;align-items:center;gap:2px;font-family:'JetBrains Mono',monospace;font-size:10px;line-height:1.2;overflow:hidden}
+.tcol .tc-foot .tc-n{color:var(--accent);font-weight:500}
+.tcol .tc-foot .tc-time{opacity:.6;font-size:9px}
+.tcol .tc-foot .tc-cost{font-family:'Inter Tight','Inter',sans-serif;font-weight:600;font-size:11px;opacity:.9}
+.tcol.session-break{margin-left:16px;padding-left:12px;border-left:1px dashed var(--border)}
+.tcol.session-break .tc-seslabel{position:absolute;top:-16px;left:12px;font-family:'JetBrains Mono',monospace;font-size:9px;opacity:.55;letter-spacing:.08em;white-space:nowrap}
+.tcol.resume .tc-bar{background:rgba(165,139,255,.1);display:flex;align-items:center;justify-content:center;flex-direction:row}
+.tcol.resume .tc-bar::before{content:"\2634";color:var(--accent);font-size:16px}
+.rail-chev{position:absolute;top:130px;width:32px;height:32px;border-radius:50%;display:grid;place-items:center;background:var(--surface,#111);border:1px solid var(--border);z-index:3;cursor:pointer;opacity:.85;color:inherit;font-size:16px}
+.rail-chev:hover{opacity:1}
+.rail-chev.left{left:48px}
+.rail-chev.right{right:-4px}
+.rail-indicator{display:flex;align-items:center;gap:12px;justify-content:space-between;margin-top:14px;font-family:'JetBrains Mono',monospace;font-size:11px;opacity:.65}
+.rail-progress{flex:1;height:2px;background:var(--border);border-radius:1px;overflow:hidden}
+.rail-progress-fill{height:100%;background:var(--accent);width:10%;transition:width .1s linear}
+
+/* Prompts (preview) */
+.prompts{padding:20px;border-radius:16px;margin-top:16px}
+.prompts table{font-size:12px}
+.prompts th,.prompts td{padding:10px 12px;border-bottom:1px solid var(--border-dim);text-align:left;vertical-align:top}
+.prompts th.num,.prompts td.num{text-align:right;font-family:'JetBrains Mono',monospace}
+.prompts thead th{font-weight:500;font-size:10px;letter-spacing:.12em;text-transform:uppercase;opacity:.55;border-bottom:1px solid var(--border)}
+.prompts .prompt-text{max-width:560px;font-family:'Inter',sans-serif;line-height:1.55;font-size:13px;opacity:.88}
+.prompts .prompt-text.truncate{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.prompts tbody tr[data-turn]{cursor:pointer;transition:background .1s ease}
+.prompts tbody tr[data-turn]:hover td,.prompts tbody tr[data-turn].active td{background:var(--hover,rgba(165,139,255,.05))}
+.prompts tbody tr[data-turn].active td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
+.prompts tbody tr[data-turn]:focus{outline:1px solid var(--accent);outline-offset:-1px}
+.prompts .prompt-turn-link{color:var(--accent);text-decoration:none;font-family:'JetBrains Mono',monospace}
+.prompts .prompt-turn-link:hover{text-decoration:underline}
+.prompts td.cost{color:#d29922;font-variant-numeric:tabular-nums;white-space:nowrap}
+.prompts td.model code{font-size:11px}
+.prompts .prompts-slash{display:inline-block;padding:0 5px;font-size:10px;border-radius:3px;margin-left:6px;background:rgba(137,87,229,.18);border:1px solid rgba(137,87,229,.4);color:#bc8cff}
+
+/* Footer */
+.foot{margin-top:60px;padding:20px 0;border-top:1px solid var(--border-dim);font-family:'JetBrains Mono',monospace;font-size:11px;opacity:.5;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+
+/* =========================================================================
+   THEME 1 — BEACON MINIMAL (default)
+   ========================================================================= */
+body.theme-beacon{
+  --bg:#0A0A0C;--surface:#111114;--surface-deep:#0E0E12;--border:#1E1E22;--border-dim:#16161a;
+  --fg:#EDECEF;--fg-dim:#8C8B93;--accent:#A58BFF;--accent-soft:#7C6BD9;
+  --punch-empty:#141418;--bar-bg:#1a1a1f;--hover:rgba(165,139,255,.05);
+  background:#0A0A0C;color:#EDECEF;
+}
+body.theme-beacon .topbar{background:rgba(10,10,12,.78);border-bottom:1px solid #16161a}
+body.theme-beacon .topbar .brand .dot{background:#A58BFF;box-shadow:0 0 12px rgba(165,139,255,.5)}
+body.theme-beacon .navlink{color:#8C8B93}
+body.theme-beacon .navlink.current{color:#EDECEF;background:rgba(165,139,255,.1)}
+body.theme-beacon .navlink:hover{color:#EDECEF}
+body.theme-beacon .switcher{background:rgba(17,17,20,.88);border:1px solid #1E1E22;backdrop-filter:blur(12px)}
+body.theme-beacon .switcher button{color:#8C8B93}
+body.theme-beacon .switcher button.active{background:#A58BFF;color:#0A0A0C}
+body.theme-beacon .kpi{background:#111114;border:1px solid #1E1E22;position:relative}
+body.theme-beacon .kpi::before{content:"";position:absolute;top:0;left:0;width:20px;height:1px;background:#A58BFF}
+body.theme-beacon .kpi::after{content:"";position:absolute;top:0;left:0;width:1px;height:20px;background:#A58BFF}
+body.theme-beacon .kpi.featured .kpi-val{color:#A58BFF}
+body.theme-beacon details.insights,body.theme-beacon .usage-insights,
+body.theme-beacon .rollup,body.theme-beacon .blocks,body.theme-beacon .chart-card,
+body.theme-beacon .punch,body.theme-beacon .tod,body.theme-beacon .models-table,
+body.theme-beacon .cards .card,body.theme-beacon #chart-container,
+body.theme-beacon .legend-block,body.theme-beacon .prompts,
+body.theme-beacon .timeline-table,body.theme-beacon .chartrail-card,
+body.theme-beacon .drawer,body.theme-beacon #weekly-rollup,
+body.theme-beacon #session-blocks,body.theme-beacon #hod-chart{background:#111114;border:1px solid #1E1E22}
+body.theme-beacon .cards .card .val{color:#A58BFF}
+body.theme-beacon .cards .card.green .val{color:#3fb950}
+body.theme-beacon .cards .card.amber .val{color:#d29922}
+body.theme-beacon th{background:#0E0E12;border-bottom:1px solid #1E1E22;color:#8C8B93}
+body.theme-beacon td{border-bottom:1px solid #16161a}
+body.theme-beacon tr.session-header td{background:#14141a;color:#A58BFF;border-top:2px solid #1E1E22}
+body.theme-beacon tr.subtotal td{background:#111114;border-top:1px solid #1E1E22}
+
+/* =========================================================================
+   THEME 2 — CONSOLE GLASS
+   ========================================================================= */
+body.theme-console{
+  --bg:#08080A;--surface:rgba(165,139,255,.04);--surface-deep:rgba(165,139,255,.02);
+  --border:rgba(165,139,255,.16);--border-dim:rgba(165,139,255,.08);
+  --fg:#E8E6F0;--fg-dim:#8A88A0;--accent:#A58BFF;--accent-soft:#5EE2C6;
+  --punch-empty:rgba(165,139,255,.05);--bar-bg:rgba(165,139,255,.08);--hover:rgba(165,139,255,.07);
+  background:#08080A;color:#E8E6F0;
+  background-image:radial-gradient(circle at 1px 1px,#1A1A20 1px,transparent 1px);
+  background-size:24px 24px;
+}
+body.theme-console .page-header h1{font-family:'JetBrains Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:.04em;font-size:20px}
+body.theme-console .page-header h1::before{content:"[ ";color:#A58BFF;opacity:.7}
+body.theme-console .page-header h1::after{content:" ]";color:#A58BFF;opacity:.7}
+body.theme-console .section-title h2{font-family:'JetBrains Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:.08em;font-size:12px}
+body.theme-console .section-title h2::before{content:"[ ";color:#A58BFF;opacity:.6}
+body.theme-console .section-title h2::after{content:" ]";color:#A58BFF;opacity:.6}
+body.theme-console h2{font-family:'JetBrains Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:.06em;font-size:12px;color:#A58BFF}
+body.theme-console .topbar{background:rgba(8,8,10,.88);border-bottom:1px solid rgba(165,139,255,.12)}
+body.theme-console .topbar .brand .dot{background:#A58BFF;box-shadow:0 0 8px #A58BFF,0 0 16px rgba(165,139,255,.5)}
+body.theme-console .navlink{color:#8A88A0;font-family:'JetBrains Mono',monospace}
+body.theme-console .navlink.current{color:#A58BFF;background:rgba(165,139,255,.08);border:1px solid rgba(165,139,255,.25)}
+body.theme-console .switcher{background:rgba(8,8,10,.92);border:1px solid rgba(165,139,255,.2);backdrop-filter:blur(12px)}
+body.theme-console .switcher button{color:#8A88A0}
+body.theme-console .switcher button.active{background:rgba(165,139,255,.15);color:#A58BFF;border:1px solid #A58BFF}
+body.theme-console .kpi{background:rgba(165,139,255,.04);border:1px solid rgba(165,139,255,.16);border-radius:10px}
+body.theme-console .kpi .kpi-val{font-family:'JetBrains Mono',monospace;font-weight:500;font-size:22px;color:#A58BFF}
+body.theme-console .kpi .kpi-label{font-family:'JetBrains Mono',monospace;color:#8A88A0}
+body.theme-console .kpi.teal .kpi-val{color:#5EE2C6}
+body.theme-console details.insights,body.theme-console .usage-insights,
+body.theme-console .rollup,body.theme-console .blocks,body.theme-console .chart-card,
+body.theme-console .punch,body.theme-console .tod,body.theme-console .models-table,
+body.theme-console .cards .card,body.theme-console #chart-container,
+body.theme-console .legend-block,body.theme-console .prompts,
+body.theme-console .timeline-table,body.theme-console .chartrail-card,
+body.theme-console .drawer,body.theme-console #weekly-rollup,
+body.theme-console #session-blocks,body.theme-console #hod-chart{background:rgba(165,139,255,.03);border:1px solid rgba(165,139,255,.14);border-radius:10px}
+body.theme-console .cards .card .val{color:#A58BFF;font-family:'JetBrains Mono',monospace;font-weight:500}
+body.theme-console .cards .card.green .val{color:#5EE2C6}
+body.theme-console .cards .card.amber .val{color:#FFB86B}
+body.theme-console th{background:rgba(165,139,255,.05);border-bottom:1px solid rgba(165,139,255,.16);color:#8A88A0;font-family:'JetBrains Mono',monospace}
+body.theme-console td{border-bottom:1px solid rgba(165,139,255,.08)}
+body.theme-console tr.session-header td{background:rgba(165,139,255,.08);color:#A58BFF;border-top:1px solid rgba(165,139,255,.2)}
+body.theme-console tr.subtotal td{background:rgba(165,139,255,.05);border-top:1px solid rgba(165,139,255,.16)}
+
+/* =========================================================================
+   THEME 3 — LATTICE COMPACT
+   ========================================================================= */
+body.theme-lattice{
+  --bg:#09090C;--surface:#101014;--surface-deep:#0C0C10;--border:#17171C;--border-dim:#121216;
+  --fg:#E4E2E8;--fg-dim:#7E7C88;--accent:#A58BFF;--accent-soft:#7C6BD9;
+  --punch-empty:#131318;--bar-bg:#17171C;--hover:rgba(165,139,255,.05);
+  background:#09090C;color:#E4E2E8;font-size:12px;
+}
+body.theme-lattice .shell{padding-top:24px}
+body.theme-lattice .page-header h1{font-family:'Inter Tight','Inter',sans-serif;font-weight:600;font-size:22px;letter-spacing:-.015em}
+body.theme-lattice .section{margin-top:32px}
+body.theme-lattice .section-title h2{font-weight:600;font-size:14px}
+body.theme-lattice h2{font-size:14px}
+body.theme-lattice .topbar{background:rgba(9,9,12,.92);border-bottom:1px solid #17171C}
+body.theme-lattice .topbar .brand .dot{width:6px;height:6px;background:#A58BFF;border-radius:1px}
+body.theme-lattice .navlink{color:#7E7C88}
+body.theme-lattice .navlink.current{background:rgba(165,139,255,.1);color:#A58BFF}
+body.theme-lattice .switcher{background:#101014;border:1px solid #17171C;border-radius:6px}
+body.theme-lattice .switcher button{border-radius:4px}
+body.theme-lattice .switcher button.active{background:#A58BFF;color:#09090C}
+body.theme-lattice .kpi-grid{grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+body.theme-lattice .kpi{background:#101014;border-radius:8px;padding:14px;min-height:80px;position:relative;border:0}
+body.theme-lattice .kpi::before{content:"";position:absolute;left:0;top:10px;bottom:10px;width:2px;background:#A58BFF;border-radius:1px}
+body.theme-lattice .kpi.cat-tokens::before{background:#5EE2C6}
+body.theme-lattice .kpi.cat-time::before{background:#FBBF24}
+body.theme-lattice .kpi.cat-save::before{background:#4ADE80}
+body.theme-lattice .kpi .kpi-val{font-weight:600;font-size:22px}
+body.theme-lattice .kpi .kpi-label{font-size:10px;letter-spacing:.08em}
+body.theme-lattice details.insights,body.theme-lattice .usage-insights,
+body.theme-lattice .rollup,body.theme-lattice .blocks,body.theme-lattice .chart-card,
+body.theme-lattice .punch,body.theme-lattice .tod,body.theme-lattice .models-table,
+body.theme-lattice .cards .card,body.theme-lattice #chart-container,
+body.theme-lattice .legend-block,body.theme-lattice .prompts,
+body.theme-lattice .timeline-table,body.theme-lattice .chartrail-card,
+body.theme-lattice .drawer,body.theme-lattice #weekly-rollup,
+body.theme-lattice #session-blocks,body.theme-lattice #hod-chart{background:#101014;border:1px solid #17171C;border-radius:8px}
+body.theme-lattice .cards .card{padding:12px 14px;position:relative}
+body.theme-lattice .cards .card::before{content:"";position:absolute;left:0;top:10px;bottom:10px;width:2px;background:#A58BFF;border-radius:1px}
+body.theme-lattice .cards .card.green::before{background:#4ADE80}
+body.theme-lattice .cards .card.amber::before{background:#FBBF24}
+body.theme-lattice .cards .card .val{font-size:20px}
+body.theme-lattice th{background:#0C0C10;border-bottom:1px solid #17171C;color:#7E7C88}
+body.theme-lattice td{border-bottom:1px solid #121216}
+body.theme-lattice tr.session-header td{background:#13111a;color:#A58BFF;border-top:1px solid #17171C}
+body.theme-lattice tr.subtotal td{background:#101014;border-top:1px solid #17171C}
+
+/* =========================================================================
+   THEME 4 — PULSE (amber+lilac gradient)
+   ========================================================================= */
+body.theme-pulse{
+  --bg:#0D0B14;--surface:#15121C;--surface-deep:#110F18;--border:#2A2438;--border-dim:#1D1928;
+  --fg:#F2EFF7;--fg-dim:#9E9AAE;--accent:#C084FC;--accent-soft:#FFB86B;
+  --punch-empty:#1D1928;--bar-bg:#1D1928;--hover:rgba(192,132,252,.08);
+  background:radial-gradient(circle at 85% -20%,rgba(255,184,107,.08),transparent 40%),radial-gradient(circle at -10% 120%,rgba(192,132,252,.12),transparent 50%),#0D0B14;
+  color:#F2EFF7;
+}
+body.theme-pulse .page-header h1{font-weight:700;font-size:30px;letter-spacing:-.025em;background:linear-gradient(90deg,#FFB86B,#C084FC 60%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent}
+body.theme-pulse h2{font-weight:600;font-size:17px;letter-spacing:-.015em}
+body.theme-pulse .topbar{background:rgba(13,11,20,.82);border-bottom:1px solid #1D1928}
+body.theme-pulse .topbar .brand .dot{background:#FFB86B;box-shadow:0 0 10px rgba(255,184,107,.6)}
+body.theme-pulse .navlink{color:#9E9AAE}
+body.theme-pulse .navlink.current{background:rgba(192,132,252,.12);color:#C084FC}
+body.theme-pulse .switcher{background:rgba(21,18,28,.92);border:1px solid #2A2438;backdrop-filter:blur(12px)}
+body.theme-pulse .switcher button{color:#9E9AAE}
+body.theme-pulse .switcher button.active{background:linear-gradient(90deg,#FFB86B,#C084FC);color:#0D0B14}
+body.theme-pulse .kpi{background:#15121C;border:1px solid #2A2438;border-radius:14px;position:relative;overflow:hidden}
+body.theme-pulse .kpi::before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 100% 0%,rgba(255,184,107,.08),transparent 50%);pointer-events:none}
+body.theme-pulse .kpi .kpi-val{font-weight:700;font-size:28px;letter-spacing:-.02em}
+body.theme-pulse .kpi.featured{background:linear-gradient(135deg,rgba(192,132,252,.18),rgba(255,184,107,.12) 60%,#15121C);border:1px solid rgba(192,132,252,.35);animation:sm-pulse-ring-lg 3s ease-in-out infinite}
+body.theme-pulse .kpi.featured .kpi-val{font-size:44px;line-height:1;background:linear-gradient(90deg,#FFB86B,#C084FC 60%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent}
+body.theme-pulse .kpi.featured .kpi-label{color:#FFB86B;font-weight:600}
+body.theme-pulse .kpi.cat-save .kpi-val,body.theme-pulse .kpi.teal .kpi-val{color:#5EE2C6}
+body.theme-pulse .kpi.cat-time .kpi-val{color:#FFB86B}
+@keyframes sm-pulse-ring-lg{0%,100%{box-shadow:0 0 0 0 rgba(192,132,252,.25)}50%{box-shadow:0 0 0 4px rgba(192,132,252,0)}}
+body.theme-pulse details.insights,body.theme-pulse .usage-insights,
+body.theme-pulse .rollup,body.theme-pulse .blocks,body.theme-pulse .chart-card,
+body.theme-pulse .punch,body.theme-pulse .tod,body.theme-pulse .models-table,
+body.theme-pulse .cards .card,body.theme-pulse #chart-container,
+body.theme-pulse .legend-block,body.theme-pulse .prompts,
+body.theme-pulse .timeline-table,body.theme-pulse .chartrail-card,
+body.theme-pulse .drawer,body.theme-pulse #weekly-rollup,
+body.theme-pulse #session-blocks,body.theme-pulse #hod-chart{background:#15121C;border:1px solid #2A2438;border-radius:14px}
+body.theme-pulse .cards .card .val{background:linear-gradient(90deg,#FFB86B,#C084FC 60%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent;font-weight:700}
+body.theme-pulse .cards .card.green .val{background:none;-webkit-text-fill-color:initial;color:#5EE2C6}
+body.theme-pulse .cards .card.amber .val{background:none;-webkit-text-fill-color:initial;color:#FFB86B}
+body.theme-pulse th{background:#110F18;border-bottom:1px solid #2A2438;color:#9E9AAE}
+body.theme-pulse td{border-bottom:1px solid #1D1928}
+body.theme-pulse tr.session-header td{background:#1D1928;color:#C084FC;border-top:1px solid #2A2438}
+body.theme-pulse tr.subtotal td{background:#15121C;border-top:1px solid #2A2438}
+
+/* =========================================================================
+   Responsive
+   ========================================================================= */
+@media (max-width:1200px){
+  .kpi-grid{grid-template-columns:repeat(3,1fr)}
+}
+@media (max-width:780px){
+  .shell{padding:20px 16px 40px}
+  .kpi-grid{grid-template-columns:repeat(2,1fr)}
+  .topbar{flex-wrap:wrap;gap:8px}
+  .topbar .nav{margin-left:0}
+  .switcher{margin-left:0}
+  .drawer{width:100%}
+}
+</style>"""
+
+
+def _theme_picker_markup() -> str:
+    """4-button theme switcher embedded inside the topbar's <nav> element.
+
+    The four buttons match the four themes in ``_theme_css()``. The active
+    class is toggled by ``_theme_bootstrap_body_js()`` on apply.
+    """
+    return (
+        '<div class="switcher" role="tablist" aria-label="Theme variant switcher">'
+        '<button data-theme="theme-beacon">Beacon</button>'
+        '<button data-theme="theme-console" class="active">Console</button>'
+        '<button data-theme="theme-lattice">Lattice</button>'
+        '<button data-theme="theme-pulse">Pulse</button>'
+        '</div>'
+    )
+
+
+def _theme_bootstrap_head_js() -> str:
+    """Pre-paint <head> script: reads URL hash (``#theme=X``), falls back to
+    ``localStorage['sm_theme']``, defaults to ``console``. Writes the resolved
+    theme onto ``<html data-sm-theme=...>`` so the body-end script can apply
+    synchronously without a paint-flash."""
+    return (
+        '<script>'
+        '(function(){try{'
+          'var h=(location.hash.match(/theme=([a-z]+)/)||[])[1];'
+          'var t=h||(function(){try{return localStorage.getItem("sm_theme");}'
+                    'catch(e){return null;}})()||"console";'
+          'if(!/^(beacon|console|lattice|pulse)$/.test(t))t="console";'
+          'document.documentElement.setAttribute("data-sm-theme",t);'
+        '}catch(e){}})();'
+        '</script>'
+    )
+
+
+def _theme_bootstrap_body_js() -> str:
+    """End-of-body script: applies the theme class to <body>, wires the
+    switcher buttons, persists to ``localStorage`` wrapped in try/catch
+    (Firefox ``privacy.file_unique_origin=true`` throws ``SecurityError``
+    on ``file://``), and rewrites any ``a[data-sm-nav]`` href with the
+    current ``#theme=`` so cross-file nav preserves the picked theme.
+
+    Also re-skins accent-color-bearing chart libraries when possible —
+    current strategy: reload with the hash preserved. uPlot/Highcharts
+    have no cheap post-init accent API so a reload is the simplest
+    correct answer, and the hash makes it seamless.
+    """
+    return (
+        '<script>'
+        '(function(){'
+          'function apply(t,isUserAction){'
+            'document.body.className='
+              'document.body.className.replace(/\\btheme-\\w+\\b/g,"").trim()'
+              '+" theme-"+t;'
+            'var btns=document.querySelectorAll(".switcher button");'
+            'btns.forEach(function(b){'
+              'b.classList.toggle("active",b.dataset.theme==="theme-"+t);'
+            '});'
+            'try{localStorage.setItem("sm_theme",t);}catch(e){}'
+            'var h="theme="+t;'
+            'if(location.hash.indexOf("theme=")>=0){'
+              'location.hash=location.hash.replace(/theme=[a-z]+/,h);'
+            '}else if(location.hash&&location.hash.length>1){'
+              'location.hash=location.hash.substring(1)+"&"+h;'
+            '}else{'
+              'location.hash=h;'
+            '}'
+            'document.querySelectorAll("a[data-sm-nav]").forEach(function(a){'
+              'a.href=a.href.split("#")[0]+"#"+h;'
+            '});'
+            'if(isUserAction&&window.SM_RESKIN_CHARTS){'
+              'try{window.SM_RESKIN_CHARTS();}catch(e){}'
+            '}'
+          '}'
+          'var init=document.documentElement.getAttribute("data-sm-theme")||"console";'
+          'apply(init,false);'
+          'document.querySelectorAll(".switcher button").forEach(function(b){'
+            'b.addEventListener("click",function(){'
+              'apply(b.dataset.theme.replace("theme-",""),true);'
+            '});'
+          '});'
+        '})();'
+        '</script>'
+    )
+
+
+def _build_chartrail_section_html(chartrail_data: list) -> str:
+    """Return the chartrail section HTML for a given list of turn dicts.
+
+    Returns an empty string if ``chartrail_data`` is empty.
+    """
+    if not chartrail_data:
+        return ""
+    rail_json = json.dumps(chartrail_data, separators=(",", ":"),
+                            default=str).replace("</", "<\\/")
+    n_turns = len(chartrail_data)
+    return (
+        '<section class="section">\n'
+        '<div class="section-title"><h2>Token usage over time</h2>'
+        '<span class="hint">scroll horizontally &middot; click a turn '
+        'to drill in &middot; \u2190 \u2192</span></div>\n'
+        '<div class="chartrail-card">\n'
+        '  <div class="chartrail-legend">\n'
+        '    <span><span class="sw i"></span>Input (new)</span>\n'
+        '    <span><span class="sw o"></span>Output</span>\n'
+        '    <span><span class="sw cw"></span>Cache write</span>\n'
+        '    <span><span class="sw cr"></span>Cache read</span>\n'
+        '    <span><span class="sw cost"></span>Cost $</span>\n'
+        '  </div>\n'
+        '  <div class="chartrail-wrap">\n'
+        '    <div class="chartrail-yaxis" id="chartrail-yaxis"></div>\n'
+        '    <div class="chartrail-scroll" id="chartrail-scroll" '
+        'tabindex="0">\n'
+        '      <div class="chartrail-inner" id="chartrail-inner">'
+        '</div>\n'
+        '    </div>\n'
+        '    <button class="rail-chev left" id="rail-prev" '
+        'aria-label="Scroll turns left">\u2039</button>\n'
+        '    <button class="rail-chev right" id="rail-next" '
+        'aria-label="Scroll turns right">\u203a</button>\n'
+        '  </div>\n'
+        '  <div class="rail-indicator">\n'
+        f'    <span><span id="rail-counter">01</span> / {n_turns}</span>\n'
+        '    <div class="rail-progress">'
+        '<div class="rail-progress-fill" id="rail-progress-fill">'
+        '</div></div>\n'
+        '    <span>scroll or use \u2190 \u2192</span>\n'
+        '  </div>\n'
+        '</div>\n'
+        '<script type="application/json" id="chartrail-data">'
+        f'{rail_json}</script>\n'
+        '</section>'
+    )
+
+
+def _chartrail_script() -> str:
+    """Return the full chartrail interaction JS string."""
+    return """<script>
+(function () {
+  var root = document.getElementById('chartrail-data');
+  if (!root) return;
+  var rows; try { rows = JSON.parse(root.textContent); } catch (e) { return; }
+  var scroll = document.getElementById('chartrail-scroll');
+  var inner  = document.getElementById('chartrail-inner');
+  var yaxis  = document.getElementById('chartrail-yaxis');
+  var counter= document.getElementById('rail-counter');
+  var progress = document.getElementById('rail-progress-fill');
+  if (!scroll || !inner || !yaxis) return;
+
+  // Max tokens = input + output + cache_read + cache_write per turn
+  var maxTok = 0;
+  rows.forEach(function (t) {
+    var tot = (t.input||0) + (t.output||0) + (t.cache_read||0) + (t.cache_write||0);
+    if (tot > maxTok) maxTok = tot;
+  });
+  if (!maxTok) maxTok = 1;
+
+  // Y-axis ticks: 5 bands 0..max
+  var yHtml = '';
+  for (var i = 0; i <= 4; i++) {
+    var v = (maxTok / 4) * i;
+    var label = v >= 1e6 ? (v/1e6).toFixed(1) + 'M'
+              : v >= 1e3 ? Math.round(v/1e3) + 'k'
+              : Math.round(v);
+    var pct = 100 - (i/4) * 100;
+    yHtml += '<span class="tick" style="top:' + pct + '%">' + label + '</span>';
+  }
+  yaxis.innerHTML = yHtml;
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
+
+  var parts = [];
+  rows.forEach(function (t, i) {
+    if (t.is_resume) {
+      var label = t.is_terminal ? 'Session exited' : 'Session resumed';
+      parts.push('<div class="tcol resume' +
+        (t.session_break && i > 0 ? ' session-break' : '') +
+        '" title="' + esc(label + ' at ' + (t.ts || '')) + '">' +
+        (t.session_break && i > 0
+          ? '<div class="tc-seslabel">' + esc(t.session_label || '') + '</div>'
+          : '') +
+        '<div class="tc-bar" aria-hidden="true"></div>' +
+        '<div class="tc-foot"><span class="tc-n">' +
+        String(t.n).padStart(2, '0') + '</span>' +
+        '<span class="tc-time">' + esc(t.time || '') + '</span>' +
+        '<span class="tc-cost" style="opacity:.5">&mdash;</span></div>' +
+        '</div>');
+      return;
+    }
+    var pctI  = (t.input      /maxTok) * 100;
+    var pctO  = (t.output     /maxTok) * 100;
+    var pctCw = (t.cache_write/maxTok) * 100;
+    var pctCr = (t.cache_read /maxTok) * 100;
+    var tot = (t.input||0) + (t.output||0) + (t.cache_read||0) + (t.cache_write||0);
+    var title = 'Turn ' + t.n + ' \u00b7 ' + (t.time || '') + ' \u00b7 ' +
+                (t.model || '') + ' \u00b7 tokens ' + tot.toLocaleString() +
+                ' \u00b7 $' + (t.cost || 0).toFixed(4);
+    parts.push('<div class="tcol' +
+      (t.session_break && i > 0 ? ' session-break' : '') +
+      '" data-turn="' + esc(t.key) + '" tabindex="0" title="' + esc(title) + '">' +
+      (t.session_break && i > 0
+        ? '<div class="tc-seslabel">' + esc(t.session_label || '') + '</div>'
+        : '') +
+      '<div class="tc-bar" aria-hidden="true">' +
+      '<span class="seg i"  style="height:' + pctI.toFixed(2) + '%"></span>' +
+      '<span class="seg o"  style="height:' + pctO.toFixed(2) + '%"></span>' +
+      '<span class="seg cw" style="height:' + pctCw.toFixed(2) + '%"></span>' +
+      '<span class="seg cr" style="height:' + pctCr.toFixed(2) + '%"></span>' +
+      '</div>' +
+      '<div class="tc-foot">' +
+      '<span class="tc-n">' + String(t.n).padStart(2, '0') + '</span>' +
+      '<span class="tc-time">' + esc(t.time || '') + '</span>' +
+      '<span class="tc-cost">$' + (t.cost || 0).toFixed(3) + '</span>' +
+      '</div></div>');
+  });
+  inner.innerHTML = parts.join('');
+
+  // Click → open drawer via shared opener (from drawer script).
+  inner.addEventListener('click', function (ev) {
+    var col = ev.target && ev.target.closest ? ev.target.closest('.tcol') : null;
+    if (!col) return;
+    var key = col.getAttribute('data-turn');
+    if (key && typeof window.smOpenDrawer === 'function') window.smOpenDrawer(key);
+  });
+  inner.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter' || ev.key === ' ') {
+      var el = document.activeElement;
+      if (el && el.classList && el.classList.contains('tcol')) {
+        var key = el.getAttribute('data-turn');
+        if (key && typeof window.smOpenDrawer === 'function') {
+          ev.preventDefault();
+          window.smOpenDrawer(key);
+        }
+      }
+    }
+  });
+
+  // Chevrons scroll-by a ~10-col chunk (320px is a sensible default).
+  var lchev = document.querySelector('.rail-chev.left');
+  var rchev = document.querySelector('.rail-chev.right');
+  if (lchev) lchev.addEventListener('click', function () {
+    scroll.scrollBy({left: -320, behavior: 'smooth'});
+  });
+  if (rchev) rchev.addEventListener('click', function () {
+    scroll.scrollBy({left: 320, behavior: 'smooth'});
+  });
+
+  // Keyboard \u2190/\u2192 scroll the rail; Enter/Space opens drawer via click handler above.
+  scroll.addEventListener('keydown', function (ev) {
+    if (ev.key === 'ArrowRight') {
+      ev.preventDefault();
+      scroll.scrollBy({left: 160, behavior: 'smooth'});
+    } else if (ev.key === 'ArrowLeft') {
+      ev.preventDefault();
+      scroll.scrollBy({left: -160, behavior: 'smooth'});
+    }
+  });
+
+  // Wheel-to-horizontal: translate vertical wheel to horizontal scroll so users
+  // can navigate without a horizontal trackpad gesture.
+  scroll.addEventListener('wheel', function (ev) {
+    if (Math.abs(ev.deltaY) > Math.abs(ev.deltaX)) {
+      scroll.scrollLeft += ev.deltaY;
+      ev.preventDefault();
+    }
+  }, {passive: false});
+
+  // Update counter + progress bar as user scrolls.
+  function updateIndicator() {
+    var max = scroll.scrollWidth - scroll.clientWidth;
+    var t = max > 0 ? scroll.scrollLeft / max : 0;
+    if (progress) progress.style.width = Math.max(2, t * 100) + '%';
+    var firstCol = scroll.querySelector('.tcol');
+    if (firstCol && counter) {
+      var cw = firstCol.getBoundingClientRect().width + 4;
+      var idx = Math.min(rows.length - 1,
+        Math.max(0, Math.round(scroll.scrollLeft / Math.max(1, cw))));
+      counter.textContent = String(rows[idx].n).padStart(2, '0');
+    }
+  }
+  scroll.addEventListener('scroll', updateIndicator);
+  updateIndicator();
+})();
+</script>"""
+
+
+def _build_daily_cost_rail_html(daily_data: list) -> str:
+    """Return a horizontally-scrollable daily-cost rail for the instance page.
+
+    Each column is one calendar day; bar height is proportional to cost.
+    Reuses ``.chartrail-card`` CSS layout; DOM IDs use the ``costail-``
+    prefix so the element names don't clash with the per-session chartrail.
+
+    Returns ``""`` if ``daily_data`` is empty.
+    """
+    if not daily_data:
+        return ""
+    rail_json = json.dumps(
+        [{"n": i, "date": d.get("date", ""), "cost": float(d.get("cost", 0.0))}
+         for i, d in enumerate(daily_data, 1)],
+        separators=(",", ":"),
+    ).replace("</", "<\\/")
+    n_days = len(daily_data)
+    return (
+        '<section class="section">\n'
+        '<div class="section-title"><h2>Daily cost timeline</h2>'
+        '<span class="hint">one bar per calendar day &middot; '
+        'scroll horizontally &middot; \u2190 \u2192</span></div>\n'
+        '<div class="chartrail-card">\n'
+        '  <div class="chartrail-wrap">\n'
+        '    <div class="chartrail-yaxis" id="costail-yaxis"></div>\n'
+        '    <div class="chartrail-scroll" id="costail-scroll" tabindex="0">\n'
+        '      <div class="chartrail-inner" id="costail-inner"></div>\n'
+        '    </div>\n'
+        '    <button class="rail-chev left"  id="costail-prev" '
+        'aria-label="Scroll days left">\u2039</button>\n'
+        '    <button class="rail-chev right" id="costail-next" '
+        'aria-label="Scroll days right">\u203a</button>\n'
+        '  </div>\n'
+        '  <div class="rail-indicator">\n'
+        f'    <span><span id="costail-counter">01</span> / {n_days} days</span>\n'
+        '    <div class="rail-progress">'
+        '<div class="rail-progress-fill" id="costail-progress"></div></div>\n'
+        '    <span>scroll or use \u2190 \u2192</span>\n'
+        '  </div>\n'
+        '</div>\n'
+        '<script type="application/json" id="costail-data">'
+        f'{rail_json}</script>\n'
+        '</section>'
+    )
+
+
+def _daily_cost_rail_script() -> str:
+    """Interaction JS for the daily-cost rail (costail).
+
+    Renders one bar per calendar day whose height is proportional to cost.
+    Y-axis ticks show dollar amounts.  Wires chevrons, keyboard, and wheel
+    scroll — identical UX to the per-session chartrail.
+    """
+    return """<script>
+(function () {
+  var root = document.getElementById('costail-data');
+  if (!root) return;
+  var rows; try { rows = JSON.parse(root.textContent); } catch (e) { return; }
+  var scroll   = document.getElementById('costail-scroll');
+  var inner    = document.getElementById('costail-inner');
+  var yaxis    = document.getElementById('costail-yaxis');
+  var counter  = document.getElementById('costail-counter');
+  var progress = document.getElementById('costail-progress');
+  if (!scroll || !inner || !yaxis) return;
+
+  var maxCost = 0;
+  rows.forEach(function (r) { if (r.cost > maxCost) maxCost = r.cost; });
+  if (!maxCost) maxCost = 1;
+
+  // Y-axis: 5 dollar-amount ticks
+  var yHtml = '';
+  for (var i = 0; i <= 4; i++) {
+    var v   = (maxCost / 4) * i;
+    var lbl = v >= 100 ? '$' + Math.round(v)
+            : v >= 1   ? '$' + v.toFixed(1)
+            :            '$' + v.toFixed(2);
+    var pct = 100 - (i / 4) * 100;
+    yHtml += '<span class="tick" style="top:' + pct + '%">' + lbl + '</span>';
+  }
+  yaxis.innerHTML = yHtml;
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
+
+  var parts = [];
+  rows.forEach(function (r, i) {
+    var pct   = (r.cost / maxCost) * 100;
+    var label = esc(r.date) + ' \u00b7 $' + r.cost.toFixed(2);
+    // Shorten date for column label: keep MM-DD portion
+    var dateShort = String(r.date).slice(5);   // "YYYY-MM-DD" → "MM-DD"
+    parts.push(
+      '<div class="tcol" title="' + label + '">' +
+      '<div class="tc-bar" aria-hidden="true">' +
+      '<span class="seg cost" style="height:' + pct.toFixed(2) + '%"></span>' +
+      '</div>' +
+      '<div class="tc-foot">' +
+      '<span class="tc-n">' + String(r.n).padStart(2,'0') + '</span>' +
+      '<span class="tc-time">' + esc(dateShort) + '</span>' +
+      '<span class="tc-cost">$' + r.cost.toFixed(2) + '</span>' +
+      '</div></div>'
+    );
+  });
+  inner.innerHTML = parts.join('');
+
+  // Chevrons
+  var lchev = document.getElementById('costail-prev');
+  var rchev = document.getElementById('costail-next');
+  if (lchev) lchev.addEventListener('click', function () {
+    scroll.scrollBy({left: -320, behavior: 'smooth'});
+  });
+  if (rchev) rchev.addEventListener('click', function () {
+    scroll.scrollBy({left: 320, behavior: 'smooth'});
+  });
+
+  // Keyboard ←/→
+  scroll.addEventListener('keydown', function (ev) {
+    if (ev.key === 'ArrowRight') {
+      ev.preventDefault(); scroll.scrollBy({left: 160, behavior: 'smooth'});
+    } else if (ev.key === 'ArrowLeft') {
+      ev.preventDefault(); scroll.scrollBy({left: -160, behavior: 'smooth'});
+    }
+  });
+
+  // Vertical wheel → horizontal scroll
+  scroll.addEventListener('wheel', function (ev) {
+    if (Math.abs(ev.deltaY) > Math.abs(ev.deltaX)) {
+      scroll.scrollLeft += ev.deltaY;
+      ev.preventDefault();
+    }
+  }, {passive: false});
+
+  function updateIndicator() {
+    var max = scroll.scrollWidth - scroll.clientWidth;
+    var t   = max > 0 ? scroll.scrollLeft / max : 0;
+    if (progress) progress.style.width = Math.max(2, t * 100) + '%';
+    var firstCol = scroll.querySelector('.tcol');
+    if (firstCol && counter) {
+      var cw  = firstCol.getBoundingClientRect().width + 4;
+      var idx = Math.min(rows.length - 1,
+        Math.max(0, Math.round(scroll.scrollLeft / Math.max(1, cw))));
+      counter.textContent = String(rows[idx].n).padStart(2, '0');
+    }
+  }
+  scroll.addEventListener('scroll', updateIndicator);
+  updateIndicator();
+})();
+</script>"""
+
+
 def render_html(report: dict, variant: str = "single",
                 nav_sibling: str | None = None,
                 chart_lib: str = "highcharts") -> str:
@@ -4152,8 +5035,9 @@ def render_html(report: dict, variant: str = "single",
     """
     if report.get("mode") == "instance":
         return _render_instance_html(report, chart_lib=chart_lib)
-    include_insights = variant in ("single", "dashboard")
-    include_chart    = variant in ("single", "detail")
+    include_insights = variant in ("single", "dashboard", "project")
+    include_chart    = variant in ("single", "detail", "project")
+    include_hc_chart = variant == "single"   # Highcharts 3D for single only; detail/project use chartrail
     slug = report["slug"]
     totals = report["totals"]
     mode = report["mode"]
@@ -4168,7 +5052,7 @@ def render_html(report: dict, variant: str = "single",
     # ``<head>`` while the container div goes in the body.
     chart_html      = ""
     chart_head_html = ""
-    if include_chart:
+    if include_hc_chart:
         if mode == "project":
             all_turns = [t for s in sessions for t in s["turns"]]
         else:
@@ -4373,24 +5257,42 @@ def render_html(report: dict, variant: str = "single",
             for m, cnt in sorted(report["models"].items(), key=lambda x: -x[1])
         )
 
-    # Nav bar: cross-link to the companion page (only present in split mode).
-    nav_html = ""
+    # Nav bar: cross-link to the companion page.
+    # Switcher is embedded inside the topbar's <nav> to avoid positional overlap.
+    # Split mode: brand left + [Dashboard | Detail | switcher] right.
+    # Single mode: brand left + [switcher] right (no cross-link).
+    _sw = _theme_picker_markup()
     if nav_sibling:
         label_here  = "Dashboard" if variant == "dashboard" else "Detail"
-        label_other = "Detail \u2192" if variant == "dashboard" else "\u2190 Dashboard"
+        label_other = "Detail"   if variant == "dashboard" else "Dashboard"
         nav_html = (
-            f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;'
-            f'padding:8px 12px;background:#161b22;border:1px solid #30363d;border-radius:6px">'
-            f'<span style="color:#8b949e;font-size:11px">You are on:</span>'
-            f'<strong style="color:#58a6ff;font-size:12px">{label_here}</strong>'
-            f'<a href="{nav_sibling}" style="margin-left:auto;color:#58a6ff;'
-            f'font-size:12px;text-decoration:none">{label_other}</a>'
-            f'</div>'
+            f'<header class="topbar sm-nav">'
+            f'<div class="brand"><span class="dot"></span>'
+            f'<span>session-metrics</span></div>'
+            f'<nav class="nav">'
+            f'<span class="navlink current">{label_here}</span>'
+            f'<a class="navlink" data-sm-nav href="{nav_sibling}">{label_other}</a>'
+            f'{_sw}'
+            f'</nav>'
+            f'</header>'
+        )
+    else:
+        nav_html = (
+            f'<header class="topbar">'
+            f'<div class="brand"><span class="dot"></span>'
+            f'<span>session-metrics</span></div>'
+            f'<nav class="nav">{_sw}</nav>'
+            f'</header>'
         )
 
     chart_section_html = ""
-    if include_chart and chart_html:
-        chart_section_html = f'<h2>Token Usage Over Time</h2>\n{chart_html}'
+    if include_hc_chart and chart_html:
+        chart_section_html = (
+            '<section class="section">\n'
+            '<div class="section-title"><h2>Token Usage Over Time</h2></div>\n'
+            f'{chart_html}\n'
+            '</section>'
+        )
 
     table_section_html = ""
     if include_chart and table_rows:
@@ -4428,9 +5330,10 @@ def render_html(report: dict, variant: str = "single",
         content_th = ('<th class="content-blocks">Content</th>'
                       if show_content else "")
         table_section_html = (
-            '<h2>Timeline</h2>\n'
+            '<section class="section">\n'
+            '<div class="section-title"><h2>Timeline</h2></div>\n'
             + legend_html + '\n'
-            + '<table>\n<thead><tr>\n'
+            + '<table class="timeline-table">\n<thead><tr>\n'
             f'  <th class="num">#</th><th>Time ({tz_label})</th><th>Model</th>\n'
             f'  {"<th>Mode</th>" if show_mode else ""}\n'
             '  <th class="num">Input (new)</th><th class="num">Output</th>\n'
@@ -4438,16 +5341,20 @@ def render_html(report: dict, variant: str = "single",
             f'  {content_th}\n'
             '  <th class="num">Total</th><th class="num">Cost $</th>\n'
             f'</tr></thead>\n<tbody>\n{"".join(table_rows)}\n</tbody>\n</table>\n'
+            '</section>'
         )
 
     models_section_html = ""
     if include_chart and model_rows:
         models_section_html = (
-            '<h2>Models</h2>\n<table class="models-table">\n'
+            '<section class="section">\n'
+            '<div class="section-title"><h2>Models</h2></div>\n'
+            '<table class="models-table">\n'
             '<thead><tr><th>Model</th><th class="num">Turns</th>\n'
             '  <th class="num">$/M input</th><th class="num">$/M output</th>\n'
             '  <th class="num">$/M rd</th><th class="num">$/M wr</th></tr></thead>\n'
             f'<tbody>{model_rows}</tbody>\n</table>\n'
+            '</section>'
         )
 
     summary_cards_html = ""
@@ -4457,11 +5364,11 @@ def render_html(report: dict, variant: str = "single",
             pct_1h = 100 * totals["cache_write_1h"] / max(1, totals["cache_write"])
             extra = totals.get("extra_1h_cost", 0.0)
             ttl_mix_card = (
-                f'\n  <div class="card amber" '
+                f'\n  <div class="kpi cat-tokens" '
                 f'title="1-hour cache writes cost 2× input vs 1.25× for the 5-minute tier. '
                 f'This card shows the premium you paid for longer cache reuse.">'
-                f'<div class="val">{pct_1h:.0f}% 1h · ${extra:.4f}</div>'
-                f'<div class="lbl">Cache TTL mix (extra paid for 1h)</div></div>'
+                f'<div class="kpi-label">Cache TTL mix (extra paid for 1h)</div>'
+                f'<div class="kpi-val">{pct_1h:.0f}% 1h · ${extra:.4f}</div></div>'
             )
         thinking_card = ""
         if totals.get("thinking_turn_count", 0) > 0:
@@ -4470,13 +5377,13 @@ def render_html(report: dict, variant: str = "single",
             blocks = (totals.get("content_blocks") or {}).get("thinking", 0)
             total_turns = totals.get("turns", 0)
             thinking_card = (
-                f'\n  <div class="card" '
+                f'\n  <div class="kpi" '
                 f'title="Claude Code stores thinking blocks signature-only — '
                 f'the count is real but per-block token counts aren\'t recoverable '
                 f'from the transcript (thinking tokens are rolled into output_tokens).">'
-                f'<div class="val">{tp:.0f}% · {blocks} blocks</div>'
-                f'<div class="lbl">Extended thinking engagement '
-                f'({tn} of {total_turns} turns)</div></div>'
+                f'<div class="kpi-label">Extended thinking engagement '
+                f'({tn} of {total_turns} turns)</div>'
+                f'<div class="kpi-val">{tp:.0f}% · {blocks} blocks</div></div>'
             )
         tool_calls_card = ""
         if totals.get("tool_call_total", 0) > 0:
@@ -4487,9 +5394,9 @@ def render_html(report: dict, variant: str = "single",
             # in a compromised transcript — escape each before interpolating.
             top3_str = ", ".join(html_mod.escape(n) for n in top3) if top3 else "none"
             tool_calls_card = (
-                f'\n  <div class="card">'
-                f'<div class="val">{tc} · {avg:.1f}/turn</div>'
-                f'<div class="lbl">Tool calls &middot; top: {top3_str}</div></div>'
+                f'\n  <div class="kpi">'
+                f'<div class="kpi-label">Tool calls &middot; top: {top3_str}</div>'
+                f'<div class="kpi-val">{tc} · {avg:.1f}/turn</div></div>'
             )
         resumes_card = ""
         resumes_list = report.get("resumes") or []
@@ -4507,26 +5414,26 @@ def render_html(report: dict, variant: str = "single",
                 if n_terminal != 1:
                     terminal_note += "s"
             resumes_card = (
-                f'\n  <div class="card">'
-                f'<div class="val">&#8634; {n_resumes} detected</div>'
-                f'<div class="lbl" title="Precise lower bound: detects claude -c '
+                f'\n  <div class="kpi">'
+                f'<div class="kpi-label" title="Precise lower bound: detects claude -c '
                 f'resumes that replay a prior /exit into this session. Resumes '
                 f'after Ctrl+C or crash leave no trace and are not counted.">'
                 f'Session resumes'
                 f'{(" &middot; " + times_str) if times_str else ""}'
                 f'{terminal_note}'
-                f'</div></div>'
+                f'</div>'
+                f'<div class="kpi-val">&#8634; {n_resumes} detected</div></div>'
             )
         summary_cards_html = f'''\
-<div class="cards">
-  <div class="card amber"><div class="val">${totals['cost']:.4f}</div><div class="lbl">Total cost (USD)</div></div>
-  <div class="card green"><div class="val">${totals['cache_savings']:.4f}</div><div class="lbl">Cache savings</div></div>
-  <div class="card"><div class="val">{totals['cache_hit_pct']:.1f}%</div><div class="lbl">Cache hit ratio</div></div>
-  <div class="card"><div class="val">{totals['total_input']:,}</div><div class="lbl">Total input tokens</div></div>
-  <div class="card"><div class="val">{totals['input']:,}</div><div class="lbl">Input tokens (new)</div></div>
-  <div class="card"><div class="val">{totals['output']:,}</div><div class="lbl">Output tokens</div></div>
-  <div class="card"><div class="val">{totals['cache_read']:,}</div><div class="lbl">Cache read tokens</div></div>
-  <div class="card"><div class="val">{totals['cache_write']:,}</div><div class="lbl">Cache write tokens</div></div>{ttl_mix_card}{thinking_card}{tool_calls_card}{resumes_card}
+<div class="kpi-grid">
+  <div class="kpi featured cat-tokens"><div class="kpi-label">Total cost (USD)</div><div class="kpi-val">${totals['cost']:.4f}</div></div>
+  <div class="kpi cat-save"><div class="kpi-label">Cache savings</div><div class="kpi-val">${totals['cache_savings']:.4f}</div></div>
+  <div class="kpi"><div class="kpi-label">Cache hit ratio</div><div class="kpi-val">{totals['cache_hit_pct']:.1f}%</div></div>
+  <div class="kpi cat-tokens"><div class="kpi-label">Total input tokens</div><div class="kpi-val">{totals['total_input']:,}</div></div>
+  <div class="kpi cat-tokens"><div class="kpi-label">Input tokens (new)</div><div class="kpi-val">{totals['input']:,}</div></div>
+  <div class="kpi cat-tokens"><div class="kpi-label">Output tokens</div><div class="kpi-val">{totals['output']:,}</div></div>
+  <div class="kpi cat-tokens"><div class="kpi-label">Cache read tokens</div><div class="kpi-val">{totals['cache_read']:,}</div></div>
+  <div class="kpi cat-tokens"><div class="kpi-label">Cache write tokens</div><div class="kpi-val">{totals['cache_write']:,}</div></div>{ttl_mix_card}{thinking_card}{tool_calls_card}{resumes_card}
 </div>'''
 
     # Usage Insights panel — sits between the summary cards and the
@@ -4559,13 +5466,40 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
     turn_drawer_html     = ""
     prompts_section_html = ""
     drawer_script_html   = ""
+    chartrail_section_html = ""
     if include_chart:
         turn_data: dict[str, dict] = {}
         prompts_rows: list[dict]   = []
+        # Chart-rail data — one row per turn in document order.
+        # Resume markers are rendered as a distinct column (.tcol.resume) rather
+        # than a full stacked bar; they don't enter turn_data (no drawer).
+        chartrail_data: list[dict] = []
         for s in sessions:
             sid8 = s["session_id"][:8]
+            sess_label = f'{sid8} · {s.get("first_ts", "")}'
+            first_in_session = True
             for t in s["turns"]:
                 if t.get("is_resume_marker"):
+                    chartrail_data.append({
+                        "n":             t["index"],
+                        "key":           "",
+                        "ts":            t.get("timestamp_fmt", ""),
+                        "time":          (t.get("timestamp_fmt", "").split(" ")
+                                           [-1][:5]),
+                        "model":         "",
+                        "input":         0,
+                        "output":        0,
+                        "cache_read":    0,
+                        "cache_write":   0,
+                        "total":         0,
+                        "cost":          0.0,
+                        "session_id":    sid8,
+                        "session_label": sess_label,
+                        "session_break": first_in_session,
+                        "is_resume":     True,
+                        "is_terminal":   bool(t.get("is_terminal_exit_marker")),
+                    })
+                    first_in_session = False
                     continue
                 key = f'{sid8}-{t["index"]}'
                 turn_data[key] = {
@@ -4587,6 +5521,26 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                     "assistant_snippet": t.get("assistant_snippet", ""),
                     "assistant_text":    t.get("assistant_text", ""),
                 }
+                chartrail_data.append({
+                    "n":             t["index"],
+                    "key":           key,
+                    "ts":            t.get("timestamp_fmt", ""),
+                    "time":          (t.get("timestamp_fmt", "").split(" ")
+                                       [-1][:5]),
+                    "model":         t.get("model", ""),
+                    "input":         t.get("input_tokens", 0),
+                    "output":        t.get("output_tokens", 0),
+                    "cache_read":    t.get("cache_read_tokens", 0),
+                    "cache_write":   t.get("cache_write_tokens", 0),
+                    "total":         t.get("total_tokens", 0),
+                    "cost":          t.get("cost_usd", 0.0),
+                    "session_id":    sid8,
+                    "session_label": sess_label,
+                    "session_break": first_in_session,
+                    "is_resume":     False,
+                    "is_terminal":   False,
+                })
+                first_in_session = False
                 if t.get("prompt_text"):
                     prompts_rows.append({
                         "key":    key,
@@ -4607,49 +5561,64 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
             f'<script type="application/json" id="turn-data">{payload_json}</script>'
         )
 
-        turn_drawer_html = '''<div class="turn-drawer-backdrop" hidden></div>
-<aside id="turn-drawer" class="turn-drawer" aria-hidden="true" role="dialog"
-       aria-labelledby="turn-drawer-title">
-  <header class="turn-drawer-hdr">
-    <h3 id="turn-drawer-title">Turn <span data-slot="idx"></span></h3>
-    <button class="turn-drawer-close" aria-label="Close">&times;</button>
-  </header>
-  <div class="turn-drawer-meta">
-    <span data-slot="ts"></span> <span class="sep">&middot;</span>
-    <code data-slot="model"></code><span data-slot="slash-wrap" hidden>
-    <span class="sep">&middot;</span> <code data-slot="slash"></code></span>
+        # Chart-rail: horizontally-scrollable column chart, one column per turn.
+        # Rendered into #chartrail-inner by JS from the chartrail-data JSON blob.
+        chartrail_section_html = _build_chartrail_section_html(chartrail_data)
+
+        turn_drawer_html = '''<div class="drawer-backdrop" id="drawer-backdrop"></div>
+<aside id="drawer" class="drawer" aria-hidden="true" role="dialog"
+       aria-labelledby="drawer-title">
+  <div class="drawer-head">
+    <h3 id="drawer-title">Turn <span data-slot="idx"></span></h3>
+    <button class="x" id="drawer-close" aria-label="Close">&times;</button>
   </div>
-  <section class="turn-drawer-prompt">
-    <h4>Prompt</h4>
-    <pre data-slot="prompt-snippet" class="turn-drawer-pre"></pre>
-    <button class="turn-drawer-more" data-state="collapsed" hidden>Show full prompt</button>
-    <pre data-slot="prompt-full" class="turn-drawer-pre" hidden></pre>
-  </section>
-  <section class="turn-drawer-tools" hidden>
-    <h4>Tools called (<span data-slot="tool-count"></span>)</h4>
-    <ul data-slot="tools" class="turn-drawer-tools-list"></ul>
-  </section>
-  <section class="turn-drawer-content">
-    <h4>Content blocks</h4>
-    <dl data-slot="content-dl" class="turn-drawer-content-dl"></dl>
-  </section>
-  <section class="turn-drawer-cost">
-    <h4>Tokens &amp; cost</h4>
-    <table class="turn-drawer-cost-table"><tbody>
-      <tr><th>Input (new)</th><td data-slot="tok-input"></td></tr>
-      <tr><th>Output</th><td data-slot="tok-output"></td></tr>
-      <tr><th>Cache read</th><td data-slot="tok-cache-read"></td></tr>
-      <tr><th>Cache write</th><td data-slot="tok-cache-write"></td></tr>
-      <tr><th>Cost</th><td data-slot="cost"></td></tr>
-    </tbody></table>
-    <p data-slot="cache-savings" class="turn-drawer-savings" hidden></p>
-  </section>
-  <section class="turn-drawer-assistant" hidden>
-    <h4>Assistant response</h4>
-    <pre data-slot="assistant-snippet" class="turn-drawer-pre"></pre>
-    <button class="turn-drawer-more-a" data-state="collapsed" hidden>Show full response</button>
-    <pre data-slot="assistant-full" class="turn-drawer-pre" hidden></pre>
-  </section>
+  <div class="drawer-body" id="drawer-body">
+    <div class="drawer-sec">
+      <h4>Meta</h4>
+      <dl class="drawer-kv">
+        <dt>Time</dt><dd data-slot="ts"></dd>
+        <dt>Model</dt><dd><code data-slot="model"></code></dd>
+        <dt data-slot="slash-wrap-dt" hidden>Slash</dt>
+        <dd data-slot="slash-wrap" hidden><code data-slot="slash"></code></dd>
+      </dl>
+    </div>
+    <div class="drawer-sec">
+      <h4>Prompt</h4>
+      <div data-slot="prompt-snippet" class="drawer-prompt"></div>
+      <button class="drawer-more" data-state="collapsed" hidden>Show full prompt</button>
+      <div data-slot="prompt-full" class="drawer-prompt" hidden></div>
+    </div>
+    <div class="drawer-sec" data-slot="tools-sec" hidden>
+      <h4>Tools called (<span data-slot="tool-count"></span>)</h4>
+      <ul data-slot="tools" class="drawer-tools-list"></ul>
+    </div>
+    <div class="drawer-sec">
+      <h4>Content blocks</h4>
+      <dl data-slot="content-dl" class="drawer-kv"></dl>
+    </div>
+    <div class="drawer-sec">
+      <h4>Tokens</h4>
+      <dl class="drawer-kv">
+        <dt>Input (new)</dt><dd data-slot="tok-input"></dd>
+        <dt>Output</dt><dd data-slot="tok-output"></dd>
+        <dt>Cache read</dt><dd data-slot="tok-cache-read"></dd>
+        <dt>Cache write</dt><dd data-slot="tok-cache-write"></dd>
+      </dl>
+    </div>
+    <div class="drawer-sec">
+      <h4>Cost</h4>
+      <dl class="drawer-kv">
+        <dt>Cost</dt><dd data-slot="cost"></dd>
+      </dl>
+      <p data-slot="cache-savings" class="drawer-savings" hidden></p>
+    </div>
+    <div class="drawer-sec" data-slot="assistant-sec" hidden>
+      <h4>Assistant response</h4>
+      <div data-slot="assistant-snippet" class="drawer-prompt"></div>
+      <button class="drawer-more drawer-more-a" data-state="collapsed" hidden>Show full response</button>
+      <div data-slot="assistant-full" class="drawer-prompt" hidden></div>
+    </div>
+  </div>
 </aside>'''
 
         if prompts_rows:
@@ -4671,28 +5640,28 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                                    f'{html_mod.escape(r["slash"])}</span>')
                 key_esc = html_mod.escape(r["key"])
                 rows_html.append(
-                    f'<tr class="prompts-row" data-turn-id="{key_esc}"'
-                    f' role="button" tabindex="0">'
+                    f'<tr data-turn="{key_esc}" tabindex="0">'
+                    f'<td class="num">'
+                    f'<a class="prompt-turn-link" href="#turn-{key_esc}">'
+                    f'#{r["idx"]}</a></td>'
+                    f'<td><div class="prompt-text truncate">'
+                    f'{html_mod.escape(r["prompt"])}{slash_badge}</div></td>'
                     f'<td class="cost">${r["cost"]:.4f}</td>'
-                    f'<td class="prompt-cell">'
-                    f'{html_mod.escape(r["prompt"])}{slash_badge}</td>'
                     f'<td class="model"><code>{html_mod.escape(r["model"])}</code></td>'
-                    f'<td class="num"><a href="#turn-{key_esc}">#{r["idx"]}</a></td>'
                     f'<td class="tools">{tools_str}</td>'
                     f'<td class="num">{r["tokens"]:,}</td>'
                     f'</tr>'
                 )
             prompts_section_html = (
-                '<details class="prompts-details" open>'
-                '<summary><h2 class="prompts-h2">Prompts '
-                '<span class="legend">most-expensive user prompts in this report '
-                '&middot; click a row to open turn drawer</span></h2></summary>\n'
-                '<table class="prompts-table">\n<thead><tr>'
-                '<th>Cost</th><th>Prompt</th><th>Model</th>'
-                '<th class="num">Turn</th><th>Tools</th>'
-                '<th class="num">Tokens</th></tr></thead>\n'
+                '<section class="section">\n'
+                '<div class="section-title"><h2>Prompts</h2>'
+                '<span class="hint">most-expensive user prompts in this report '
+                '&middot; click a row to open turn drawer</span></div>\n'
+                '<div class="prompts">\n<table>\n<thead><tr>'
+                '<th>Turn</th><th>Prompt</th><th class="num">Cost</th><th>Model</th>'
+                '<th>Tools</th><th class="num">Tokens</th></tr></thead>\n'
                 f'<tbody>{"".join(rows_html)}</tbody></table>\n'
-                '</details>'
+                '</div>\n</section>'
             )
 
         drawer_script_html = """<script>
@@ -4700,24 +5669,32 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
   var root = document.getElementById('turn-data');
   if (!root) return;
   var data; try { data = JSON.parse(root.textContent); } catch (e) { return; }
-  var drawer   = document.getElementById('turn-drawer');
+  var drawer   = document.getElementById('drawer');
   if (!drawer) return;
-  var backdrop = document.querySelector('.turn-drawer-backdrop');
+  var backdrop = document.getElementById('drawer-backdrop');
   var lastFocused = null;
   function sel(slot) { return drawer.querySelector('[data-slot="' + slot + '"]'); }
   function setText(slot, v) { var el = sel(slot); if (el) el.textContent = v == null ? '' : String(v); }
   function formatNum(n) { return typeof n === 'number' ? n.toLocaleString() : ''; }
 
-  function open(key) {
+  function openTurn(key) {
     var t = data[key]; if (!t) return;
     setText('idx', t.idx); setText('ts', t.ts); setText('model', t.model);
-    var slashWrap = sel('slash-wrap'), slashEl = sel('slash');
-    if (t.slash_command) { slashWrap.hidden = false; slashEl.textContent = t.slash_command; }
-    else { slashWrap.hidden = true; }
+    var slashWrap = sel('slash-wrap');
+    var slashWrapDt = sel('slash-wrap-dt');
+    var slashEl = sel('slash');
+    if (t.slash_command) {
+      if (slashWrap) slashWrap.hidden = false;
+      if (slashWrapDt) slashWrapDt.hidden = false;
+      if (slashEl) slashEl.textContent = t.slash_command;
+    } else {
+      if (slashWrap) slashWrap.hidden = true;
+      if (slashWrapDt) slashWrapDt.hidden = true;
+    }
 
     var snip = t.prompt_snippet || '(no prompt captured)';
     setText('prompt-snippet', snip);
-    var full = sel('prompt-full'), moreBtn = drawer.querySelector('.turn-drawer-more');
+    var full = sel('prompt-full'), moreBtn = drawer.querySelector('.drawer-more:not(.drawer-more-a)');
     if (t.prompt_text && t.prompt_text.length > (t.prompt_snippet || '').length) {
       moreBtn.hidden = false; moreBtn.dataset.state = 'collapsed';
       moreBtn.textContent = 'Show full prompt';
@@ -4729,7 +5706,7 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
     }
 
     var tools = t.tools || [];
-    var toolsSect = drawer.querySelector('.turn-drawer-tools');
+    var toolsSect = sel('tools-sec');
     var toolsList = sel('tools');
     setText('tool-count', tools.length);
     toolsList.innerHTML = '';
@@ -4741,7 +5718,7 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
         li.appendChild(nm);
         if (tu.input_preview) {
           var pv = document.createElement('span');
-          pv.className = 'turn-drawer-tool-preview';
+          pv.className = 'drawer-tool-preview';
           pv.textContent = ' ' + tu.input_preview;
           li.appendChild(pv);
         }
@@ -4777,10 +5754,10 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
     if (savings > 0) { sEl.textContent = 'Cache savings vs no-cache: $' + savings.toFixed(4); sEl.hidden = false; }
     else { sEl.textContent = ''; sEl.hidden = true; }
 
-    var asstSect = drawer.querySelector('.turn-drawer-assistant');
+    var asstSect = sel('assistant-sec');
     var asstSnip = sel('assistant-snippet');
     var asstFull = sel('assistant-full');
-    var asstMore = drawer.querySelector('.turn-drawer-more-a');
+    var asstMore = drawer.querySelector('.drawer-more-a');
     if (t.assistant_snippet) {
       asstSect.hidden = false;
       asstSnip.hidden = false;
@@ -4796,40 +5773,67 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 
     drawer.classList.add('open');
     drawer.setAttribute('aria-hidden', 'false');
-    if (backdrop) { backdrop.hidden = false; }
+    if (backdrop) backdrop.classList.add('open');
     lastFocused = document.activeElement;
-    var closeBtn = drawer.querySelector('.turn-drawer-close');
+    var closeBtn = document.getElementById('drawer-close');
     if (closeBtn) closeBtn.focus();
-  }
 
-  function close() {
+    // Sync highlight state on any clickable sources bound to this turn.
+    document.querySelectorAll('tr.turn-row[data-turn-id]').forEach(function (tr) {
+      tr.classList.toggle('active', tr.getAttribute('data-turn-id') === key);
+    });
+    document.querySelectorAll('.prompts tbody tr[data-turn]').forEach(function (tr) {
+      tr.classList.toggle('active', tr.getAttribute('data-turn') === key);
+    });
+    document.querySelectorAll('.tcol[data-turn]').forEach(function (c) {
+      c.classList.toggle('active', c.getAttribute('data-turn') === key);
+    });
+  }
+  // Expose for other modules (chart-rail) to call.
+  window.smOpenDrawer = openTurn;
+
+  function closeDrawer() {
     drawer.classList.remove('open');
     drawer.setAttribute('aria-hidden', 'true');
-    if (backdrop) { backdrop.hidden = true; }
+    if (backdrop) backdrop.classList.remove('open');
     if (lastFocused && typeof lastFocused.focus === 'function') lastFocused.focus();
   }
 
-  document.querySelectorAll('tr.turn-row[data-turn-id], tr.prompts-row[data-turn-id]').forEach(function (el) {
+  document.querySelectorAll('tr.turn-row[data-turn-id]').forEach(function (el) {
     el.addEventListener('click', function (ev) {
       if (ev.target && ev.target.closest && ev.target.closest('a')) return;
-      open(el.getAttribute('data-turn-id'));
+      openTurn(el.getAttribute('data-turn-id'));
     });
     el.addEventListener('keydown', function (ev) {
       if (ev.key === 'Enter' || ev.key === ' ') {
         ev.preventDefault();
-        open(el.getAttribute('data-turn-id'));
+        openTurn(el.getAttribute('data-turn-id'));
       }
     });
   });
 
-  drawer.querySelector('.turn-drawer-close').addEventListener('click', close);
-  if (backdrop) backdrop.addEventListener('click', close);
-  document.addEventListener('keydown', function (ev) {
-    if (ev.key === 'Escape' && drawer.classList.contains('open')) close();
+  document.querySelectorAll('.prompts tbody tr[data-turn]').forEach(function (el) {
+    el.addEventListener('click', function (ev) {
+      if (ev.target && ev.target.closest && ev.target.closest('a')) return;
+      openTurn(el.getAttribute('data-turn'));
+    });
+    el.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        openTurn(el.getAttribute('data-turn'));
+      }
+    });
   });
 
-  var moreBtn2 = drawer.querySelector('.turn-drawer-more');
-  moreBtn2.addEventListener('click', function () {
+  var closeBtnEl = document.getElementById('drawer-close');
+  if (closeBtnEl) closeBtnEl.addEventListener('click', closeDrawer);
+  if (backdrop) backdrop.addEventListener('click', closeDrawer);
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape' && drawer.classList.contains('open')) closeDrawer();
+  });
+
+  var moreBtn2 = drawer.querySelector('.drawer-more:not(.drawer-more-a)');
+  if (moreBtn2) moreBtn2.addEventListener('click', function () {
     var full = sel('prompt-full'), snippet = sel('prompt-snippet');
     if (moreBtn2.dataset.state === 'collapsed') {
       full.hidden = false; snippet.hidden = true;
@@ -4839,8 +5843,8 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
       moreBtn2.textContent = 'Show full prompt'; moreBtn2.dataset.state = 'collapsed';
     }
   });
-  var moreA2 = drawer.querySelector('.turn-drawer-more-a');
-  moreA2.addEventListener('click', function () {
+  var moreA2 = drawer.querySelector('.drawer-more-a');
+  if (moreA2) moreA2.addEventListener('click', function () {
     var full = sel('assistant-full'), snippet = sel('assistant-snippet');
     if (moreA2.dataset.state === 'collapsed') {
       full.hidden = false; snippet.hidden = true;
@@ -4853,6 +5857,8 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 })();
 </script>"""
 
+    chartrail_script_html = _chartrail_script() if chartrail_section_html else ""
+
     title_suffix  = (" — Dashboard" if variant == "dashboard"
                      else " — Detail" if variant == "detail" else "")
     return f"""<!DOCTYPE html>
@@ -4861,221 +5867,35 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 <meta charset="utf-8">
 <title>Session Metrics — {slug}{title_suffix}</title>
 {chart_head_html}
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-         background: #0d1117; color: #e6edf3; font-size: 13px; padding: 24px; }}
-  h1 {{ font-size: 18px; font-weight: 600; margin-bottom: 4px; color: #f0f6fc; }}
-  .meta {{ color: #8b949e; font-size: 11px; margin-bottom: 24px; }}
-  .cards {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }}
-  .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-           padding: 14px 18px; min-width: 140px; }}
-  .card .val {{ font-size: 22px; font-weight: 700; color: #58a6ff; }}
-  .card .lbl {{ font-size: 11px; color: #8b949e; margin-top: 2px; }}
-  .card.green .val {{ color: #3fb950; }}
-  .card.amber .val {{ color: #d29922; }}
-  .usage-insights {{ margin: 0 0 28px; padding: 16px 20px;
-                     background: #161b22; border: 1px solid #30363d;
-                     border-radius: 8px; }}
-  .usage-insights .ui-top {{ font-size: 14px; line-height: 1.5;
-                             color: #c9d1d9; margin: 0; }}
-  .usage-insights .ui-top strong {{ color: #f0f6fc; font-size: 18px;
-                                    font-weight: 600; margin-right: 6px; }}
-  .usage-insights details {{ margin-top: 10px;
-                             border-top: 1px solid #30363d; padding-top: 8px; }}
-  .usage-insights details > summary {{ list-style: none; cursor: pointer;
-                                        color: #58a6ff; font-size: 13px;
-                                        padding: 4px 0; user-select: none; }}
-  .usage-insights details > summary::-webkit-details-marker {{ display: none; }}
-  .usage-insights details > summary::before {{ content: "▸ ";
-                                                font-size: 10px; }}
-  .usage-insights details[open] > summary::before {{ content: "▾ "; }}
-  .usage-insights details > summary:hover {{ color: #79c0ff; }}
-  .usage-insights ul.ui-list {{ list-style: none; padding: 6px 0 0;
-                                margin: 0; }}
-  .usage-insights ul.ui-list li {{ padding: 8px 0; color: #c9d1d9;
-                                    font-size: 13px; line-height: 1.5;
-                                    border-top: 1px dashed #21262d; }}
-  .usage-insights ul.ui-list li:first-child {{ border-top: none; }}
-  .usage-insights ul.ui-list li strong {{ color: #f0f6fc; font-weight: 600;
-                                          margin-right: 6px; }}
-  h2 {{ font-size: 14px; font-weight: 600; color: #f0f6fc; margin: 24px 0 10px; }}
-  h2 .legend {{ font-size: 11px; font-weight: 400; color: #8b949e;
-                margin-left: 10px; }}
-  h2 .legend code {{ background: #161b22; border: 1px solid #30363d;
-                     border-radius: 3px; padding: 0 4px; font-size: 10px; }}
-  h2 .legend b {{ color: #c9d1d9; font-weight: 600; }}
-  #chart-container {{ background: #161b22; border: 1px solid #30363d;
-                      border-radius: 8px; margin-bottom: 28px; min-height: 420px; }}
-  .chart-controls {{ display: flex; gap: 10px; align-items: center;
-                     padding: 10px 16px 0; flex-wrap: wrap; }}
-  .chart-controls label {{ font-size: 11px; color: #8b949e; display: flex;
-                           align-items: center; gap-5px; cursor: pointer; }}
-  .chart-controls input[type=range] {{ width: 120px; accent-color: #58a6ff; }}
-  .chart-controls span {{ font-size: 11px; color: #58a6ff; min-width: 28px; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
-  th {{ background: #161b22; color: #8b949e; font-weight: 500; text-align: left;
-        padding: 6px 10px; border-bottom: 1px solid #30363d; white-space: nowrap; }}
-  td {{ padding: 4px 10px; border-bottom: 1px solid #21262d; vertical-align: middle; }}
-  tr:hover td {{ background: #161b22; }}
-  td.num, th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  td.ts {{ color: #8b949e; white-space: nowrap; }}
-  td.model {{ color: #a5d6ff; font-size: 11px; }}
-  td.cost {{ text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }}
-  .bar {{ display: inline-block; height: 8px; background: #1f6feb44;
-          border-radius: 2px; margin-right: 6px; vertical-align: middle; }}
-  tr.session-header {{ cursor: pointer; }}
-  tr.session-header td {{ background: #1c2128; color: #58a6ff; padding: 8px 10px;
-                           border-top: 2px solid #30363d; font-size: 12px; }}
-  tr.session-header:hover td {{ background: #1f2937; }}
-  .toggle-arrow {{ display: inline-block; font-size: 10px; transition: transform 0.15s;
-                   margin-right: 4px; }}
-  tr.session-header.open .toggle-arrow {{ transform: rotate(90deg); }}
-  tr.subtotal td {{ background: #161b22; color: #e6edf3; border-top: 1px solid #30363d; }}
-  .models-table td {{ padding: 5px 10px; }}
-  .models-table code {{ font-size: 11px; color: #a5d6ff; }}
-  td.mode-fast {{ color: #3fb950; font-size: 10px; font-weight: 600; }}
-  td.mode-std  {{ color: #484f58; font-size: 10px; }}
-  .badge-ttl {{ display: inline-block; margin-left: 6px; padding: 0 5px;
-                font-size: 9px; font-weight: 600; letter-spacing: 0.5px;
-                border-radius: 3px; vertical-align: middle; cursor: help; }}
-  .badge-ttl.ttl-1h  {{ background: #d2992233; color: #e3b341;
-                        border: 1px solid #d2992266; }}
-  .badge-ttl.ttl-mix {{ background: #8957e533; color: #bc8cff;
-                        border: 1px solid #8957e566; }}
-  td.content-blocks, th.content-blocks {{ font-variant-numeric: tabular-nums;
-                        font-family: "SF Mono", Menlo, Consolas, monospace;
-                        font-size: 11px; white-space: nowrap;
-                        color: #8b949e; cursor: help; }}
-  td.content-blocks span {{ color: #a5d6ff; }}
-  td.content-blocks.muted {{ color: #484f58; cursor: default; }}
-  .legend-block {{ color: #8b949e; font-size: 11px; margin: -4px 0 12px;
-                   padding: 8px 12px; background: #161b22;
-                   border: 1px solid #30363d; border-radius: 6px;
-                   line-height: 1.6; }}
-  .legend-block b {{ color: #c9d1d9; font-weight: 600; }}
-  .legend-block code {{ background: #0d1117; border: 1px solid #30363d;
-                        border-radius: 3px; padding: 0 4px; font-size: 10px;
-                        color: #a5d6ff; }}
-  .chart-page-label {{ font-size: 11px; color: #8b949e; padding: 8px 16px 0;
-                       border-top: 1px solid #30363d; margin-top: 4px; }}
-  tr.resume-marker-row td {{ background: #0d1a2e; border-top: 1px dashed #2f5f9c;
-                             border-bottom: 1px dashed #2f5f9c; padding: 6px 10px; }}
-  tr.resume-marker-row td.resume-marker-idx {{ color: #58a6ff; opacity: 0.7; }}
-  tr.resume-marker-row td.resume-marker-cell {{ text-align: center;
-                              color: #8b949e; font-size: 12px; }}
-  .resume-marker-pill {{ display: inline-flex; align-items: center;
-                         gap: 8px; padding: 3px 10px;
-                         background: #1f3552; border: 1px solid #2f5f9c;
-                         border-radius: 12px; color: #c9d1d9; cursor: help; }}
-  .resume-marker-pill strong {{ color: #58a6ff; font-weight: 600;
-                                font-size: 12px; letter-spacing: 0.2px; }}
-  .resume-marker-pill .resume-marker-icon {{ color: #58a6ff;
-                                             font-size: 14px; line-height: 1; }}
-  .resume-marker-pill .resume-marker-time {{ color: #8b949e; font-size: 11px;
-                                             font-variant-numeric: tabular-nums; }}
-  .resume-marker-pill.terminal {{ background: #2e1f0d; border-color: #9c7a2f; }}
-  .resume-marker-pill.terminal strong,
-  .resume-marker-pill.terminal .resume-marker-icon {{ color: #e3b341; }}
-  tr.turn-row {{ cursor: pointer; }}
-  tr.turn-row:focus {{ outline: 1px solid #58a6ff; outline-offset: -1px; }}
-  .turn-drawer {{ position: fixed; top: 0; right: 0; width: 380px; max-width: 92vw;
-                  height: 100vh; background: #161b22; border-left: 1px solid #30363d;
-                  transform: translateX(100%); transition: transform 0.18s ease-out;
-                  overflow-y: auto; z-index: 1000; padding: 16px 20px 24px;
-                  box-shadow: -4px 0 20px rgba(0,0,0,0.5); }}
-  .turn-drawer.open {{ transform: translateX(0); }}
-  .turn-drawer h3 {{ font-size: 14px; font-weight: 600; color: #f0f6fc; margin: 0; }}
-  .turn-drawer h4 {{ font-size: 11px; font-weight: 600; color: #8b949e;
-                     margin: 14px 0 6px; text-transform: uppercase;
-                     letter-spacing: 0.6px; }}
-  .turn-drawer-hdr {{ display: flex; justify-content: space-between;
-                       align-items: center; margin-bottom: 4px;
-                       border-bottom: 1px solid #30363d; padding-bottom: 10px; }}
-  .turn-drawer-close {{ background: none; border: none; color: #8b949e;
-                         font-size: 22px; cursor: pointer; line-height: 1;
-                         padding: 4px 8px; }}
-  .turn-drawer-close:hover {{ color: #f0f6fc; }}
-  .turn-drawer-meta {{ color: #8b949e; font-size: 11px; margin-top: 6px;
-                        line-height: 1.6; }}
-  .turn-drawer-meta code {{ color: #a5d6ff; background: #0d1117;
-                             border: 1px solid #30363d; padding: 0 5px;
-                             border-radius: 3px; font-size: 10px; }}
-  .turn-drawer-pre {{ background: #0d1117; border: 1px solid #30363d;
-                       border-radius: 4px; padding: 8px 10px; color: #c9d1d9;
-                       font-family: "SF Mono", Menlo, Consolas, monospace;
-                       font-size: 11px; white-space: pre-wrap; word-break: break-word;
-                       max-height: 240px; overflow-y: auto; margin: 0; }}
-  .turn-drawer-more, .turn-drawer-more-a {{ margin-top: 6px; background: none;
-                       border: 1px solid #30363d; color: #58a6ff;
-                       padding: 3px 10px; font-size: 11px; border-radius: 4px;
-                       cursor: pointer; }}
-  .turn-drawer-more:hover, .turn-drawer-more-a:hover {{ border-color: #58a6ff; }}
-  .turn-drawer-tools-list {{ list-style: none; padding: 0; margin: 0; }}
-  .turn-drawer-tools-list li {{ padding: 4px 0; border-top: 1px dashed #21262d;
-                                 font-size: 11px; color: #c9d1d9; }}
-  .turn-drawer-tools-list li:first-child {{ border-top: none; }}
-  .turn-drawer-tools-list code {{ color: #a5d6ff; background: #0d1117;
-                                   border: 1px solid #30363d; padding: 0 4px;
-                                   border-radius: 3px; font-size: 10px; }}
-  .turn-drawer-tool-preview {{ color: #8b949e;
-                                font-family: "SF Mono", Menlo, Consolas, monospace;
-                                font-size: 10px; word-break: break-word; }}
-  .turn-drawer-content-dl {{ display: grid; grid-template-columns: auto 1fr;
-                              gap: 4px 12px; font-size: 11px; color: #c9d1d9;
-                              margin: 0; }}
-  .turn-drawer-content-dl dt {{ color: #8b949e; }}
-  .turn-drawer-content-dl dd {{ margin: 0; color: #a5d6ff;
-                                 font-variant-numeric: tabular-nums; }}
-  .turn-drawer-cost-table {{ width: 100%; font-size: 11px; }}
-  .turn-drawer-cost-table th {{ color: #8b949e; font-weight: 500;
-                                 padding: 3px 6px; border: none; background: none;
-                                 text-align: left; white-space: nowrap; }}
-  .turn-drawer-cost-table td {{ text-align: right; padding: 3px 6px;
-                                 border: none; color: #c9d1d9;
-                                 font-variant-numeric: tabular-nums; }}
-  .turn-drawer-savings {{ color: #3fb950; font-size: 11px; margin-top: 4px; }}
-  .turn-drawer-backdrop {{ position: fixed; inset: 0;
-                            background: rgba(0,0,0,0.35); z-index: 999; }}
-  .prompts-details {{ margin-top: 16px; }}
-  .prompts-details > summary {{ list-style: none; cursor: pointer; }}
-  .prompts-details > summary::-webkit-details-marker {{ display: none; }}
-  .prompts-details > summary h2.prompts-h2 {{ display: inline; }}
-  .prompts-details > summary::before {{ content: "\\25b8 "; font-size: 10px;
-                                         color: #8b949e; }}
-  .prompts-details[open] > summary::before {{ content: "\\25be "; }}
-  .prompts-table tbody tr.prompts-row {{ cursor: pointer; }}
-  .prompts-table tbody tr.prompts-row:focus {{ outline: 1px solid #58a6ff;
-                                                outline-offset: -1px; }}
-  .prompts-table td.prompt-cell {{ max-width: 560px; overflow: hidden;
-                                    text-overflow: ellipsis; white-space: nowrap;
-                                    color: #c9d1d9; }}
-  .prompts-table td.cost {{ color: #d29922; font-variant-numeric: tabular-nums;
-                             white-space: nowrap; }}
-  .prompts-table td.model code {{ color: #a5d6ff; font-size: 11px; }}
-  .prompts-table .prompts-slash {{ display: inline-block; padding: 0 5px;
-                                    font-size: 10px; color: #bc8cff;
-                                    background: #8957e522;
-                                    border: 1px solid #8957e566;
-                                    border-radius: 3px; margin-left: 6px; }}
-</style>
+{_theme_css()}
+{_theme_bootstrap_head_js()}
 </head>
-<body>
+<body class="theme-console">
+<div class="shell">
 {nav_html}
-<h1>Session Metrics — {slug}{title_suffix}</h1>
-<p class="meta">Generated {generated} &nbsp;·&nbsp; Mode: {mode} &nbsp;·&nbsp;
-{len(sessions)} session{'s' if len(sessions) != 1 else ''}, {totals['turns']:,} turns</p>
+<header class="page-header">
+  <h1>Session Metrics — {slug}{title_suffix}</h1>
+  <p class="meta">Generated {generated} &nbsp;·&nbsp; Mode: {mode} &nbsp;·&nbsp;
+  {len(sessions)} session{'s' if len(sessions) != 1 else ''}, {totals['turns']:,} turns</p>
+</header>
 {summary_cards_html}
 {usage_insights_html}
 {tod_html}
 {chart_section_html}
+{chartrail_section_html}
 {table_section_html}
 {prompts_section_html}
 {models_section_html}
+<footer class="foot">
+  <span class="muted">session-metrics · {generated}</span>
+</footer>
+</div>
 {toggle_script_html}
 {turn_data_json_html}
 {turn_drawer_html}
 {drawer_script_html}
+{chartrail_script_html}
+{_theme_bootstrap_body_js()}
 </body>
 </html>"""
 
@@ -5630,7 +6450,7 @@ def _dispatch_instance(instance_report: dict,
             print(f"[{i}/{total}] Rendering drilldown: {slug}...",
                   file=sys.stderr)
             try:
-                html_str = render_html(pr, variant="single",
+                html_str = render_html(pr, variant="project",
                                         chart_lib=chart_lib)
             except (ValueError, KeyError, RuntimeError) as exc:
                 print(f"[warn] {slug}: HTML render failed ({exc})",
@@ -5978,15 +6798,10 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
             "model":         "instance",
             "index":         0,
         })
-    if synth_turns:
-        renderer = CHART_RENDERERS.get(chart_lib) or _render_chart_none
-        # At instance scope each data point is a calendar day — override
-        # the chart renderers' default "Turn" axis label so the x-axis
-        # title + pagination header ("Days 1–60 of N") match reality.
-        chart_html, chart_head_html = renderer(synth_turns, x_title="Day")
-    else:
-        chart_html = ""
-        chart_head_html = ""
+    # Instance page shows a daily cost rail (not the Highcharts 3D chart and
+    # not the per-session chartrail — each is wrong at instance scope).
+    daily_cost_rail_html   = _build_daily_cost_rail_html(daily)
+    daily_cost_rail_script = _daily_cost_rail_script() if daily_cost_rail_html else ""
 
     # ---- Summary cards -----------------------------------------------------
     top_project = projects[0] if projects else None
@@ -6019,15 +6834,17 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
                       "Top model by cost"))
 
     cards_html_parts = []
-    for val, lbl in cards:
+    for idx, (val, lbl) in enumerate(cards):
         safe_val = html_mod.escape(val)
         safe_lbl = html_mod.escape(lbl)
+        # First card is "Total cost" — elevate to .featured
+        kpi_cls = "kpi featured cat-tokens" if idx == 0 else "kpi cat-tokens"
         cards_html_parts.append(
-            f'<div class="card"><div class="val">{safe_val}</div>'
-            f'<div class="lbl">{safe_lbl}</div></div>'
+            f'<div class="{kpi_cls}"><div class="kpi-label">{safe_lbl}</div>'
+            f'<div class="kpi-val">{safe_val}</div></div>'
         )
     summary_cards_html = (
-        f'<div class="cards">{"".join(cards_html_parts)}</div>'
+        f'<div class="kpi-grid">{"".join(cards_html_parts)}</div>'
     )
 
     # ---- Reused insights helpers ------------------------------------------
@@ -6055,8 +6872,7 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
         friendly = html_mod.escape(proj.get("friendly_path", ""))
         if slug in drilldown_slugs:
             name_cell = (
-                f'<a href="projects/{slug_safe}.html" '
-                f'style="color:#58a6ff;text-decoration:none;">'
+                f'<a class="drilldown" data-sm-nav href="projects/{slug_safe}.html">'
                 f'<code>{slug_safe}</code></a>'
             )
         else:
@@ -6065,7 +6881,7 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
             f'<tr>'
             f'<td class="num">{i}</td>'
             f'<td>{name_cell}</td>'
-            f'<td style="color:#8b949e;font-size:11px;">{friendly}</td>'
+            f'<td class="muted mono">{friendly}</td>'
             f'<td class="num">{proj.get("session_count", 0):,}</td>'
             f'<td class="num">{proj.get("turn_count", 0):,}</td>'
             f'<td class="ts">{html_mod.escape(proj.get("first_ts", ""))}</td>'
@@ -6074,10 +6890,10 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
             f'</tr>'
         )
     projects_table_html = (
-        f'<h2>Projects breakdown <span class="legend">'
-        f'sorted by cost descending · click project to open drilldown'
-        f'</span></h2>'
-        f'<table>'
+        f'<section class="section">'
+        f'<div class="section-title"><h2>Projects breakdown</h2>'
+        f'<span class="hint">sorted by cost descending · click project to open drilldown</span></div>'
+        f'<table class="timeline-table">'
         f'<thead><tr>'
         f'<th class="num">#</th><th>Project</th><th>Path</th>'
         f'<th class="num">Sessions</th><th class="num">Turns</th>'
@@ -6085,6 +6901,7 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
         f'</tr></thead>'
         f'<tbody>{"".join(proj_rows_html_parts)}</tbody>'
         f'</table>'
+        f'</section>'
     )
 
     # ---- Models table (aggregated) ----------------------------------------
@@ -6109,7 +6926,8 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
                 f'</tr>'
             )
         models_table_html = (
-            f'<h2>Models (aggregated)</h2>'
+            f'<section class="section">'
+            f'<div class="section-title"><h2>Models (aggregated)</h2></div>'
             f'<table class="models-table">'
             f'<thead><tr>'
             f'<th>Model</th><th class="num">Turns</th>'
@@ -6121,15 +6939,10 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
             f'</tr></thead>'
             f'<tbody>{"".join(model_rows_html_parts)}</tbody>'
             f'</table>'
+            f'</section>'
         )
     else:
         models_table_html = ""
-
-    chart_section_html = (
-        f'<h2>Daily cost timeline <span class="legend">'
-        f'one point per day · aggregated across all projects</span></h2>'
-        f'<div id="chart-container">{chart_html}</div>'
-    ) if chart_html else ""
 
     page_title = "Session Metrics — all projects"
     return f"""<!DOCTYPE html>
@@ -6137,56 +6950,33 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
 <head>
 <meta charset="utf-8">
 <title>{page_title}</title>
-{chart_head_html}
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-         background: #0d1117; color: #e6edf3; font-size: 13px; padding: 24px; }}
-  h1 {{ font-size: 18px; font-weight: 600; margin-bottom: 4px; color: #f0f6fc; }}
-  .meta {{ color: #8b949e; font-size: 11px; margin-bottom: 24px; }}
-  .meta code {{ color: #a5d6ff; background: #161b22; border: 1px solid #30363d;
-                border-radius: 3px; padding: 0 5px; font-size: 10px; }}
-  .cards {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }}
-  .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-           padding: 14px 18px; min-width: 140px; }}
-  .card .val {{ font-size: 22px; font-weight: 700; color: #58a6ff; }}
-  .card .lbl {{ font-size: 11px; color: #8b949e; margin-top: 2px; }}
-  h2 {{ font-size: 14px; font-weight: 600; color: #f0f6fc; margin: 24px 0 10px; }}
-  h2 .legend {{ font-size: 11px; font-weight: 400; color: #8b949e;
-                margin-left: 10px; }}
-  #chart-container {{ background: #161b22; border: 1px solid #30363d;
-                      border-radius: 8px; margin-bottom: 28px; min-height: 420px; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 12px;
-           margin-bottom: 28px; }}
-  th {{ background: #161b22; color: #8b949e; font-weight: 500; text-align: left;
-        padding: 6px 10px; border-bottom: 1px solid #30363d; white-space: nowrap; }}
-  td {{ padding: 4px 10px; border-bottom: 1px solid #21262d; vertical-align: middle; }}
-  tr:hover td {{ background: #161b22; }}
-  td.num, th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  td.ts {{ color: #8b949e; white-space: nowrap; }}
-  td.cost {{ text-align: right; font-variant-numeric: tabular-nums;
-             white-space: nowrap; color: #d29922; }}
-  code {{ color: #a5d6ff; font-size: 11px; }}
-  /* Reused insight helpers pull in the same styles as single/project mode. */
-  .insight-card {{ background: #161b22; border: 1px solid #30363d;
-                   border-radius: 8px; padding: 14px 18px; margin-bottom: 16px; }}
-  .insight-card h3 {{ font-size: 13px; font-weight: 600; color: #f0f6fc;
-                      margin-bottom: 6px; }}
-  .weekly-rollup td, .session-blocks td, .hod-table td, .punchcard td,
-  .heatmap td {{ font-variant-numeric: tabular-nums; }}
-</style>
+{_theme_css()}
+{_theme_bootstrap_head_js()}
 </head>
-<body>
-<h1>{page_title}</h1>
-<p class="meta">Generated {generated} &nbsp;·&nbsp; Scanning: <code>{projects_dir}</code>
- &nbsp;·&nbsp; {report.get("project_count", 0)} projects,
- {report.get("session_count", 0)} sessions,
- {totals.get("turns", 0):,} turns</p>
+<body class="theme-console">
+<div class="shell">
+<header class="topbar">
+  <div class="brand"><span class="dot"></span><span>session-metrics</span></div>
+  <nav class="nav"><span class="navlink current">Instance</span>{_theme_picker_markup()}</nav>
+</header>
+<header class="page-header">
+  <h1>{page_title}</h1>
+  <p class="meta">Generated {generated} &nbsp;·&nbsp; Scanning: <code>{projects_dir}</code>
+   &nbsp;·&nbsp; {report.get("project_count", 0)} projects,
+   {report.get("session_count", 0)} sessions,
+   {totals.get("turns", 0):,} turns</p>
+</header>
 {summary_cards_html}
-{chart_section_html}
+{daily_cost_rail_html}
 {projects_table_html}
 {insights_html}
 {models_table_html}
+<footer class="foot">
+  <span class="muted">session-metrics (instance) · {generated}</span>
+</footer>
+</div>
+{daily_cost_rail_script}
+{_theme_bootstrap_body_js()}
 </body>
 </html>"""
 
