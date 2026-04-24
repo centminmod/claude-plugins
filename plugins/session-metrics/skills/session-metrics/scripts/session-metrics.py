@@ -6450,14 +6450,20 @@ def _dispatch_instance(instance_report: dict,
             print(f"[{i}/{total}] Rendering drilldown: {slug}...",
                   file=sys.stderr)
             try:
-                html_str = render_html(pr, variant="project",
-                                        chart_lib=chart_lib)
+                dash_html = render_html(pr, variant="dashboard",
+                                         nav_sibling=f"{slug}_detail.html",
+                                         chart_lib=chart_lib)
+                det_html  = render_html(pr, variant="detail",
+                                         nav_sibling=f"{slug}_dashboard.html",
+                                         chart_lib=chart_lib)
             except (ValueError, KeyError, RuntimeError) as exc:
                 print(f"[warn] {slug}: HTML render failed ({exc})",
                       file=sys.stderr)
                 continue
-            (root / "projects" / f"{slug}.html").write_text(
-                html_str, encoding="utf-8")
+            (root / "projects" / f"{slug}_dashboard.html").write_text(
+                dash_html, encoding="utf-8")
+            (root / "projects" / f"{slug}_detail.html").write_text(
+                det_html, encoding="utf-8")
             drilldown_slugs.add(slug)
         print(f"[export] per-project drilldowns → {root / 'projects'}",
               file=sys.stderr)
@@ -6872,7 +6878,7 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
         friendly = html_mod.escape(proj.get("friendly_path", ""))
         if slug in drilldown_slugs:
             name_cell = (
-                f'<a class="drilldown" data-sm-nav href="projects/{slug_safe}.html">'
+                f'<a class="drilldown" data-sm-nav href="projects/{slug_safe}_dashboard.html">'
                 f'<code>{slug_safe}</code></a>'
             )
         else:

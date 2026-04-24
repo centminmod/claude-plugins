@@ -6744,12 +6744,14 @@ def test_render_html_instance_suppresses_drawer(instance_env):
 
 def test_render_html_instance_hyperlinks_to_project_drilldowns(instance_env):
     html, run = _run_instance_capture_html(instance_env, drilldown=True)
-    # One href per project, pointing at a relative projects/<slug>.html
-    assert 'href="projects/-home-user-alpha.html"' in html
-    assert 'href="projects/-home-user-beta.html"' in html
-    # Drilldown files actually exist on disk
-    assert (run / "projects" / "-home-user-alpha.html").exists()
-    assert (run / "projects" / "-home-user-beta.html").exists()
+    # Instance index links to the dashboard half of each drilldown pair
+    assert 'href="projects/-home-user-alpha_dashboard.html"' in html
+    assert 'href="projects/-home-user-beta_dashboard.html"' in html
+    # Both halves of each drilldown pair exist on disk
+    assert (run / "projects" / "-home-user-alpha_dashboard.html").exists()
+    assert (run / "projects" / "-home-user-alpha_detail.html").exists()
+    assert (run / "projects" / "-home-user-beta_dashboard.html").exists()
+    assert (run / "projects" / "-home-user-beta_detail.html").exists()
 
 
 def test_render_html_instance_no_drilldown_flag(instance_env):
