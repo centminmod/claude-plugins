@@ -112,6 +112,8 @@ project root, named `session_<id8>_<YYYYMMDD_HHMMSS>.<ext>` (single) or
 | `--no-cache`                 | Skip `~/.cache/session-metrics/parse/` and always re-parse from scratch. |
 | `--include-subagents`        | Also tally spawned subagent JSONL files. |
 | `--cache-break-threshold <N>` | Turns whose `input + cache_creation` exceed N are flagged as **cache-break events** (default 100 000). Matches Anthropic's `session-report` convention. |
+| `--no-subagent-attribution`  | Disable Phase-B subagent → parent-prompt token attribution. Default behaviour rolls every subagent's tokens up onto the user prompt that spawned the chain (additional `attributed_subagent_*` fields, no double-counting). |
+| `--sort-prompts-by {total,self}` | How to rank top prompts in HTML/MD output. `total` (default) = parent + attributed subagent cost, surfaces cheap-prompt-spawning-expensive-subagent turns. `self` = parent only (pre-Phase-B order). CSV/JSON keep `self` ordering for stability regardless of this flag. |
 
 > **Invocation note for the AI.** Don't pass `--tz` or `--utc-offset` unless the user explicitly asks for a specific timezone. The script auto-detects the user's system tz and renders all human-facing timestamps (timeline, session headers, generated-at banner, block anchors) in that tz. JSON/CSV raw `timestamp` fields stay UTC ISO-8601 as a machine-readable audit trail.
 
@@ -187,6 +189,35 @@ export.
 **UUID-based dedup** runs at project and instance scope to prevent
 resumed-session replays from double-counting. Session scope keeps the
 existing `message.id` streaming-split dedup.
+
+### Subagent → parent-prompt attribution (v1.7.0 — Phase B)
+
+When `--include-subagents` is on, every spawned subagent's token usage
+rolls up onto the **user prompt** that originally triggered the chain:
+
+- Three new turn-record fields populate on the spawning prompt's row —
+  `attributed_subagent_tokens`, `attributed_subagent_cost`,
+  `attributed_subagent_count`. They are **purely additive**:
+  `cost_usd` / `total_tokens` on every turn (parent and subagent) are
+  unchanged, so existing aggregators and the session total are
+  untouched. Display layers read both columns separately.
+- **Nested chains** (subagent A → subagent B) attribute B's tokens onto
+  the **root** user prompt, not onto A. Implemented via an iterative
+  resolve over `(tool_use.id, agentId)` linkage extracted from the
+  parent's `toolUseResult.agentId` fields, with a cycle guard.
+- **HTML prompts table** sorts by `cost_usd + attributed_subagent_cost`
+  by default (configurable via `--sort-prompts-by`). A new "Subagents
+  +$" column is auto-shown when at least one top-20 row has attributed
+  cost. The prompt snippet gains a "+N subagents" badge.
+- **CSV per-turn export** always includes the three attribution columns
+  (zero on rows without spawn activity) — column count stays stable.
+- **JSON report** exposes top-level `subagent_attribution_summary`
+  with `attributed_turns`, `orphan_subagent_turns`,
+  `nested_levels_seen`, `cycles_detected`. Useful for sanity checks
+  when pointing at unfamiliar history.
+
+Disable with `--no-subagent-attribution` for performance-sensitive
+instance-mode runs or to compare against pre-Phase-B reports.
 
 ## Instance dashboard (all projects)
 

@@ -397,9 +397,15 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
     last_entry: dict[str, dict] = {}
     merged_content: dict[str, list] = {}
     preceding_user: dict[str, object] = {}
+    # Phase-B: links from a user entry's ``toolUseResult.agentId`` to the
+    # ``tool_use_id`` of every ``tool_result`` block in its content. Indexed
+    # by the *next* assistant ``msg_id`` so subagent attribution can map
+    # ``tool_use.id → agentId`` after turn assembly.
+    preceding_user_agent_links: dict[str, list[tuple[str, str]]] = {}
     resume_marker_msg_ids: set[str] = set()
     recent_user_contents: list[object] = []
     last_user_content = None
+    last_user_agent_links: list[tuple[str, str]] = []
     for entry in entries:
         t = entry.get("type")
         if t == "user":
@@ -408,6 +414,29 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
             recent_user_contents.append(last_user_content)
             if len(recent_user_contents) > _RESUME_LOOKBACK_USER_ENTRIES:
                 recent_user_contents.pop(0)
+            # Phase-B: extract Agent/Task tool_result agentId linkage.
+            # ``toolUseResult.agentId`` is a top-level field on the JSONL
+            # entry that Claude Code synthesises when an Agent/Task
+            # subagent completes. We pair it with every ``tool_result``
+            # block's ``tool_use_id`` in the message content (typically
+            # one block, but we scan all to be safe).
+            agent_links: list[tuple[str, str]] = []
+            tur = entry.get("toolUseResult")
+            tur_agent_id = ""
+            if isinstance(tur, dict):
+                aid = tur.get("agentId")
+                if isinstance(aid, str) and aid:
+                    tur_agent_id = aid
+            if tur_agent_id and isinstance(last_user_content, list):
+                for block in last_user_content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_result":
+                        continue
+                    tuid = block.get("tool_use_id")
+                    if isinstance(tuid, str) and tuid:
+                        agent_links.append((tuid, tur_agent_id))
+            last_user_agent_links = agent_links
             continue
         if t != "assistant":
             continue
@@ -429,6 +458,7 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
         # the first streaming chunk.
         if msg_id not in preceding_user:
             preceding_user[msg_id] = last_user_content
+            preceding_user_agent_links[msg_id] = list(last_user_agent_links)
         content = msg.get("content")
         if isinstance(content, list):
             merged_content.setdefault(msg_id, []).extend(content)
@@ -440,6 +470,7 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
             **entry,
             "message": merged_msg,
             "_preceding_user_content": preceding_user.get(msg_id),
+            "_preceding_user_agent_links": preceding_user_agent_links.get(msg_id, []),
             "_is_resume_marker": msg_id in resume_marker_msg_ids,
         })
     turns.sort(key=lambda e: e.get("timestamp", ""))
@@ -1407,6 +1438,11 @@ def _build_turn_record(global_index: int, entry: dict,
     # turns without the respective signal.
     skill_invocations: list[str] = []
     spawned_subagents: list[str] = []
+    # Phase-B (v1.7.0): tool_use ids of Agent/Task spawn blocks on this
+    # turn. Used by ``_attribute_subagent_tokens`` to map
+    # ``tool_use_id → prompt_anchor_index`` so subagent tokens roll up
+    # to the spawning user prompt.
+    tool_use_ids: list[str] = []
     if isinstance(assist_content, list):
         for block in assist_content:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
@@ -1427,9 +1463,24 @@ def _build_turn_record(global_index: int, entry: dict,
                 st = binput.get("subagent_type")
                 if isinstance(st, str) and st:
                     spawned_subagents.append(st)
+                bid = block.get("id")
+                if isinstance(bid, str) and bid:
+                    tool_use_ids.append(bid)
     # Subagent-type tag propagated from ``_load_session`` when the entry came
     # from a ``subagents/*.jsonl`` file. Main-session turns: empty string.
     subagent_type = str(entry.get("_subagent_type") or "")
+    # Phase-B: filename-derived agentId (only present on subagent turns).
+    subagent_agent_id = str(entry.get("_subagent_agent_id") or "")
+    # Phase-B: ``(tool_use_id, agentId)`` pairs surfaced from the user
+    # entry preceding this turn (set in ``_extract_turns``). Empty for
+    # turns whose preceding user message was not an Agent/Task result.
+    raw_links = entry.get("_preceding_user_agent_links") or []
+    agent_links: list[tuple[str, str]] = []
+    if isinstance(raw_links, list):
+        for pair in raw_links:
+            if (isinstance(pair, (list, tuple)) and len(pair) == 2
+                    and isinstance(pair[0], str) and isinstance(pair[1], str)):
+                agent_links.append((pair[0], pair[1]))
     if u.get("speed") == "fast":
         _FAST_MODE_TURNS[0] += 1
     return {
@@ -1460,6 +1511,19 @@ def _build_turn_record(global_index: int, entry: dict,
         "skill_invocations":      skill_invocations,
         "spawned_subagents":      spawned_subagents,
         "subagent_type":          subagent_type,
+        # Phase-B (v1.7.0): subagent → parent-prompt attribution fields.
+        # ``tool_use_ids`` / ``agent_links`` / ``subagent_agent_id`` are
+        # the linkage primitives. ``prompt_anchor_index`` is filled in
+        # by a one-shot pass over ``turn_records`` in ``_build_report``.
+        # ``attributed_subagent_*`` start at zero and are accumulated by
+        # ``_attribute_subagent_tokens`` on the spawning prompt's row.
+        "tool_use_ids":              tool_use_ids,
+        "agent_links":               agent_links,
+        "subagent_agent_id":         subagent_agent_id,
+        "prompt_anchor_index":       0,
+        "attributed_subagent_tokens": 0,
+        "attributed_subagent_cost":   0.0,
+        "attributed_subagent_count":  0,
     }
 
 
@@ -1815,6 +1879,181 @@ def _build_by_subagent_type(sessions: list[dict], total_cost: float) -> list[dic
                 _accumulate_bucket(row, t)
                 row["_sessions"].add(sid)
     return _finalise_subagent_rows(rows, total_cost)
+
+
+# ---------------------------------------------------------------------------
+# Phase-B (v1.7.0): subagent → parent-prompt token attribution
+# ---------------------------------------------------------------------------
+#
+# Roll subagent token usage onto the user prompt that spawned the subagent
+# chain so the Prompts table reflects the *true* cost of an action ("a
+# cheap-looking prompt that spawned a $1.20 Explore"). Implementation
+# mirrors Anthropic's session-report 3-stage linkage but adapts to our
+# post-load architecture:
+#
+#   Stage 1: ``tool_use.id → prompt_anchor_index`` (parent-side spawn)
+#   Stage 2: ``agentId → prompt_anchor_index`` (via ``toolUseResult.agentId``)
+#   Stage 3: roll subagent turns' tokens onto the resolved root prompt
+#
+# Key correction over Anthropic's reference: we use ``prompt_anchor_index``
+# (the most recent turn whose ``prompt_text`` is non-empty) instead of the
+# turn the spawn happens in. This avoids attribution landing on a turn
+# that's invisible in the Prompts table (which filters on prompt_text).
+# Nested chains resolve via iterative walk (no timestamp-sort dependency)
+# with a cycle guard.
+
+
+def _compute_prompt_anchor_indices(turn_records: list[dict]) -> None:
+    """Forward pass: stamp ``prompt_anchor_index`` on every turn.
+
+    The anchor is the index of the most recent turn (this one or earlier
+    in chronological order) with non-empty ``prompt_text``. Subagent turns
+    don't carry their own ``prompt_text`` and don't anchor for main-session
+    rollup — they keep the most recent main-turn anchor that was seen.
+
+    Mutates ``turn_records`` in place.
+    """
+    last_main_anchor: int | None = None
+    for t in turn_records:
+        # Subagent turns inherit the prior main-turn anchor (their own
+        # ``prompt_text`` is "" by construction since the subagent JSONL
+        # doesn't contain user prompts in the same shape).
+        if t.get("subagent_agent_id"):
+            t["prompt_anchor_index"] = (
+                last_main_anchor if last_main_anchor is not None else t["index"]
+            )
+            continue
+        if (t.get("prompt_text") or "").strip():
+            last_main_anchor = t["index"]
+        t["prompt_anchor_index"] = (
+            last_main_anchor if last_main_anchor is not None else t["index"]
+        )
+
+
+def _attribute_subagent_tokens(turn_records: list[dict]) -> dict:
+    """Roll subagent token usage onto the user prompt that spawned them.
+
+    Modifies the matching turn record in-place: increments
+    ``attributed_subagent_tokens``, ``attributed_subagent_cost`` and
+    ``attributed_subagent_count`` on the *root* main-turn for every
+    subagent turn whose chain resolves back to a known parent.
+
+    The new fields are purely additive: ``cost_usd`` and ``total_tokens``
+    on every turn are unchanged, so ``_totals_from_turns`` and existing
+    aggregators see the same values they did pre-attribution. Display
+    layers read ``attributed_subagent_*`` separately.
+
+    Algorithm (no timestamp-sort dependency, with cycle guard):
+
+    Pass 1 — ``tool_use_id → prompt_anchor_index``:
+        Walk *all* turns (main + subagent). For each turn with
+        ``tool_use_ids``, every id maps to that turn's
+        ``prompt_anchor_index`` — i.e., the user prompt this spawn
+        belongs to. Subagent turns also contribute (nested case): their
+        anchor is the parent-subagent's resolved root, populated by
+        ``_compute_prompt_anchor_indices`` to the most recent main
+        prompt.
+
+    Pass 2 — ``agent_id → anchor_index``:
+        Walk *all* turns. For every ``(tuid, agent_id)`` in
+        ``agent_links``, look up the spawn's ``prompt_anchor_index``
+        from pass 1 and record it under ``agent_id``.
+
+    Pass 3 — roll up subagent tokens:
+        For every turn whose ``subagent_agent_id`` is non-empty, look
+        up ``agent_id_anchor[subagent_agent_id]`` to find the root
+        main-turn index. If found, accumulate; if not, increment the
+        orphan counter.
+
+    Returns a summary dict with totals useful for sanity checks.
+    """
+    summary = {
+        "attributed_turns":       0,
+        "orphan_subagent_turns":  0,
+        "nested_levels_seen":     0,
+        "cycles_detected":        0,
+    }
+    if not turn_records:
+        return summary
+
+    # ``index`` may not equal list position (global_idx is reset across
+    # sessions in _build_report). Build a position map so anchor lookup
+    # is O(1) regardless.
+    index_to_pos = {t["index"]: i for i, t in enumerate(turn_records)}
+
+    # Pass 1: tool_use_id -> prompt_anchor_index.
+    tool_use_to_anchor: dict[str, int] = {}
+    for t in turn_records:
+        if t.get("is_resume_marker"):
+            continue
+        anchor = t.get("prompt_anchor_index", t["index"])
+        for tuid in (t.get("tool_use_ids") or []):
+            if isinstance(tuid, str) and tuid:
+                tool_use_to_anchor[tuid] = anchor
+
+    # Pass 2: agent_id -> anchor_index.
+    agent_id_to_anchor: dict[str, int] = {}
+    for t in turn_records:
+        for pair in (t.get("agent_links") or []):
+            if not (isinstance(pair, (list, tuple)) and len(pair) == 2):
+                continue
+            tuid, aid = pair[0], pair[1]
+            if not (isinstance(tuid, str) and isinstance(aid, str) and tuid and aid):
+                continue
+            anchor = tool_use_to_anchor.get(tuid)
+            if anchor is not None:
+                agent_id_to_anchor[aid] = anchor
+
+    # Pass 3: roll up subagent tokens onto root main turn.
+    attributed_indices: set[int] = set()
+    for t in turn_records:
+        aid = t.get("subagent_agent_id") or ""
+        if not aid:
+            continue
+        anchor = agent_id_to_anchor.get(aid)
+        if anchor is None:
+            summary["orphan_subagent_turns"] += 1
+            continue
+        # Iterative resolve with cycle guard. The anchor from pass 1 is
+        # already the prompt-anchor index of the spawning turn; if that
+        # spawning turn was itself a subagent turn, we step up via its
+        # own ``subagent_agent_id`` until we land on a main turn.
+        visited: set[str] = {aid}
+        depth = 1
+        while True:
+            pos = index_to_pos.get(anchor)
+            if pos is None:
+                break
+            anchor_turn = turn_records[pos]
+            parent_aid = anchor_turn.get("subagent_agent_id") or ""
+            if not parent_aid:
+                break  # reached a main-session turn — root found
+            if parent_aid in visited:
+                summary["cycles_detected"] += 1
+                break
+            visited.add(parent_aid)
+            next_anchor = agent_id_to_anchor.get(parent_aid)
+            if next_anchor is None:
+                break  # orphan in chain — roll onto current anchor anyway
+            anchor = next_anchor
+            depth += 1
+        # Accumulate onto the resolved root (or the deepest known anchor
+        # if the chain orphans partway). The anchor is a main turn iff
+        # we broke on the no-parent-aid branch above.
+        pos = index_to_pos.get(anchor)
+        if pos is None:
+            summary["orphan_subagent_turns"] += 1
+            continue
+        target = turn_records[pos]
+        target["attributed_subagent_tokens"] += int(t.get("total_tokens", 0))
+        target["attributed_subagent_cost"]   += float(t.get("cost_usd", 0.0))
+        target["attributed_subagent_count"]  += 1
+        attributed_indices.add(target["index"])
+        if depth > summary["nested_levels_seen"]:
+            summary["nested_levels_seen"] = depth
+
+    summary["attributed_turns"] = len(attributed_indices)
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -2325,6 +2564,8 @@ def _build_report(
     peak: dict | None = None,
     suppress_model_compare_insight: bool = False,
     cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
+    subagent_attribution: bool = True,
+    sort_prompts_by: str | None = None,
 ) -> dict:
     """Build a structured report dict from raw session data.
 
@@ -2343,11 +2584,30 @@ def _build_report(
     """
     sessions_out = []
     global_idx = 1
+    attribution_summary = {
+        "attributed_turns":      0,
+        "orphan_subagent_turns": 0,
+        "nested_levels_seen":    0,
+        "cycles_detected":       0,
+    }
 
     for session_id, raw_turns, user_ts in sessions_raw:
         turn_records = [_build_turn_record(global_idx + i, t, tz_offset_hours)
                         for i, t in enumerate(raw_turns)]
         global_idx += len(turn_records)
+        # Phase-B (v1.7.0): subagent → parent-prompt attribution. Anchor
+        # computation must precede attribution; both modify turn records
+        # in place. Always-on by default; ``--no-subagent-attribution``
+        # suppresses Pass 3's accumulation while still computing anchors
+        # so other features (sort tie-breaks) keep working.
+        _compute_prompt_anchor_indices(turn_records)
+        if subagent_attribution:
+            session_summary = _attribute_subagent_tokens(turn_records)
+            for k, v in session_summary.items():
+                if k == "nested_levels_seen":
+                    attribution_summary[k] = max(attribution_summary[k], v)
+                else:
+                    attribution_summary[k] += v
         resumes = _build_resumes(turn_records)
         # Stamp `is_terminal_exit_marker` onto the last-turn marker (if any) so
         # the timeline divider can distinguish "user came back" from "user's
@@ -2419,6 +2679,19 @@ def _build_report(
         "by_skill":            _build_by_skill(sessions_out, totals.get("cost", 0.0)),
         "by_subagent_type":    _build_by_subagent_type(sessions_out, totals.get("cost", 0.0)),
         "cache_break_threshold": cache_break_threshold,
+        # Phase-B (v1.7.0): subagent → parent-prompt attribution summary.
+        # Renderers read ``attributed_subagent_*`` directly off turn
+        # records; this top-level dict surfaces orphan/cycle counts +
+        # nested-depth observed for footer + JSON consumers.
+        "subagent_attribution_summary": attribution_summary,
+        # User-requested prompt sort mode (or None = renderer default).
+        # HTML/MD default to ``"total"`` (parent + attributed subagent
+        # cost — bubbles up cheap-prompt-spawning-expensive-subagent
+        # turns); CSV/JSON default to ``"self"`` (parent only) so
+        # script consumers parsing the prior output ordering remain
+        # stable. Value is preserved on the report dict so renderers
+        # can do their own per-format defaulting.
+        "sort_prompts_by": sort_prompts_by,
         # CLI opt-out for the Phase 7 model-compare insight card. Keyed
         # with an underscore so downstream JSON exports don't leak the
         # flag into user-facing schema; `_compute_usage_insights` reads
@@ -2940,7 +3213,12 @@ def render_csv(report: dict) -> str:
                 "cache_write_5m_tokens", "cache_write_1h_tokens", "cache_write_ttl",
                 "total_tokens", "cost_usd", "no_cache_cost_usd",
                 "thinking_blocks", "tool_use_blocks", "text_blocks",
-                "tool_result_blocks", "image_blocks"])
+                "tool_result_blocks", "image_blocks",
+                # Phase-B (v1.7.0) attribution columns. Always emitted so
+                # column count is stable across reports; values are 0 on
+                # turns that didn't spawn a subagent (the common case).
+                "attributed_subagent_tokens", "attributed_subagent_cost",
+                "attributed_subagent_count"])
     for s in report["sessions"]:
         for t in s["turns"]:
             cb = t.get("content_blocks") or {}
@@ -2957,6 +3235,9 @@ def render_csv(report: dict) -> str:
                 cb.get("thinking", 0), cb.get("tool_use", 0),
                 cb.get("text", 0), cb.get("tool_result", 0),
                 cb.get("image", 0),
+                t.get("attributed_subagent_tokens", 0),
+                f"{float(t.get('attributed_subagent_cost', 0.0)):.6f}",
+                t.get("attributed_subagent_count", 0),
             ])
 
     # Time-of-day summary section
@@ -6282,6 +6563,12 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                                    (t.get("tool_use_detail") or [])],
                         "tokens": t.get("total_tokens", 0),
                         "slash":  t.get("slash_command", ""),
+                        # Phase-B (v1.7.0): rolled-up subagent token/cost
+                        # from this prompt's spawned chain. Zero on turns
+                        # that didn't spawn or whose attribution is off.
+                        "att_cost":   t.get("attributed_subagent_cost", 0.0),
+                        "att_tokens": t.get("attributed_subagent_tokens", 0),
+                        "att_count":  t.get("attributed_subagent_count", 0),
                     })
         # `</` sequences would close the surrounding <script> tag early.
         # Replace them with `<\/` (still valid JSON inside a string literal).
@@ -6352,8 +6639,23 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 </aside>'''
 
         if prompts_rows:
-            prompts_rows.sort(key=lambda r: -r["cost"])
+            # Phase-B (v1.7.0): default sort is now ``self + attributed
+            # subagent cost`` for HTML — surfaces cheap-prompt-spawning-
+            # expensive-subagent turns. ``--sort-prompts-by self`` opts
+            # back into pre-Phase-B parent-cost-only ordering. CSV/JSON
+            # default to ``self`` separately so script consumers stay
+            # stable.
+            prompts_sort_mode = report.get("sort_prompts_by") or "total"
+            if prompts_sort_mode == "self":
+                prompts_rows.sort(key=lambda r: -r["cost"])
+            else:
+                prompts_rows.sort(
+                    key=lambda r: -(r["cost"] + r.get("att_cost", 0.0)))
             top = prompts_rows[:20]
+            # Hide the Subagents+$ column entirely when nothing in the
+            # top-N actually has attribution — keeps the table tight on
+            # sessions without subagent activity.
+            show_att = any(r.get("att_count", 0) > 0 for r in top)
             rows_html: list[str] = []
             for r in top:
                 tool_names = r["tools"]
@@ -6368,6 +6670,23 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                 if r.get("slash"):
                     slash_badge = (f' <span class="prompts-slash">'
                                    f'{html_mod.escape(r["slash"])}</span>')
+                # Subagent annotation appended to the prompt cell when
+                # the row has attributed cost — keeps the spawn signal
+                # visible even when the dedicated column is hidden.
+                sub_badge = ""
+                if r.get("att_count", 0) > 0:
+                    sub_badge = (
+                        f' <span class="prompts-subagent" title="'
+                        f'Includes ${r["att_cost"]:.4f} from {r["att_count"]} '
+                        f'subagent turn(s) attributed to this prompt">'
+                        f'+{r["att_count"]} subagent'
+                        f'{"s" if r["att_count"] != 1 else ""}'
+                        f'</span>'
+                    )
+                att_cell = (
+                    f'<td class="num cost">${r["att_cost"]:.4f}</td>'
+                    if show_att else ""
+                )
                 key_esc = html_mod.escape(r["key"])
                 rows_html.append(
                     f'<tr data-turn="{key_esc}" tabindex="0">'
@@ -6375,20 +6694,35 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                     f'<a class="prompt-turn-link" href="#turn-{key_esc}">'
                     f'#{r["idx"]}</a></td>'
                     f'<td><div class="prompt-text truncate">'
-                    f'{html_mod.escape(r["prompt"])}{slash_badge}</div></td>'
+                    f'{html_mod.escape(r["prompt"])}{slash_badge}{sub_badge}'
+                    f'</div></td>'
                     f'<td class="cost">${r["cost"]:.4f}</td>'
+                    f'{att_cell}'
                     f'<td class="model"><code>{html_mod.escape(r["model"])}</code></td>'
                     f'<td class="tools">{tools_str}</td>'
                     f'<td class="num">{r["tokens"]:,}</td>'
                     f'</tr>'
                 )
+            att_th = (
+                '<th class="num" title="Subagent token cost rolled up '
+                'onto this prompt (Phase-B attribution)">Subagents +$</th>'
+                if show_att else ""
+            )
+            sort_hint = (
+                "ranked by parent + attributed subagent cost"
+                if prompts_sort_mode != "self"
+                else "ranked by parent-turn cost only"
+            )
             prompts_section_html = (
                 '<section class="section">\n'
                 '<div class="section-title"><h2>Prompts</h2>'
-                '<span class="hint">most-expensive user prompts in this report '
-                '&middot; click a row to open turn drawer</span></div>\n'
+                f'<span class="hint">most-expensive user prompts in this report '
+                f'&middot; {sort_hint} '
+                f'&middot; click a row to open turn drawer</span></div>\n'
                 '<div class="prompts">\n<table>\n<thead><tr>'
-                '<th>Turn</th><th>Prompt</th><th class="num">Cost</th><th>Model</th>'
+                '<th>Turn</th><th>Prompt</th><th class="num">Cost</th>'
+                f'{att_th}'
+                '<th>Model</th>'
                 '<th>Tools</th><th class="num">Tokens</th></tr></thead>\n'
                 f'<tbody>{"".join(rows_html)}</tbody></table>\n'
                 '</div>\n</section>'
@@ -6743,10 +7077,19 @@ def _load_session(
         if subagent_dir.exists():
             for sub in sorted(subagent_dir.glob("*.jsonl")):
                 agent_type = _resolve_subagent_type(sub)
+                # Phase-B: filename stem sans ``agent-`` prefix is the
+                # canonical agentId Claude Code uses to link a subagent
+                # JSONL to the parent's ``toolUseResult.agentId``. Tag
+                # every entry so ``_attribute_subagent_tokens`` can roll
+                # tokens up onto the spawning prompt.
+                agent_id = sub.stem
+                if agent_id.startswith("agent-"):
+                    agent_id = agent_id[len("agent-"):]
                 sub_entries = _cached_parse_jsonl(sub, use_cache=use_cache)
                 for e in sub_entries:
                     if isinstance(e, dict):
                         e["_subagent_type"] = agent_type
+                        e["_subagent_agent_id"] = agent_id
                         entries.append(e)
     # Cross-file UUID dedup (opt-in). Anthropic's session-report uses this
     # to prevent resumed-session replays from double-counting across sibling
@@ -6779,7 +7122,9 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
                          use_cache: bool = True,
                          chart_lib: str = "highcharts",
                          suppress_model_compare_insight: bool = False,
-                         cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD) -> None:
+                         cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
+                         subagent_attribution: bool = True,
+                         sort_prompts_by: str | None = None) -> None:
     print(f"Session : {jsonl_path.stem}", file=sys.stderr)
     print(f"File    : {jsonl_path}", file=sys.stderr)
     print(file=sys.stderr)
@@ -6799,6 +7144,8 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
         tz_offset_hours=tz_offset, tz_label=tz_label, peak=peak,
         suppress_model_compare_insight=suppress_model_compare_insight,
         cache_break_threshold=cache_break_threshold,
+        subagent_attribution=subagent_attribution,
+        sort_prompts_by=sort_prompts_by,
     )
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib)
 
@@ -6810,7 +7157,9 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
                       use_cache: bool = True,
                       chart_lib: str = "highcharts",
                       suppress_model_compare_insight: bool = False,
-                      cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD) -> None:
+                      cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
+                      subagent_attribution: bool = True,
+                      sort_prompts_by: str | None = None) -> None:
     files = _find_jsonl_files(slug)
     if not files:
         print(f"[error] No sessions found for slug: {slug}", file=sys.stderr)
@@ -6837,6 +7186,8 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
         tz_offset_hours=tz_offset, tz_label=tz_label, peak=peak,
         suppress_model_compare_insight=suppress_model_compare_insight,
         cache_break_threshold=cache_break_threshold,
+        subagent_attribution=subagent_attribution,
+        sort_prompts_by=sort_prompts_by,
     )
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib)
 
@@ -7086,6 +7437,26 @@ def _merge_bucket_rows(project_reports: list[dict], key: str,
     return out
 
 
+def _aggregate_attribution_summary(project_reports: list[dict]) -> dict:
+    """Sum per-project Phase-B attribution summaries (counts add; nested
+    depth maxes). Stable shape across modes so renderers don't branch."""
+    out = {
+        "attributed_turns":      0,
+        "orphan_subagent_turns": 0,
+        "nested_levels_seen":    0,
+        "cycles_detected":       0,
+    }
+    for pr in project_reports:
+        s = pr.get("subagent_attribution_summary") or {}
+        for k in out:
+            v = int(s.get(k, 0) or 0)
+            if k == "nested_levels_seen":
+                out[k] = max(out[k], v)
+            else:
+                out[k] += v
+    return out
+
+
 def _build_instance_report(
         project_reports: list[dict],
         all_sessions_raw: list[tuple[str, list[dict], list[int]]],
@@ -7184,6 +7555,13 @@ def _build_instance_report(
         "by_skill":            inst_by_skill,
         "by_subagent_type":    inst_by_subagent,
         "cache_break_threshold": cache_break_threshold,
+        # Phase-B (v1.7.0): instance-wide attribution summary — sum
+        # per-project counts; max nested depth observed across all
+        # projects. Each project's per-turn ``attributed_subagent_*``
+        # already lives on the per-project sessions/turns and renders
+        # via the project drilldown — no instance-level aggregation
+        # needed beyond the summary footer.
+        "subagent_attribution_summary": _aggregate_attribution_summary(project_reports),
         # Placeholders so the existing renderers don't KeyError if they
         # reach into the report looking for these.
         "sessions":         [],
@@ -7202,7 +7580,9 @@ def _run_all_projects(formats: list[str],
                       include_subagents: bool = False,
                       drilldown: bool = True,
                       suppress_model_compare_insight: bool = False,
-                      cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD) -> None:
+                      cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
+                      subagent_attribution: bool = True,
+                      sort_prompts_by: str | None = None) -> None:
     projects_dir = _projects_dir()
     print(f"Scanning: {projects_dir}", file=sys.stderr)
     discovered = _list_all_projects()
@@ -7254,6 +7634,8 @@ def _run_all_projects(formats: list[str],
             tz_offset_hours=tz_offset, tz_label=tz_label, peak=peak,
             suppress_model_compare_insight=True,  # per-project, suppress noise
             cache_break_threshold=cache_break_threshold,
+            subagent_attribution=subagent_attribution,
+            sort_prompts_by=sort_prompts_by,
         )
         project_reports.append(pr)
         all_sessions_raw.extend(sessions_raw)
@@ -8008,6 +8390,20 @@ def _build_parser() -> argparse.ArgumentParser:
                          f"flagged as cache-break events (default: "
                          f"{_CACHE_BREAK_DEFAULT_THRESHOLD:,}). Matches Anthropic "
                          f"session-report's convention."))
+    p.add_argument("--no-subagent-attribution", action="store_true",
+                   help="Disable Phase-B subagent → parent-prompt token "
+                        "attribution. By default, subagent token usage rolls "
+                        "up onto the user prompt that spawned the subagent "
+                        "chain via additional ``attributed_subagent_*`` "
+                        "fields (no double-counting).")
+    p.add_argument("--sort-prompts-by", choices=["total", "self"],
+                   default=None, metavar="MODE",
+                   help="How to rank top-prompts: 'total' (parent + attributed "
+                        "subagent cost — bubbles cheap prompts that spawned "
+                        "expensive subagents) or 'self' (parent only — pre-"
+                        "Phase-B behaviour). Default: 'total' for HTML/MD "
+                        "outputs, 'self' for CSV/JSON to keep machine "
+                        "consumers stable.")
     p.add_argument("--tz", metavar="IANA",
                    help="IANA timezone for time-of-day bucketing "
                         "(e.g. 'America/Los_Angeles', 'Australia/Brisbane'). "
@@ -8506,6 +8902,8 @@ def main() -> None:
             drilldown=not args.no_project_drilldown,
             suppress_model_compare_insight=args.no_model_compare_insight,
             cache_break_threshold=args.cache_break_threshold,
+            subagent_attribution=not args.no_subagent_attribution,
+            sort_prompts_by=args.sort_prompts_by,
         )
         return
 
@@ -8519,6 +8917,8 @@ def main() -> None:
             use_cache=not args.no_cache, chart_lib=chart_lib,
             suppress_model_compare_insight=args.no_model_compare_insight,
             cache_break_threshold=args.cache_break_threshold,
+            subagent_attribution=not args.no_subagent_attribution,
+            sort_prompts_by=args.sort_prompts_by,
         )
         return
 
@@ -8531,6 +8931,8 @@ def main() -> None:
         use_cache=not args.no_cache, chart_lib=chart_lib,
         suppress_model_compare_insight=args.no_model_compare_insight,
         cache_break_threshold=args.cache_break_threshold,
+        subagent_attribution=not args.no_subagent_attribution,
+        sort_prompts_by=args.sort_prompts_by,
     )
 
 

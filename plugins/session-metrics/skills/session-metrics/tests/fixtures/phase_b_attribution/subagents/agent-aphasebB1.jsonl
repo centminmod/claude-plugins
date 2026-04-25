@@ -1,0 +1,2 @@
+{"type":"user","uuid":"pbB1-u1","timestamp":"2026-04-25T09:00:18.000Z","sessionId":"pb-B1","message":{"role":"user","content":[{"type":"text","text":"plan subagent: do work"}]}}
+{"type":"assistant","uuid":"pbB1-a1","timestamp":"2026-04-25T09:00:22.000Z","sessionId":"pb-B1","message":{"id":"pbB1_msg_1","model":"claude-opus-4-7","role":"assistant","content":[{"type":"text","text":"plan output"}],"usage":{"input_tokens":700,"output_tokens":250,"cache_read_input_tokens":1500,"cache_creation_input_tokens":0}}}

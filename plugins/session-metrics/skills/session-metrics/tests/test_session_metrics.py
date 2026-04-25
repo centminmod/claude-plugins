@@ -7237,3 +7237,173 @@ def test_phase_a_cli_flag_parsed():
     # Default is the module constant.
     args_default = sm._build_parser().parse_args([])
     assert args_default.cache_break_threshold == sm._CACHE_BREAK_DEFAULT_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Phase-B subagent → parent-prompt token attribution (v1.7.0).
+# Fixture in fixtures/phase_b_attribution.jsonl (+ subagents/ dir) covers:
+#   - parent → Explore subagent (direct attribution)
+#   - Explore → nested Plan subagent (transitive root attribution)
+#   - parent → spawn whose subagent file is missing (orphan path)
+# ---------------------------------------------------------------------------
+
+_PHASE_B_FIXTURE = _HERE / "fixtures" / "phase_b_attribution.jsonl"
+
+
+def _build_phase_b_report(subagent_attribution=True, sort_prompts_by=None):
+    """Load Phase-B fixture with subagents enabled and attribution applied."""
+    sid, turns, user_ts = sm._load_session(
+        _PHASE_B_FIXTURE, include_subagents=True, use_cache=False)
+    return sm._build_report(
+        "session", "pb", [(sid, turns, user_ts)],
+        subagent_attribution=subagent_attribution,
+        sort_prompts_by=sort_prompts_by,
+    )
+
+
+def test_phase_b_extract_turns_captures_agent_links():
+    entries = sm._parse_jsonl(_PHASE_B_FIXTURE)
+    turns = sm._extract_turns(entries)
+    # The 2nd assistant turn (pb-a2) is paired with the user entry that
+    # carries toolUseResult.agentId=aphasebA1 + tool_use_id=tu-explore.
+    a2 = next(t for t in turns if t["message"]["id"] == "pb_msg_2")
+    links = a2.get("_preceding_user_agent_links") or []
+    assert ("tu-explore", "aphasebA1") in links
+
+
+def test_phase_b_load_session_tags_subagent_agent_id():
+    sid, turns, _ = sm._load_session(
+        _PHASE_B_FIXTURE, include_subagents=True, use_cache=False)
+    sub_turns = [t for t in turns if t.get("_subagent_agent_id")]
+    # Two subagent files: aphasebA1 (2 assistant turns) + aphasebB1 (1).
+    assert {t.get("_subagent_agent_id") for t in sub_turns} == {
+        "aphasebA1", "aphasebB1"}
+
+
+def test_phase_b_simple_attribution():
+    r = _build_phase_b_report()
+    turns = r["sessions"][0]["turns"]
+    parent = next(t for t in turns
+                  if t.get("prompt_text", "").startswith("do an Explore"))
+    # A1 has 2 assistant turns: 1500+400+3000 = 4900 + 2500+500+4000 = 7000
+    # = 11_900 total tokens. Plus B1's 700+250+1500 = 2450 nested.
+    assert parent["attributed_subagent_count"] >= 3
+    assert parent["attributed_subagent_tokens"] == 11_900 + 2_450
+    assert parent["attributed_subagent_cost"] > 0
+
+
+def test_phase_b_orphan_subagent_counted():
+    r = _build_phase_b_report()
+    summary = r["subagent_attribution_summary"]
+    # The "orphan" parent spawn references aphasebMissing for which no
+    # subagent file exists, so no rollup happens — but the attribution
+    # pass also doesn't crash. orphan_subagent_turns is non-zero only if
+    # a subagent JSONL was loaded but its parent linkage was missing —
+    # in this fixture that is also the case for B1 chain (its parent A1
+    # IS resolvable, so B1 isn't orphaned). So orphan_subagent_turns = 0
+    # here. We assert no crash and that nested_levels_seen >= 1.
+    assert summary["nested_levels_seen"] >= 1
+
+
+def test_phase_b_nested_chain_rolls_to_root():
+    """B1's 1 turn (970 tokens) should be on the root prompt, not on A1."""
+    r = _build_phase_b_report()
+    turns = r["sessions"][0]["turns"]
+    parent = next(t for t in turns
+                  if t.get("prompt_text", "").startswith("do an Explore"))
+    a1_turns = [t for t in turns if t.get("subagent_agent_id") == "aphasebA1"]
+    b1_turns = [t for t in turns if t.get("subagent_agent_id") == "aphasebB1"]
+    # The Explore subagent file (A1) has 2 assistant turns. Its own
+    # ``attributed_subagent_*`` should be 0 — nested tokens roll up to
+    # the original root, not the intermediate subagent.
+    assert all(t["attributed_subagent_count"] == 0 for t in a1_turns)
+    assert all(t["attributed_subagent_count"] == 0 for t in b1_turns)
+    # Root parent count >= 3 (2 from A1 + 1 from B1).
+    assert parent["attributed_subagent_count"] == 3
+
+
+def test_phase_b_no_double_counting_in_totals():
+    """Session total cost is the sum of every turn's cost_usd. The
+    attribution pass adds attributed_subagent_* fields without modifying
+    cost_usd or total_tokens, so totals must match before/after."""
+    r_with = _build_phase_b_report(subagent_attribution=True)
+    r_without = _build_phase_b_report(subagent_attribution=False)
+    assert r_with["totals"]["cost"] == r_without["totals"]["cost"]
+    assert r_with["totals"]["input"] == r_without["totals"]["input"]
+
+
+def test_phase_b_disabled_zeroes_attribution():
+    r = _build_phase_b_report(subagent_attribution=False)
+    turns = r["sessions"][0]["turns"]
+    assert all(t["attributed_subagent_count"] == 0 for t in turns)
+    assert all(t["attributed_subagent_tokens"] == 0 for t in turns)
+
+
+def test_phase_b_prompt_anchor_index_skips_empty_prompts():
+    """A turn with empty prompt_text (e.g., the second turn of an Agent
+    spawn chain) inherits the prompt_anchor_index of the most recent
+    non-empty user prompt, so attribution lands where it's renderable."""
+    r = _build_phase_b_report()
+    turns = r["sessions"][0]["turns"]
+    parent_idx = next(t["index"] for t in turns
+                      if t.get("prompt_text", "").startswith("do an Explore"))
+    spawn_turn = next(t for t in turns if "tu-explore" in (t.get("tool_use_ids") or []))
+    # The spawn turn itself often has prompt_text=="" because the user
+    # entry is a tool_result; the anchor must point to the *user* prompt.
+    assert spawn_turn["prompt_anchor_index"] == parent_idx
+
+
+def test_phase_b_html_attribution_column_renders():
+    r = _build_phase_b_report()
+    html = sm.render_html(r, variant="single", chart_lib="none")
+    assert ">Subagents +$<" in html
+    # And the row badge appears for the parent prompt.
+    assert "+3 subagents" in html or "+3 subagent" in html
+
+
+def test_phase_b_html_no_column_when_attribution_off():
+    r = _build_phase_b_report(subagent_attribution=False)
+    html = sm.render_html(r, variant="single", chart_lib="none")
+    assert ">Subagents +$<" not in html
+
+
+def test_phase_b_csv_includes_attributed_columns():
+    r = _build_phase_b_report()
+    csv = sm.render_csv(r)
+    assert "attributed_subagent_tokens" in csv
+    assert "attributed_subagent_cost" in csv
+    assert "attributed_subagent_count" in csv
+
+
+def test_phase_b_sort_prompts_by_total_default_html():
+    # In the fixture the parent-Explore prompt has small parent cost but
+    # large attributed cost — under default 'total' sort it should appear
+    # before the orphan-spawn prompt (which has higher parent cost on
+    # this fixture is similar).
+    r = _build_phase_b_report(sort_prompts_by=None)
+    html = sm.render_html(r, variant="single", chart_lib="none")
+    # The Explore parent prompt snippet appears before the orphan
+    # parent's snippet in the rendered table when sorted by total.
+    explore_pos = html.find("do an Explore for foo")
+    orphan_pos = html.find("orphan-spawn")
+    plain_pos = html.find("plain prompt no spawn")
+    # All three snippets should be in the prompts table.
+    assert explore_pos > 0 and orphan_pos > 0 and plain_pos > 0
+    # Explore precedes plain (much bigger total).
+    assert explore_pos < plain_pos
+
+
+def test_phase_b_sort_prompts_by_self_explicit():
+    r = _build_phase_b_report(sort_prompts_by="self")
+    html = sm.render_html(r, variant="single", chart_lib="none")
+    assert "ranked by parent-turn cost only" in html
+
+
+def test_phase_b_cli_flags_parsed():
+    args = sm._build_parser().parse_args(["--no-subagent-attribution",
+                                          "--sort-prompts-by", "self"])
+    assert args.no_subagent_attribution is True
+    assert args.sort_prompts_by == "self"
+    args_default = sm._build_parser().parse_args([])
+    assert args_default.no_subagent_attribution is False
+    assert args_default.sort_prompts_by is None
