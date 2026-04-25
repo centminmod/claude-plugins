@@ -111,6 +111,7 @@ project root, named `session_<id8>_<YYYYMMDD_HHMMSS>.<ext>` (single) or
 | `--utc-offset <H>`           | Fixed UTC offset, DST-naive. Use `--tz` for DST-aware. |
 | `--no-cache`                 | Skip `~/.cache/session-metrics/parse/` and always re-parse from scratch. |
 | `--include-subagents`        | Also tally spawned subagent JSONL files. |
+| `--cache-break-threshold <N>` | Turns whose `input + cache_creation` exceed N are flagged as **cache-break events** (default 100 000). Matches Anthropic's `session-report` convention. |
 
 > **Invocation note for the AI.** Don't pass `--tz` or `--utc-offset` unless the user explicitly asks for a specific timezone. The script auto-detects the user's system tz and renders all human-facing timestamps (timeline, session headers, generated-at banner, block anchors) in that tz. JSON/CSV raw `timestamp` fields stay UTC ISO-8601 as a machine-readable audit trail.
 
@@ -156,6 +157,36 @@ fingerprint — lower-bound count), and the **Usage Insights** panel
 (prose-style pattern characterisations inspired by Anthropic's `/usage`
 command, auto-hide below threshold, exposed in JSON under `usage_insights`
 and in Markdown under `## Usage Insights`).
+
+### Cross-cutting sections (v1.6.0 — inspired by Anthropic's session-report)
+
+Three additional sections auto-hide when empty and render at every scope
+(single session / `--project-cost` / `--all-projects`). All three feed the
+same `by_skill`, `by_subagent_type`, and `cache_breaks` keys in the JSON
+export.
+
+- **Cache breaks** — single turns whose `input + cache_creation` exceeds
+  the threshold (configurable via `--cache-break-threshold`, default
+  100 000). Each row names **which turn** lost the cache; the HTML version
+  is expandable and shows ±2 user-prompt context around the event.
+  Complements the overall cache-hit % with actionable "here is where it
+  blew up" detail.
+- **Skills & slash commands** — one row per named skill or `/slash`
+  command, columns: invocations, turns attributed, input / output / cache
+  tokens, % cached, cost, % of total. Attribution model: a slash-prefixed
+  user prompt sets the "current skill" for that prompt and its follow-up
+  turns; a Skill-tool invocation overrides attribution for its own turn.
+  Slash-prefixed keys (e.g. `/session-metrics`) are de-slashed so they
+  merge with Skill-tool invocations of the same name.
+- **Subagent types** — one row per resolved `subagent_type` (from
+  `Agent` / `Task` tool_use `input.subagent_type`). Shows spawn count
+  always; token/cost columns populate when `--include-subagents` is
+  passed (subagent JSONLs are tagged with their type via meta.json →
+  filename regex → `fork` fallback).
+
+**UUID-based dedup** runs at project and instance scope to prevent
+resumed-session replays from double-counting. Session scope keeps the
+existing `message.id` streaming-split dedup.
 
 ## Instance dashboard (all projects)
 

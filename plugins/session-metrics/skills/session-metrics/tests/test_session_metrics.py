@@ -7087,3 +7087,153 @@ def test_argparse_compare_run_alone_accepted():
     args = sm._build_parser().parse_args(["--compare-run"])
     assert args.compare_run == []  # nargs="*" with no values gives []
     assert args.compare is None
+
+
+# ---------------------------------------------------------------------------
+# Phase-A aggregators (v1.6.0) — cache_breaks / by_skill / by_subagent_type
+# and UUID global dedup. See CLAUDE-session-metrics-development-history.md
+# Session 63 for context.
+# ---------------------------------------------------------------------------
+
+_PHASE_A_FIXTURE = _HERE / "fixtures" / "phase_a_session.jsonl"
+
+
+def _build_phase_a_report():
+    entries = sm._parse_jsonl(_PHASE_A_FIXTURE)
+    turns = sm._extract_turns(entries)
+    user_ts = sm._extract_user_timestamps(entries)
+    return sm._build_report("session", "pa", [("pa", turns, user_ts)])
+
+
+def test_phase_a_cache_break_detection_threshold():
+    r = _build_phase_a_report()
+    breaks = r.get("cache_breaks") or []
+    assert len(breaks) == 1
+    cb = breaks[0]
+    # input 150_000 + cache_creation 2_000 = 152_000 uncached.
+    assert cb["uncached"] == 152_000
+    assert cb["turn_index"] == 2
+    assert any(c.get("here") for c in cb["context"])
+
+
+def test_phase_a_cache_break_threshold_override():
+    entries = sm._parse_jsonl(_PHASE_A_FIXTURE)
+    turns = sm._extract_turns(entries)
+    user_ts = sm._extract_user_timestamps(entries)
+    r = sm._build_report("session", "pa", [("pa", turns, user_ts)],
+                          cache_break_threshold=1_000_000)
+    assert (r.get("cache_breaks") or []) == []
+
+
+def test_phase_a_by_skill_table():
+    r = _build_phase_a_report()
+    rows = {row["name"]: row for row in (r.get("by_skill") or [])}
+    assert "compact" in rows
+    assert rows["compact"]["invocations"] >= 1
+    assert rows["compact"]["turns_attributed"] >= 1
+    assert "session-metrics" in rows
+    assert rows["session-metrics"]["invocations"] >= 2
+    # Plain no-signal turn is not attributed.
+    total_attributed_turns = sum(r["turns_attributed"] for r in rows.values())
+    assert total_attributed_turns <= 4
+
+
+def test_phase_a_by_subagent_type_spawn_count():
+    r = _build_phase_a_report()
+    rows = {row["name"]: row for row in (r.get("by_subagent_type") or [])}
+    assert "Explore" in rows
+    assert rows["Explore"]["spawn_count"] == 1
+
+
+def test_phase_a_turn_record_fields_present():
+    r = _build_phase_a_report()
+    turns = r["sessions"][0]["turns"]
+    spawn_turns = [t for t in turns if t.get("spawned_subagents")]
+    skill_turns = [t for t in turns if t.get("skill_invocations")]
+    assert len(spawn_turns) == 1
+    assert spawn_turns[0]["spawned_subagents"] == ["Explore"]
+    assert len(skill_turns) == 1
+    assert skill_turns[0]["skill_invocations"] == ["session-metrics"]
+    assert all(t.get("subagent_type", "") == "" for t in turns)
+
+
+def test_phase_a_uuid_global_dedup(tmp_path):
+    original = _PHASE_A_FIXTURE.read_text(encoding="utf-8")
+    a_path = tmp_path / "pa-original.jsonl"
+    b_path = tmp_path / "pa-resumed.jsonl"
+    a_path.write_text(original, encoding="utf-8")
+    b_path.write_text(original, encoding="utf-8")
+    _, turns_no_dedup_a, _ = sm._load_session(
+        a_path, include_subagents=False, use_cache=False)
+    _, turns_no_dedup_b, _ = sm._load_session(
+        b_path, include_subagents=False, use_cache=False, seen_uuids=None)
+    assert len(turns_no_dedup_a) == len(turns_no_dedup_b) > 0
+    shared: set[str] = set()
+    _, turns_shared_a, _ = sm._load_session(
+        a_path, include_subagents=False, use_cache=False, seen_uuids=shared)
+    _, turns_shared_b, _ = sm._load_session(
+        b_path, include_subagents=False, use_cache=False, seen_uuids=shared)
+    assert len(turns_shared_a) == len(turns_no_dedup_a)
+    assert len(turns_shared_b) == 0  # every uuid already seen
+
+
+def test_phase_a_resolve_subagent_type_filename_fallback(tmp_path):
+    sub = tmp_path / "agent-aExplore-abc123def.jsonl"
+    sub.write_text("", encoding="utf-8")
+    assert sm._resolve_subagent_type(sub) == "Explore"
+
+
+def test_phase_a_resolve_subagent_type_meta_wins(tmp_path):
+    sub = tmp_path / "agent-aExplore-abc123def.jsonl"
+    meta = tmp_path / "agent-aExplore-abc123def.meta.json"
+    sub.write_text("", encoding="utf-8")
+    meta.write_text('{"agentType": "code-searcher"}', encoding="utf-8")
+    assert sm._resolve_subagent_type(sub) == "code-searcher"
+
+
+def test_phase_a_resolve_subagent_type_fork_fallback(tmp_path):
+    sub = tmp_path / "random-name.jsonl"
+    sub.write_text("", encoding="utf-8")
+    assert sm._resolve_subagent_type(sub) == "fork"
+
+
+def test_phase_a_html_sections_auto_hide_when_empty():
+    entries = sm._parse_jsonl(_FIXTURE)
+    turns = sm._extract_turns(entries)
+    user_ts = sm._extract_user_timestamps(entries)
+    r = sm._build_report("session", "mini", [("mini", turns, user_ts)])
+    html = sm.render_html(r, variant="single", chart_lib="none")
+    assert "cache-break-row" not in html
+    assert ">Skills &amp; slash commands<" not in html
+
+
+def test_phase_a_html_sections_render_when_present():
+    r = _build_phase_a_report()
+    html = sm.render_html(r, variant="single", chart_lib="none")
+    assert "cache-break-row" in html
+    assert ">Skills &amp; slash commands<" in html
+    assert ">Subagent types<" in html
+
+
+def test_phase_a_markdown_sections_render_when_present():
+    r = _build_phase_a_report()
+    md = sm.render_md(r)
+    assert "## Skills & slash commands" in md
+    assert "## Subagent types" in md
+    assert "## Cache breaks" in md
+
+
+def test_phase_a_csv_sections_render_when_present():
+    r = _build_phase_a_report()
+    csv = sm.render_csv(r)
+    assert "# SKILLS / SLASH COMMANDS" in csv
+    assert "# SUBAGENT TYPES" in csv
+    assert "# CACHE BREAKS" in csv
+
+
+def test_phase_a_cli_flag_parsed():
+    args = sm._build_parser().parse_args(["--cache-break-threshold", "50000"])
+    assert args.cache_break_threshold == 50000
+    # Default is the module constant.
+    args_default = sm._build_parser().parse_args([])
+    assert args_default.cache_break_threshold == sm._CACHE_BREAK_DEFAULT_THRESHOLD

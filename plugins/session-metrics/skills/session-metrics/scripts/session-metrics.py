@@ -1401,6 +1401,12 @@ def _build_turn_record(global_index: int, entry: dict,
     slash_cmd   = _extract_slash_command(prompt_text, user_raw)
     asst_text   = _extract_assistant_text(assist_content)
     tool_detail: list[dict] = []
+    # Phase-A additions (v1.6.0): cross-turn signals for the skill/subagent-type
+    # tables. Extracted once here so aggregators can walk ``turn_records``
+    # without re-parsing content. Empty lists/string for main-session turns or
+    # turns without the respective signal.
+    skill_invocations: list[str] = []
+    spawned_subagents: list[str] = []
     if isinstance(assist_content, list):
         for block in assist_content:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
@@ -1410,6 +1416,20 @@ def _build_turn_record(global_index: int, entry: dict,
                 "name":          name if isinstance(name, str) else str(name),
                 "input_preview": _summarise_tool_input(name, block.get("input")),
             })
+            binput = block.get("input")
+            if not isinstance(binput, dict):
+                binput = {}
+            if name == "Skill":
+                sk = binput.get("skill")
+                if isinstance(sk, str) and sk:
+                    skill_invocations.append(sk)
+            elif name in ("Agent", "Task"):
+                st = binput.get("subagent_type")
+                if isinstance(st, str) and st:
+                    spawned_subagents.append(st)
+    # Subagent-type tag propagated from ``_load_session`` when the entry came
+    # from a ``subagents/*.jsonl`` file. Main-session turns: empty string.
+    subagent_type = str(entry.get("_subagent_type") or "")
     if u.get("speed") == "fast":
         _FAST_MODE_TURNS[0] += 1
     return {
@@ -1437,6 +1457,9 @@ def _build_turn_record(global_index: int, entry: dict,
         "assistant_text":         asst_text,
         "assistant_snippet":      _truncate(asst_text, 240),
         "tool_use_detail":        tool_detail,
+        "skill_invocations":      skill_invocations,
+        "spawned_subagents":      spawned_subagents,
+        "subagent_type":          subagent_type,
     }
 
 
@@ -1495,6 +1518,303 @@ def _model_counts(turn_records: list[dict]) -> dict[str, int]:
     for r in turn_records:
         counts[r["model"]] = counts.get(r["model"], 0) + 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Phase-A aggregators (v1.6.0) — inspired by Anthropic's session-report skill.
+# Three new cross-cutting breakdowns the existing renderers did not expose:
+#   1. ``cache_breaks``    — single turns above a configurable uncached+cache-
+#                             create threshold, with ±2 user-prompt context.
+#   2. ``by_skill``        — per-skill/slash-command aggregation (sticky
+#                             attribution to the most recent slash-prefixed
+#                             user prompt, overridden turn-locally by Skill
+#                             tool_use blocks).
+#   3. ``by_subagent_type``— per-subagent-type table (spawn count from
+#                             Agent/Task tool_use `input.subagent_type` +
+#                             actual consumed tokens when --include-subagents
+#                             tags each sidechain turn with its resolved
+#                             subagent_type).
+# These are computed once per report build and attached at both the per-
+# session level (session dict) and the report level (aggregated across the
+# report's sessions). The instance-mode builder then aggregates across
+# projects on top.
+# ---------------------------------------------------------------------------
+
+
+# Cache-break threshold: any single turn with
+# ``input_tokens + cache_write_tokens > CACHE_BREAK_THRESHOLD`` is flagged.
+# Matches the Anthropic session-report default (100k uncached). Override via
+# ``--cache-break-threshold`` on the CLI.
+_CACHE_BREAK_DEFAULT_THRESHOLD = 100_000
+
+
+def _detect_cache_breaks(session: dict,
+                          threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
+                          context_radius: int = 2) -> list[dict]:
+    """Flag turns whose uncached+cache-create token spend exceeds ``threshold``.
+
+    "Cache break" = the cached prompt context was evicted or not reused, so
+    the model had to re-ingest a large block of uncached tokens. Surfacing
+    these lets users trace *which* turn lost the cache (vs. a summary cache-
+    hit% which doesn't name events).
+
+    Returns a list of dicts in descending-uncached order, each with:
+        session_id, turn_index, timestamp, timestamp_fmt,
+        uncached (input + cache_write), total_tokens, cache_break_pct,
+        prompt_snippet, slash_command, model,
+        context: [{ts, text, slash, here: bool}] — ±2 user prompts around
+                 the flagged turn, ordered chronologically.
+    """
+    turns = session.get("turns") or []
+    if not turns:
+        return []
+    # Build an ordered list of user-prompt records from the turn stream.
+    # A "user prompt" here is the non-empty ``prompt_text`` of a turn — i.e.
+    # the genuine typed input that triggered this turn (or the first turn
+    # of a tool-use chain rooted in that prompt). Adjacent turns sharing
+    # the same prompt reference are deduped so the ±2 window scopes to
+    # distinct user actions, not tool-loop continuations.
+    prompts: list[dict] = []
+    last_text: str | None = None
+    for t in turns:
+        if t.get("is_resume_marker"):
+            continue
+        txt = (t.get("prompt_text") or "").strip()
+        if not txt or txt == last_text:
+            continue
+        prompts.append({
+            "ts":    t.get("timestamp", ""),
+            "ts_fmt": t.get("timestamp_fmt", ""),
+            "text":   t.get("prompt_snippet") or txt[:240],
+            "slash":  t.get("slash_command", ""),
+            "turn_index": t.get("index"),
+        })
+        last_text = txt
+    # Detect flagged turns, attach context window.
+    breaks: list[dict] = []
+    for t in turns:
+        if t.get("is_resume_marker"):
+            continue
+        uncached = int(t.get("input_tokens", 0)) + int(t.get("cache_write_tokens", 0))
+        if uncached <= threshold:
+            continue
+        total = int(t.get("total_tokens", 0))
+        pct = (100.0 * uncached / total) if total else 0.0
+        # Locate this turn's position in the prompt stream — match by
+        # turn_index >= prompt.turn_index. The closest prompt whose
+        # turn_index <= flagged turn's index is "this turn's" prompt; its
+        # ±context_radius neighbours form the context window.
+        anchor = -1
+        ti = t.get("index")
+        for i, p in enumerate(prompts):
+            if p["turn_index"] is not None and ti is not None and p["turn_index"] <= ti:
+                anchor = i
+            else:
+                break
+        ctx: list[dict] = []
+        if anchor >= 0:
+            lo = max(0, anchor - context_radius)
+            hi = min(len(prompts), anchor + context_radius + 1)
+            for i in range(lo, hi):
+                p = prompts[i]
+                ctx.append({
+                    "ts":    p["ts_fmt"] or p["ts"],
+                    "text":  p["text"],
+                    "slash": p["slash"],
+                    "here":  (i == anchor),
+                })
+        breaks.append({
+            "session_id":     session.get("session_id", ""),
+            "turn_index":     t.get("index"),
+            "timestamp":      t.get("timestamp", ""),
+            "timestamp_fmt":  t.get("timestamp_fmt", ""),
+            "uncached":       uncached,
+            "total_tokens":   total,
+            "cache_break_pct": round(pct, 1),
+            "prompt_snippet": t.get("prompt_snippet", ""),
+            "slash_command":  t.get("slash_command", ""),
+            "model":          t.get("model", ""),
+            "context":        ctx,
+        })
+    breaks.sort(key=lambda b: -b["uncached"])
+    return breaks
+
+
+def _empty_skill_row(name: str) -> dict:
+    return {
+        "name":             name,
+        "invocations":      0,
+        "turns_attributed": 0,
+        "input":            0,
+        "output":           0,
+        "cache_read":       0,
+        "cache_write":      0,
+        "total_tokens":     0,
+        "cost_usd":         0.0,
+        "pct_total_cost":   0.0,
+        "cache_hit_pct":    0.0,
+        "session_count":    0,
+        "_sessions":        set(),  # stripped before return
+    }
+
+
+def _accumulate_bucket(row: dict, t: dict) -> None:
+    row["input"]        += int(t.get("input_tokens", 0))
+    row["output"]       += int(t.get("output_tokens", 0))
+    row["cache_read"]   += int(t.get("cache_read_tokens", 0))
+    row["cache_write"]  += int(t.get("cache_write_tokens", 0))
+    row["total_tokens"] += int(t.get("total_tokens", 0))
+    row["cost_usd"]     += float(t.get("cost_usd", 0.0))
+    row["turns_attributed"] += 1
+
+
+def _finalise_skill_rows(rows: dict, total_cost: float) -> list[dict]:
+    """Compute derived fields (pct_total_cost, cache_hit_pct) and drop the
+    internal ``_sessions`` set; return a list ordered by cost descending."""
+    out: list[dict] = []
+    for name, row in rows.items():
+        row = dict(row)
+        row["session_count"] = len(row.pop("_sessions", set()) or set())
+        total_input_side = (row["input"] + row["cache_read"] + row["cache_write"]) or 1
+        row["cache_hit_pct"] = round(100.0 * row["cache_read"] / total_input_side, 1)
+        row["pct_total_cost"] = (
+            round(100.0 * row["cost_usd"] / total_cost, 2) if total_cost else 0.0
+        )
+        out.append(row)
+    out.sort(key=lambda r: -r["cost_usd"])
+    return out
+
+
+def _build_by_skill(sessions: list[dict], total_cost: float) -> list[dict]:
+    """Aggregate per-turn tokens/cost by the active skill or slash command.
+
+    Attribution model (matches Anthropic's analyze-sessions.mjs approach):
+      - A user prompt with a leading slash-command (``/foo``) sets the
+        "current skill" to ``foo`` for that prompt and every follow-up
+        assistant turn driven by it (tool-use loops count).
+      - A new user prompt *without* a slash-command clears the current
+        skill (subsequent turns are un-attributed).
+      - A ``Skill`` tool_use block inside any turn overrides attribution
+        for *that turn only* to the invoked skill name (``input.skill``).
+      - Turns without any signal are simply not attributed (they still
+        count toward the report's ``totals`` but not any skill row).
+
+    Boundary detection between user prompts: we use ``prompt_text`` —
+    each turn carries a snapshot of the user entry that immediately
+    preceded its first occurrence (``_preceding_user_content``), which
+    in a tool-use chain is either the original prompt (first turn) or
+    a ``tool_result`` entry (subsequent turns). Only text-bearing prompts
+    contribute a non-empty ``prompt_text``; tool_result-only content
+    flattens to "". The boundary heuristic fires when ``prompt_text``
+    becomes non-empty and differs from the previous prompt we tracked.
+    """
+    rows: dict[str, dict] = {}
+    for session in sessions:
+        sid = session.get("session_id", "")
+        current_skill: str | None = None
+        last_prompt_text: str = ""
+        for t in session.get("turns", []) or []:
+            if t.get("is_resume_marker"):
+                continue
+            prompt_text = (t.get("prompt_text") or "").strip()
+            boundary_hit = bool(prompt_text) and prompt_text != last_prompt_text
+            if boundary_hit:
+                last_prompt_text = prompt_text
+                raw_slash = t.get("slash_command") or ""
+                # Strip the leading "/" so slash commands key-match Skill-tool
+                # invocations (e.g. "/session-metrics" slash ↔ "session-metrics"
+                # Skill tool-use invocation are merged into one row). This
+                # matches Anthropic session-report's convention.
+                new_skill = raw_slash.lstrip("/") if raw_slash else ""
+                current_skill = new_skill or None
+                if new_skill:
+                    rows.setdefault(new_skill, _empty_skill_row(new_skill))["invocations"] += 1
+            # Turn-scope override: Skill tool-use invocation attributes this
+            # turn to the invoked skill name regardless of current_skill.
+            invoked = t.get("skill_invocations") or []
+            if invoked:
+                skill_here = invoked[0]
+                row = rows.setdefault(skill_here, _empty_skill_row(skill_here))
+                _accumulate_bucket(row, t)
+                row["_sessions"].add(sid)
+                row["invocations"] += len(invoked)
+            elif current_skill:
+                row = rows.setdefault(current_skill, _empty_skill_row(current_skill))
+                _accumulate_bucket(row, t)
+                row["_sessions"].add(sid)
+    return _finalise_skill_rows(rows, total_cost)
+
+
+def _empty_subagent_row(name: str) -> dict:
+    return {
+        "name":             name,
+        "spawn_count":      0,   # Agent/Task tool_use in main turns
+        "turns_attributed": 0,   # subagent turns (only when --include-subagents)
+        "input":            0,
+        "output":           0,
+        "cache_read":       0,
+        "cache_write":      0,
+        "total_tokens":     0,
+        "cost_usd":         0.0,
+        "pct_total_cost":   0.0,
+        "cache_hit_pct":    0.0,
+        "avg_tokens_per_call": 0.0,
+        "_sessions":        set(),
+    }
+
+
+def _finalise_subagent_rows(rows: dict, total_cost: float) -> list[dict]:
+    out: list[dict] = []
+    for name, row in rows.items():
+        row = dict(row)
+        row["session_count"] = len(row.pop("_sessions", set()) or set())
+        total_input_side = (row["input"] + row["cache_read"] + row["cache_write"]) or 1
+        row["cache_hit_pct"] = round(100.0 * row["cache_read"] / total_input_side, 1)
+        row["pct_total_cost"] = (
+            round(100.0 * row["cost_usd"] / total_cost, 2) if total_cost else 0.0
+        )
+        calls_for_avg = row["spawn_count"] or row["turns_attributed"] or 1
+        row["avg_tokens_per_call"] = round(row["total_tokens"] / calls_for_avg, 1)
+        out.append(row)
+    out.sort(key=lambda r: -(r["total_tokens"] or r["spawn_count"]))
+    return out
+
+
+def _build_by_subagent_type(sessions: list[dict], total_cost: float) -> list[dict]:
+    """Aggregate spawns + consumed tokens per subagent_type.
+
+    Two data sources per row:
+      - ``spawn_count`` from **main** turns' ``spawned_subagents`` list
+        (populated when the assistant emitted an ``Agent``/``Task`` tool_use
+        with ``input.subagent_type``). Always available.
+      - ``input``/``output``/``cache_*``/``cost_usd`` from **subagent**
+        turns (turns with ``subagent_type`` set via ``_load_session``
+        tagging). Only populated when the user ran with
+        ``--include-subagents``; without it the token columns are all zero.
+
+    The row ``name`` is the resolved subagent type string. Rows for spawn
+    events whose type wasn't observed among the loaded subagent files still
+    appear (with zero tokens) so users see the spawn signal even when the
+    subagent JSONL wasn't loaded.
+    """
+    rows: dict[str, dict] = {}
+    for session in sessions:
+        sid = session.get("session_id", "")
+        for t in session.get("turns", []) or []:
+            if t.get("is_resume_marker"):
+                continue
+            # Spawn-count contribution from main turns.
+            for st in (t.get("spawned_subagents") or []):
+                row = rows.setdefault(st, _empty_subagent_row(st))
+                row["spawn_count"] += 1
+                row["_sessions"].add(sid)
+            # Token contribution from subagent-tagged turns.
+            stype = t.get("subagent_type") or ""
+            if stype:
+                row = rows.setdefault(stype, _empty_subagent_row(stype))
+                _accumulate_bucket(row, t)
+                row["_sessions"].add(sid)
+    return _finalise_subagent_rows(rows, total_cost)
 
 
 # ---------------------------------------------------------------------------
@@ -2004,6 +2324,7 @@ def _build_report(
     tz_label: str = "UTC",
     peak: dict | None = None,
     suppress_model_compare_insight: bool = False,
+    cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
 ) -> dict:
     """Build a structured report dict from raw session data.
 
@@ -2046,7 +2367,7 @@ def _build_report(
         first_epoch = _parse_iso_epoch(raw_turns[0].get("timestamp", "")) if raw_turns else 0
         last_epoch  = _parse_iso_epoch(raw_turns[-1].get("timestamp", "")) if raw_turns else 0
         duration_seconds = (last_epoch - first_epoch) if (first_epoch and last_epoch and last_epoch > first_epoch) else 0
-        sessions_out.append({
+        session_dict = {
             "session_id":       session_id,
             "first_ts":         _fmt_ts(raw_turns[0].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
             "last_ts":          _fmt_ts(raw_turns[-1].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
@@ -2056,11 +2377,27 @@ def _build_report(
             "models":           _model_counts(turn_records),
             "time_of_day":      _build_time_of_day(user_ts, offset_hours=tz_offset_hours),
             "resumes":          resumes,
-        })
+        }
+        # Per-session phase-A aggregators: cache-breaks are intrinsically
+        # session-scoped (a turn either breaks the cache in this session's
+        # context or it doesn't). by_skill / by_subagent_type are computed
+        # at both per-session and report scopes so either drilldown has a
+        # self-consistent table when displayed in isolation.
+        session_dict["cache_breaks"] = _detect_cache_breaks(
+            session_dict, threshold=cache_break_threshold,
+        )
+        session_dict["by_skill"] = _build_by_skill(
+            [session_dict], session_dict["subtotal"]["cost"],
+        )
+        session_dict["by_subagent_type"] = _build_by_subagent_type(
+            [session_dict], session_dict["subtotal"]["cost"],
+        )
+        sessions_out.append(session_dict)
 
     all_turns = [t for s in sessions_out for t in s["turns"]]
     all_user_ts = sorted(ts for _, _, uts in sessions_raw for ts in uts)
     blocks = _build_session_blocks(sessions_raw)
+    totals = _totals_from_turns(all_turns)
     report = {
         "generated_at":    datetime.now(timezone.utc).isoformat(),
         "mode":            mode,
@@ -2068,7 +2405,7 @@ def _build_report(
         "tz_offset_hours": tz_offset_hours,
         "tz_label":        tz_label,
         "sessions":        sessions_out,
-        "totals":          _totals_from_turns(all_turns),
+        "totals":          totals,
         "models":          _model_counts(all_turns),
         "time_of_day":     _build_time_of_day(all_user_ts, offset_hours=tz_offset_hours),
         "session_blocks":  blocks,
@@ -2076,12 +2413,20 @@ def _build_report(
         "weekly_rollup":   _build_weekly_rollup(sessions_out, sessions_raw, blocks),
         "peak":            peak,
         "resumes":         [r for s in sessions_out for r in s["resumes"]],
+        # Phase-A cross-cutting tables (v1.6.0). All three are always
+        # attached; renderers auto-hide when the list/dict is empty.
+        "cache_breaks":        [cb for s in sessions_out for cb in s.get("cache_breaks", [])],
+        "by_skill":            _build_by_skill(sessions_out, totals.get("cost", 0.0)),
+        "by_subagent_type":    _build_by_subagent_type(sessions_out, totals.get("cost", 0.0)),
+        "cache_break_threshold": cache_break_threshold,
         # CLI opt-out for the Phase 7 model-compare insight card. Keyed
         # with an underscore so downstream JSON exports don't leak the
         # flag into user-facing schema; `_compute_usage_insights` reads
         # it before returning the list.
         "_suppress_model_compare_insight": suppress_model_compare_insight,
     }
+    # Sort global cache_breaks by uncached desc to keep "worst-first" order.
+    report["cache_breaks"].sort(key=lambda b: -int(b.get("uncached", 0)))
     report["usage_insights"] = _compute_usage_insights(report)
     # Drop the internal flag after use so the report dict stays clean
     # for downstream renderers / JSON export.
@@ -2673,6 +3018,65 @@ def render_csv(report: dict) -> str:
                 b["input"], b["output"], b["cache_read"], b["cache_write"],
                 f"{b['cost_usd']:.6f}", len(b["sessions_touched"]),
             ])
+
+    # Phase-A (v1.6.0): skill/subagent/cache-break sections.
+    by_skill = report.get("by_skill") or []
+    if by_skill:
+        w.writerow([])
+        w.writerow(["# SKILLS / SLASH COMMANDS"])
+        w.writerow(["name", "invocations", "turns", "input", "output",
+                    "cache_read", "cache_write", "total_tokens",
+                    "cost_usd", "cache_hit_pct", "pct_total_cost"])
+        for r in by_skill:
+            w.writerow([
+                r.get("name", ""), r.get("invocations", 0),
+                r.get("turns_attributed", 0), r.get("input", 0),
+                r.get("output", 0), r.get("cache_read", 0),
+                r.get("cache_write", 0), r.get("total_tokens", 0),
+                f"{float(r.get('cost_usd', 0.0)):.6f}",
+                f"{float(r.get('cache_hit_pct', 0.0)):.1f}",
+                f"{float(r.get('pct_total_cost', 0.0)):.2f}",
+            ])
+
+    by_subagent = report.get("by_subagent_type") or []
+    if by_subagent:
+        w.writerow([])
+        w.writerow(["# SUBAGENT TYPES"])
+        w.writerow(["name", "spawn_count", "turns", "input", "output",
+                    "cache_read", "cache_write", "total_tokens",
+                    "avg_tokens_per_call", "cost_usd",
+                    "cache_hit_pct", "pct_total_cost"])
+        for r in by_subagent:
+            w.writerow([
+                r.get("name", ""), r.get("spawn_count", 0),
+                r.get("turns_attributed", 0), r.get("input", 0),
+                r.get("output", 0), r.get("cache_read", 0),
+                r.get("cache_write", 0), r.get("total_tokens", 0),
+                f"{float(r.get('avg_tokens_per_call', 0.0)):.1f}",
+                f"{float(r.get('cost_usd', 0.0)):.6f}",
+                f"{float(r.get('cache_hit_pct', 0.0)):.1f}",
+                f"{float(r.get('pct_total_cost', 0.0)):.2f}",
+            ])
+
+    cache_breaks = report.get("cache_breaks") or []
+    if cache_breaks:
+        w.writerow([])
+        threshold = int(report.get("cache_break_threshold",
+                                     _CACHE_BREAK_DEFAULT_THRESHOLD))
+        w.writerow([f"# CACHE BREAKS (> {threshold:,} uncached)"])
+        w.writerow(["session_id", "turn_index", "timestamp", "uncached",
+                    "total_tokens", "cache_break_pct", "slash_command",
+                    "project", "prompt_snippet"])
+        for cb in cache_breaks:
+            w.writerow([
+                cb.get("session_id", ""), cb.get("turn_index", ""),
+                cb.get("timestamp", ""), cb.get("uncached", 0),
+                cb.get("total_tokens", 0),
+                f"{float(cb.get('cache_break_pct', 0.0)):.1f}",
+                cb.get("slash_command", ""),
+                cb.get("project", ""),
+                (cb.get("prompt_snippet") or "")[:240],
+            ])
     return out.getvalue()
 
 
@@ -2815,6 +3219,65 @@ def render_md(report: dict) -> str:
         for m, cnt in sorted(report["models"].items(), key=lambda x: -x[1]):
             r = _pricing_for(m)
             p(f"| `{m}` | {cnt:,} | ${r['input']:.2f} | ${r['output']:.2f} | ${r['cache_read']:.2f} | ${r['cache_write']:.2f} |")
+        p()
+
+    # Phase-A (v1.6.0) sections: skill / subagent / cache-break tables.
+    by_skill_rows = report.get("by_skill") or []
+    if by_skill_rows:
+        p("## Skills & slash commands")
+        p()
+        p("| Name | Invocations | Turns | Input | Output | % cached | Cost $ | % of total |")
+        p("|------|------------:|------:|------:|------:|--------:|------:|-----------:|")
+        for r in by_skill_rows:
+            p(f"| `{r.get('name', '')}` | {int(r.get('invocations', 0)):,} "
+              f"| {int(r.get('turns_attributed', 0)):,} "
+              f"| {int(r.get('input', 0)):,} "
+              f"| {int(r.get('output', 0)):,} "
+              f"| {float(r.get('cache_hit_pct', 0.0)):.1f}% "
+              f"| ${float(r.get('cost_usd', 0.0)):.4f} "
+              f"| {float(r.get('pct_total_cost', 0.0)):.2f}% |")
+        p()
+
+    by_subagent_rows = report.get("by_subagent_type") or []
+    if by_subagent_rows:
+        p("## Subagent types")
+        p()
+        p("| Subagent | Spawns | Turns | Input | Output | % cached | Avg/call | Cost $ | % of total |")
+        p("|----------|-------:|------:|------:|------:|--------:|--------:|------:|-----------:|")
+        for r in by_subagent_rows:
+            p(f"| `{r.get('name', '')}` | {int(r.get('spawn_count', 0)):,} "
+              f"| {int(r.get('turns_attributed', 0)):,} "
+              f"| {int(r.get('input', 0)):,} "
+              f"| {int(r.get('output', 0)):,} "
+              f"| {float(r.get('cache_hit_pct', 0.0)):.1f}% "
+              f"| {float(r.get('avg_tokens_per_call', 0.0)):,.0f} "
+              f"| ${float(r.get('cost_usd', 0.0)):.4f} "
+              f"| {float(r.get('pct_total_cost', 0.0)):.2f}% |")
+        p()
+
+    cache_breaks_rows = report.get("cache_breaks") or []
+    if cache_breaks_rows:
+        threshold = int(report.get("cache_break_threshold",
+                                     _CACHE_BREAK_DEFAULT_THRESHOLD))
+        p(f"## Cache breaks (> {threshold:,} uncached)")
+        p()
+        p(f"{len(cache_breaks_rows)} event{'s' if len(cache_breaks_rows) != 1 else ''} "
+          f"— single turns where `input + cache_creation` exceeded the threshold. "
+          f"Each row names *which* turn lost the cache.")
+        p()
+        p("| Uncached | % | When | Session | Prompt |")
+        p("|---------:|--:|------|---------|--------|")
+        for cb in cache_breaks_rows[:25]:
+            sid8 = (cb.get("session_id") or "")[:8]
+            snippet = (cb.get("prompt_snippet") or "").replace("|", "\\|")[:120]
+            p(f"| {int(cb.get('uncached', 0)):,} "
+              f"| {float(cb.get('cache_break_pct', 0.0)):.0f}% "
+              f"| {cb.get('timestamp_fmt') or cb.get('timestamp', '')} "
+              f"| `{sid8}` "
+              f"| {snippet} |")
+        if len(cache_breaks_rows) > 25:
+            p()
+            p(f"_Showing top 25 of {len(cache_breaks_rows)} — raw list available in JSON export._")
         p()
 
     has_1h_cache = _has_1h_cache(report)
@@ -4094,6 +4557,168 @@ CHART_RENDERERS = {
     "chartjs":    _render_chart_chartjs,
     "none":       _render_chart_none,
 }
+
+
+def _fmt_cost(v: float) -> str:
+    return f"${float(v or 0.0):.4f}"
+
+
+def _build_by_skill_html(rows: list[dict],
+                          heading: str = "Skills &amp; slash commands",
+                          hint: str = "aggregated across this report scope · "
+                                      "sticky attribution to slash-prefixed prompts") -> str:
+    """Render the ``by_skill`` aggregation as a sortable section. Returns "" when empty."""
+    if not rows:
+        return ""
+    body_rows: list[str] = []
+    for r in rows:
+        name = html_mod.escape(r.get("name") or "")
+        body_rows.append(
+            f'<tr>'
+            f'<td><code>{name}</code></td>'
+            f'<td class="num">{int(r.get("invocations", 0)):,}</td>'
+            f'<td class="num">{int(r.get("turns_attributed", 0)):,}</td>'
+            f'<td class="num">{int(r.get("input", 0)):,}</td>'
+            f'<td class="num">{float(r.get("cache_hit_pct", 0.0)):.1f}%</td>'
+            f'<td class="num">{int(r.get("output", 0)):,}</td>'
+            f'<td class="num">{int(r.get("total_tokens", 0)):,}</td>'
+            f'<td class="cost">{_fmt_cost(r.get("cost_usd", 0.0))}</td>'
+            f'<td class="num">{float(r.get("pct_total_cost", 0.0)):.2f}%</td>'
+            f'</tr>'
+        )
+    return (
+        f'<section class="section">\n'
+        f'<div class="section-title"><h2>{heading}</h2>'
+        f'<span class="hint">{html_mod.escape(hint)}</span></div>\n'
+        f'<table class="models-table">\n'
+        f'<thead><tr>'
+        f'<th>Name</th>'
+        f'<th class="num">Invocations</th>'
+        f'<th class="num">Turns</th>'
+        f'<th class="num">Input</th>'
+        f'<th class="num">% cached</th>'
+        f'<th class="num">Output</th>'
+        f'<th class="num">Total</th>'
+        f'<th class="num">Cost $</th>'
+        f'<th class="num">% of total</th>'
+        f'</tr></thead>\n'
+        f'<tbody>{"".join(body_rows)}</tbody>\n'
+        f'</table>\n'
+        f'</section>'
+    )
+
+
+def _build_by_subagent_type_html(rows: list[dict],
+                                   heading: str = "Subagent types",
+                                   subagents_included: bool = True) -> str:
+    """Render ``by_subagent_type`` as a sortable section. Returns "" when empty.
+
+    When the loader was invoked without ``--include-subagents``, token
+    columns show only the *spawn-turn* contribution (zero for most rows).
+    A footer note is rendered so users know to enable the flag for
+    accurate per-type cost when relevant.
+    """
+    if not rows:
+        return ""
+    body_rows: list[str] = []
+    for r in rows:
+        name = html_mod.escape(r.get("name") or "")
+        body_rows.append(
+            f'<tr>'
+            f'<td><code>{name}</code></td>'
+            f'<td class="num">{int(r.get("spawn_count", 0)):,}</td>'
+            f'<td class="num">{int(r.get("turns_attributed", 0)):,}</td>'
+            f'<td class="num">{int(r.get("input", 0)):,}</td>'
+            f'<td class="num">{float(r.get("cache_hit_pct", 0.0)):.1f}%</td>'
+            f'<td class="num">{int(r.get("output", 0)):,}</td>'
+            f'<td class="num">{int(r.get("total_tokens", 0)):,}</td>'
+            f'<td class="num">{float(r.get("avg_tokens_per_call", 0.0)):,.0f}</td>'
+            f'<td class="cost">{_fmt_cost(r.get("cost_usd", 0.0))}</td>'
+            f'<td class="num">{float(r.get("pct_total_cost", 0.0)):.2f}%</td>'
+            f'</tr>'
+        )
+    hint = ("aggregated across this report scope"
+            if subagents_included else
+            "spawn-count only · pass --include-subagents for full cost rollup")
+    return (
+        f'<section class="section">\n'
+        f'<div class="section-title"><h2>{heading}</h2>'
+        f'<span class="hint">{html_mod.escape(hint)}</span></div>\n'
+        f'<table class="models-table">\n'
+        f'<thead><tr>'
+        f'<th>Subagent type</th>'
+        f'<th class="num">Spawns</th>'
+        f'<th class="num">Turns</th>'
+        f'<th class="num">Input</th>'
+        f'<th class="num">% cached</th>'
+        f'<th class="num">Output</th>'
+        f'<th class="num">Total</th>'
+        f'<th class="num">Avg / call</th>'
+        f'<th class="num">Cost $</th>'
+        f'<th class="num">% of total</th>'
+        f'</tr></thead>\n'
+        f'<tbody>{"".join(body_rows)}</tbody>\n'
+        f'</table>\n'
+        f'</section>'
+    )
+
+
+def _build_cache_breaks_html(breaks: list[dict],
+                               threshold: int,
+                               max_rows: int = 100) -> str:
+    """Render the cache-break section. Each row is an expandable <details>
+    block showing the ±2 user-message context around the flagged turn.
+    Returns "" when there are no breaks."""
+    if not breaks:
+        return ""
+    rows_html: list[str] = []
+    for cb in breaks[:max_rows]:
+        proj = html_mod.escape(cb.get("project", "") or "")
+        sid8 = (cb.get("session_id") or "")[:8]
+        ts   = html_mod.escape(cb.get("timestamp_fmt") or cb.get("timestamp") or "")
+        pct  = float(cb.get("cache_break_pct", 0.0))
+        uncached = int(cb.get("uncached", 0))
+        total    = int(cb.get("total_tokens", 0))
+        snippet = html_mod.escape(cb.get("prompt_snippet") or "")
+        context_rows: list[str] = []
+        for ce in cb.get("context", []) or []:
+            here_cls  = " cb-here" if ce.get("here") else ""
+            here_mark = ' <span class="cb-mark">(this turn)</span>' if ce.get("here") else ""
+            ctx_ts   = html_mod.escape(ce.get("ts", ""))
+            ctx_text = html_mod.escape((ce.get("text") or "")[:240])
+            slash    = ce.get("slash") or ""
+            slash_html = (f' <code>/{html_mod.escape(slash)}</code>' if slash else "")
+            context_rows.append(
+                f'<li class="cb-ctx{here_cls}"><span class="cb-ts">{ctx_ts}</span>'
+                f'{slash_html}{here_mark} — <span class="cb-txt">{ctx_text}</span></li>'
+            )
+        proj_cell = f'<span class="cb-proj">{proj}</span> · ' if proj else ''
+        rows_html.append(
+            f'<details class="cache-break-row">'
+            f'<summary>'
+            f'<span class="cb-uncached"><strong>{uncached:,}</strong> uncached</span>'
+            f' · <span class="cb-pct">{pct:.0f}% of {total:,}</span>'
+            f' · {proj_cell}<code>{sid8}</code> · <span class="cb-ts">{ts}</span>'
+            f' · <span class="cb-snippet">{snippet}</span>'
+            f'</summary>'
+            f'<ul class="cb-context">{"".join(context_rows)}</ul>'
+            f'</details>'
+        )
+    hint = f"single turns with input + cache_creation &gt; {threshold:,} · ±2 user-prompt context"
+    count_text = f"{len(breaks)} event{'s' if len(breaks) != 1 else ''}"
+    more_note = ""
+    if len(breaks) > max_rows:
+        more_note = (f'<p class="muted">Showing top {max_rows} of {len(breaks)} — '
+                     f'raw list available in JSON export.</p>')
+    return (
+        f'<section class="section">\n'
+        f'<div class="section-title"><h2>Cache breaks '
+        f'<span class="hint-inline">({count_text})</span></h2>'
+        f'<span class="hint">{hint}</span></div>\n'
+        f'<div class="cache-breaks">{"".join(rows_html)}</div>\n'
+        f'{more_note}'
+        f'</section>'
+    )
 
 
 def _build_usage_insights_html(insights: list[dict]) -> str:
@@ -5538,6 +6163,17 @@ def render_html(report: dict, variant: str = "single",
         if include_insights else ""
     )
 
+    # Phase-A (v1.6.0) sections — skill/subagent tables + cache-break events.
+    # Attach at every variant so the data surfaces in both dashboard and
+    # detail views; each helper auto-hides when empty.
+    by_skill_html = _build_by_skill_html(report.get("by_skill", []) or [])
+    by_subagent_type_html = _build_by_subagent_type_html(
+        report.get("by_subagent_type", []) or [])
+    cache_breaks_html = _build_cache_breaks_html(
+        report.get("cache_breaks", []) or [],
+        int(report.get("cache_break_threshold", _CACHE_BREAK_DEFAULT_THRESHOLD)),
+    )
+
     toggle_script_html = ""
     if include_chart and mode == "project":
         toggle_script_html = """<script>
@@ -5975,6 +6611,9 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 </header>
 {summary_cards_html}
 {usage_insights_html}
+{cache_breaks_html}
+{by_skill_html}
+{by_subagent_type_html}
 {tod_html}
 {chart_section_html}
 {chartrail_section_html}
@@ -6046,8 +6685,36 @@ def _write_output(fmt: str, content: str, report: dict,
 # Modes
 # ---------------------------------------------------------------------------
 
+# Pattern for resolving subagent type from its filename when a meta sidecar
+# is missing. Matches the Anthropic session-report convention
+# ``agent-a<label>-<hash>.jsonl`` — we peel off the label as the agent type.
+_SUBAGENT_FILENAME_RE = re.compile(r"^agent-a([^-]+)-[0-9a-fA-F]+$")
+
+
+def _resolve_subagent_type(sub_path: Path) -> str:
+    """Three-tier fallback identical in spirit to Anthropic's session-report:
+    (1) ``<stem>.meta.json`` → ``agentType`` field, (2) filename label via
+    :data:`_SUBAGENT_FILENAME_RE`, (3) ``"fork"`` sentinel.
+    """
+    meta_path = sub_path.with_suffix(".meta.json")
+    try:
+        if meta_path.is_file():
+            with open(meta_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
+            agent_type = meta.get("agentType") if isinstance(meta, dict) else None
+            if isinstance(agent_type, str) and agent_type:
+                return agent_type
+    except (OSError, json.JSONDecodeError):
+        pass
+    m = _SUBAGENT_FILENAME_RE.match(sub_path.stem)
+    if m:
+        return m.group(1)
+    return "fork"
+
+
 def _load_session(
     jsonl_path: Path, include_subagents: bool, use_cache: bool = True,
+    seen_uuids: set[str] | None = None,
 ) -> tuple[str, list[dict], list[int]]:
     """Load a session JSONL and return structured data for report building.
 
@@ -6056,6 +6723,13 @@ def _load_session(
     time-of-day activity analysis).  User timestamps are extracted from the
     full entry list *before* assistant-only filtering discards them.
 
+    ``seen_uuids`` is an opt-in cross-file dedup guard. When provided, any
+    entry whose ``uuid`` field is already in the set is dropped; surviving
+    entries are added. Callers supply a set shared across JSONLs they want
+    to treat as one scope (project/instance); pass ``None`` to skip dedup
+    (session scope — the in-file ``message.id`` dedup in ``_extract_turns``
+    already handles streaming splits).
+
     Returns:
         3-tuple of (session_id, assistant_turns, user_epoch_secs) where
         session_id is the JSONL filename stem, assistant_turns is the
@@ -6063,12 +6737,34 @@ def _load_session(
         user_epoch_secs is a sorted list of UTC epoch-seconds for every
         genuine user prompt (tool_results and meta entries excluded).
     """
-    entries = _cached_parse_jsonl(jsonl_path, use_cache=use_cache)
+    entries = list(_cached_parse_jsonl(jsonl_path, use_cache=use_cache))
     if include_subagents:
         subagent_dir = jsonl_path.parent / jsonl_path.stem / "subagents"
         if subagent_dir.exists():
             for sub in sorted(subagent_dir.glob("*.jsonl")):
-                entries += _cached_parse_jsonl(sub, use_cache=use_cache)
+                agent_type = _resolve_subagent_type(sub)
+                sub_entries = _cached_parse_jsonl(sub, use_cache=use_cache)
+                for e in sub_entries:
+                    if isinstance(e, dict):
+                        e["_subagent_type"] = agent_type
+                        entries.append(e)
+    # Cross-file UUID dedup (opt-in). Anthropic's session-report uses this
+    # to prevent resumed-session replays from double-counting across sibling
+    # JSONLs. We do the same — but only when the caller provides the set
+    # (scope = {session, project, instance}); otherwise the caller wants the
+    # single-file-only ``message.id`` dedup handled by ``_extract_turns``.
+    if seen_uuids is not None:
+        filtered: list[dict] = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            uid = e.get("uuid")
+            if isinstance(uid, str) and uid:
+                if uid in seen_uuids:
+                    continue
+                seen_uuids.add(uid)
+            filtered.append(e)
+        entries = filtered
     return (
         jsonl_path.stem,
         _extract_turns(entries),
@@ -6082,13 +6778,18 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
                          single_page: bool = False,
                          use_cache: bool = True,
                          chart_lib: str = "highcharts",
-                         suppress_model_compare_insight: bool = False) -> None:
+                         suppress_model_compare_insight: bool = False,
+                         cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD) -> None:
     print(f"Session : {jsonl_path.stem}", file=sys.stderr)
     print(f"File    : {jsonl_path}", file=sys.stderr)
     print(file=sys.stderr)
 
+    # Single-session scope: ``message.id`` dedup in ``_extract_turns`` already
+    # handles streaming splits for the one file being loaded, so we don't need
+    # cross-file UUID dedup here. Pass ``None`` to disable.
     session_id, turns, user_ts = _load_session(jsonl_path, include_subagents,
-                                                 use_cache=use_cache)
+                                                 use_cache=use_cache,
+                                                 seen_uuids=None)
     if not turns:
         print("[info] No assistant turns with usage data found.", file=sys.stderr)
         return
@@ -6097,6 +6798,7 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
         "session", slug, [(session_id, turns, user_ts)],
         tz_offset_hours=tz_offset, tz_label=tz_label, peak=peak,
         suppress_model_compare_insight=suppress_model_compare_insight,
+        cache_break_threshold=cache_break_threshold,
     )
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib)
 
@@ -6107,16 +6809,22 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
                       single_page: bool = False,
                       use_cache: bool = True,
                       chart_lib: str = "highcharts",
-                      suppress_model_compare_insight: bool = False) -> None:
+                      suppress_model_compare_insight: bool = False,
+                      cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD) -> None:
     files = _find_jsonl_files(slug)
     if not files:
         print(f"[error] No sessions found for slug: {slug}", file=sys.stderr)
         sys.exit(1)
 
+    # Project scope: one shared ``seen_uuids`` across every JSONL in the
+    # project so a resumed session replaying prior entries doesn't
+    # double-count tokens in project totals (gap #8 fix).
+    project_seen: set[str] = set()
     sessions_raw = []
     for path in reversed(files):   # oldest first
         sid, turns, user_ts = _load_session(path, include_subagents,
-                                              use_cache=use_cache)
+                                              use_cache=use_cache,
+                                              seen_uuids=project_seen)
         if turns:
             sessions_raw.append((sid, turns, user_ts))
 
@@ -6128,6 +6836,7 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
         "project", slug, sessions_raw,
         tz_offset_hours=tz_offset, tz_label=tz_label, peak=peak,
         suppress_model_compare_insight=suppress_model_compare_insight,
+        cache_break_threshold=cache_break_threshold,
     )
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib)
 
@@ -6322,13 +7031,69 @@ def _aggregate_models(project_reports: list[dict]) -> dict:
     return merged
 
 
+def _merge_bucket_rows(project_reports: list[dict], key: str,
+                        total_cost: float) -> list[dict]:
+    """Merge per-project ``by_skill`` / ``by_subagent_type`` lists into a
+    single instance-level list. Token counters and ``spawn_count`` /
+    ``invocations`` / ``turns_attributed`` sum; ``session_count`` and the
+    derived pct/cache-hit fields are recomputed from the sums.
+    """
+    merged: dict[str, dict] = {}
+    session_accumulator: dict[str, set] = {}
+    for pr in project_reports:
+        for row in pr.get(key, []) or []:
+            name = row.get("name", "")
+            if not name:
+                continue
+            m = merged.setdefault(name, {
+                "name": name,
+                "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+                "total_tokens": 0, "cost_usd": 0.0,
+                "turns_attributed": 0,
+            })
+            # Sum numeric counters generically.
+            for field in ("input", "output", "cache_read", "cache_write",
+                           "total_tokens", "turns_attributed", "invocations",
+                           "spawn_count"):
+                if field in row:
+                    m[field] = m.get(field, 0) + int(row.get(field, 0) or 0)
+            m["cost_usd"] = float(m.get("cost_usd", 0.0)) + float(row.get("cost_usd", 0.0))
+            # Sessions are recomputed from summed session_count (best-effort
+            # — we treat each project's session_count as independent because
+            # project slugs partition session IDs).
+            session_accumulator.setdefault(name, set())
+            # Proxy: each project contributes at most session_count rows.
+            sc = int(row.get("session_count", 0) or 0)
+            if sc:
+                # synth placeholder so len() matches total (deduped within
+                # a project; across projects the union over namespaces is
+                # the sum since slugs are disjoint).
+                for i in range(sc):
+                    session_accumulator[name].add(f"{pr.get('slug', '?')}::{i}")
+    out: list[dict] = []
+    for name, m in merged.items():
+        m["session_count"] = len(session_accumulator.get(name, set()))
+        total_input_side = (m["input"] + m["cache_read"] + m["cache_write"]) or 1
+        m["cache_hit_pct"] = round(100.0 * m["cache_read"] / total_input_side, 1)
+        m["pct_total_cost"] = (
+            round(100.0 * m["cost_usd"] / total_cost, 2) if total_cost else 0.0
+        )
+        if "spawn_count" in m or key == "by_subagent_type":
+            calls_for_avg = m.get("spawn_count", 0) or m.get("turns_attributed", 0) or 1
+            m["avg_tokens_per_call"] = round(m.get("total_tokens", 0) / calls_for_avg, 1)
+        out.append(m)
+    out.sort(key=lambda r: -(r.get("cost_usd", 0.0) or r.get("total_tokens", 0) or r.get("spawn_count", 0)))
+    return out
+
+
 def _build_instance_report(
         project_reports: list[dict],
         all_sessions_raw: list[tuple[str, list[dict], list[int]]],
         tz_offset_hours: float,
         tz_label: str,
         projects_dir: Path,
-        peak: dict | None = None) -> dict:
+        peak: dict | None = None,
+        cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD) -> dict:
     """Assemble the instance-wide report from per-project reports.
 
     Strategy: reuse ``_build_report(mode="project")`` for each project (done
@@ -6378,6 +7143,21 @@ def _build_instance_report(
     daily, top_slugs = _build_instance_daily(project_reports,
                                               tz_offset_hours=tz_offset_hours)
 
+    total_cost_for_pct = float(totals.get("cost", 0.0))
+    # Aggregated phase-A tables across projects.
+    inst_by_skill = _merge_bucket_rows(project_reports, "by_skill",
+                                         total_cost_for_pct)
+    inst_by_subagent = _merge_bucket_rows(project_reports, "by_subagent_type",
+                                            total_cost_for_pct)
+    inst_cache_breaks: list[dict] = []
+    for pr in project_reports:
+        pr_slug = pr.get("slug", "")
+        for cb in pr.get("cache_breaks", []) or []:
+            tagged = dict(cb)
+            tagged["project"] = pr_slug
+            inst_cache_breaks.append(tagged)
+    inst_cache_breaks.sort(key=lambda b: -int(b.get("uncached", 0)))
+
     report = {
         "generated_at":     datetime.now(timezone.utc).isoformat(),
         "mode":             "instance",
@@ -6400,6 +7180,10 @@ def _build_instance_report(
         "peak":             peak,
         "daily":            daily,
         "top_project_slugs": top_slugs,
+        "cache_breaks":        inst_cache_breaks,
+        "by_skill":            inst_by_skill,
+        "by_subagent_type":    inst_by_subagent,
+        "cache_break_threshold": cache_break_threshold,
         # Placeholders so the existing renderers don't KeyError if they
         # reach into the report looking for these.
         "sessions":         [],
@@ -6417,7 +7201,8 @@ def _run_all_projects(formats: list[str],
                       chart_lib: str = "highcharts",
                       include_subagents: bool = False,
                       drilldown: bool = True,
-                      suppress_model_compare_insight: bool = False) -> None:
+                      suppress_model_compare_insight: bool = False,
+                      cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD) -> None:
     projects_dir = _projects_dir()
     print(f"Scanning: {projects_dir}", file=sys.stderr)
     discovered = _list_all_projects()
@@ -6431,6 +7216,11 @@ def _run_all_projects(formats: list[str],
     print(file=sys.stderr)
 
     project_reports: list[dict] = []
+    # Instance-scope UUID dedup: one set spans every JSONL across every
+    # project so a session that was resumed (replaying prior UUIDs into a
+    # new file) can't double-count in instance totals. Loaded entries add
+    # their UUIDs; subsequent files skip anything already present.
+    instance_seen: set[str] = set()
     # Raw sessions_raw tuples across every project — preserved so the
     # instance-scope insights (_build_session_blocks, _build_weekly_rollup)
     # see the same raw JSONL shape they do in project mode. Without this
@@ -6446,7 +7236,8 @@ def _run_all_projects(formats: list[str],
         for path in jsonls:
             try:
                 sid, turns, user_ts = _load_session(path, include_subagents,
-                                                     use_cache=use_cache)
+                                                     use_cache=use_cache,
+                                                     seen_uuids=instance_seen)
             except (OSError, json.JSONDecodeError) as exc:
                 print(f"[warn] {slug}: skipping {path.name} ({exc})",
                       file=sys.stderr)
@@ -6462,6 +7253,7 @@ def _run_all_projects(formats: list[str],
             "project", slug, sessions_raw,
             tz_offset_hours=tz_offset, tz_label=tz_label, peak=peak,
             suppress_model_compare_insight=True,  # per-project, suppress noise
+            cache_break_threshold=cache_break_threshold,
         )
         project_reports.append(pr)
         all_sessions_raw.extend(sessions_raw)
@@ -6477,6 +7269,7 @@ def _run_all_projects(formats: list[str],
         tz_label=tz_label,
         projects_dir=projects_dir,
         peak=peak,
+        cache_break_threshold=cache_break_threshold,
     )
     instance_report["_suppress_model_compare_insight"] = \
         suppress_model_compare_insight
@@ -6965,6 +7758,15 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
 
     insights_html = rollup_html + blocks_html + hod_html + punchcard_html + heatmap_html
 
+    # Phase-A instance-level sections (v1.6.0).
+    inst_by_skill_html = _build_by_skill_html(report.get("by_skill", []) or [])
+    inst_by_subagent_type_html = _build_by_subagent_type_html(
+        report.get("by_subagent_type", []) or [])
+    inst_cache_breaks_html = _build_cache_breaks_html(
+        report.get("cache_breaks", []) or [],
+        int(report.get("cache_break_threshold", _CACHE_BREAK_DEFAULT_THRESHOLD)),
+    )
+
     # ---- Projects breakdown table -----------------------------------------
     proj_rows_html_parts = []
     for i, proj in enumerate(projects, 1):
@@ -7070,6 +7872,9 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
 </header>
 {summary_cards_html}
 {daily_cost_rail_html}
+{inst_cache_breaks_html}
+{inst_by_skill_html}
+{inst_by_subagent_type_html}
 {projects_table_html}
 {insights_html}
 {models_table_html}
@@ -7197,6 +8002,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         "Written to exports/session-metrics/ in the project root.")
     p.add_argument("--include-subagents", action="store_true",
                    help="Also tally spawned subagent JSONL files.")
+    p.add_argument("--cache-break-threshold", type=int,
+                   default=_CACHE_BREAK_DEFAULT_THRESHOLD, metavar="TOKENS",
+                   help=(f"Turns whose input + cache_creation exceed TOKENS are "
+                         f"flagged as cache-break events (default: "
+                         f"{_CACHE_BREAK_DEFAULT_THRESHOLD:,}). Matches Anthropic "
+                         f"session-report's convention."))
     p.add_argument("--tz", metavar="IANA",
                    help="IANA timezone for time-of-day bucketing "
                         "(e.g. 'America/Los_Angeles', 'Australia/Brisbane'). "
@@ -7694,6 +8505,7 @@ def main() -> None:
             include_subagents=args.include_subagents,
             drilldown=not args.no_project_drilldown,
             suppress_model_compare_insight=args.no_model_compare_insight,
+            cache_break_threshold=args.cache_break_threshold,
         )
         return
 
@@ -7706,6 +8518,7 @@ def main() -> None:
             peak=peak, single_page=args.single_page,
             use_cache=not args.no_cache, chart_lib=chart_lib,
             suppress_model_compare_insight=args.no_model_compare_insight,
+            cache_break_threshold=args.cache_break_threshold,
         )
         return
 
@@ -7717,6 +8530,7 @@ def main() -> None:
         tz_offset, tz_label, peak=peak, single_page=args.single_page,
         use_cache=not args.no_cache, chart_lib=chart_lib,
         suppress_model_compare_insight=args.no_model_compare_insight,
+        cache_break_threshold=args.cache_break_threshold,
     )
 
 
