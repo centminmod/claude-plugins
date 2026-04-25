@@ -61,18 +61,66 @@ OpenRouter rate — a reasonable estimate for mixed-environment JSONL files.
 
 Source: [OpenRouter pricing](https://openrouter.ai/pricing) — snapshot 2026-04-25.
 
-| Model ID (prefix match)      | Input | Output | Cache read | 5m Cache write | 1h Cache write |
-|------------------------------|-------|--------|------------|----------------|----------------|
-| `glm-4.7`                    |  0.38 |   1.74 |       0.00 |           0.00 |           0.00 |
-| `glm-5`                      |  0.60 |   2.08 |       0.00 |           0.00 |           0.00 |
-| `glm-5.1`                    |  1.05 |   3.50 |       0.00 |           0.00 |           0.00 |
-| `google/gemma-4-26b-a4b`     |  0.06 |   0.33 |       0.00 |           0.00 |           0.00 |
-| `gemma4`                     |  0.06 |   0.33 |       0.00 |           0.00 |           0.00 |
-| `qwen3.5:9b`                 |  0.10 |   0.15 |       0.00 |           0.00 |           0.00 |
+`_pricing_for` uses three tiers in order: **exact match → regex patterns
+(`_PRICING_PATTERNS`) → prefix sweep**. Regex patterns sit before the prefix
+sweep so families with shared prefixes (e.g. `glm-5` vs `glm-5-turbo`) resolve
+correctly regardless of dict insertion order.
 
-> **GLM ordering note**: `glm-5.1` and `glm-5` are exact-match lookups (not
-> prefix), so they will never cross-match. Order within `_PRICING` does not
-> affect them.
+### GLM (Z.ai)
+
+| Model ID                     | Input | Output | Regex pattern |
+|------------------------------|-------|--------|---------------|
+| `glm-4.7`                    |  0.38 |   1.74 | `glm-4\.7`    |
+| `glm-5`                      |  0.60 |   2.08 | `glm-5`       |
+| `glm-5.1`                    |  1.05 |   3.50 | `glm-5\.1`    |
+| `z-ai/glm-5-turbo`           |  1.20 |   4.00 | `glm-5-turbo` |
+
+### Google Gemma 4
+
+| Model ID                     | Input | Output | Note |
+|------------------------------|-------|--------|------|
+| `google/gemma-4-26b-a4b`     |  0.06 |   0.33 | Exact + prefix for `…a4b-it` variants |
+| `gemma4`                     |  0.06 |   0.33 | Prefix for Ollama local variants |
+
+### Qwen (Alibaba)
+
+| Model ID                     | Input | Output | Regex pattern        |
+|------------------------------|-------|--------|----------------------|
+| `qwen3.5:9b`                 |  0.10 |   0.15 | exact                |
+| `qwen/qwen3.6-plus`          | 0.325 |   1.95 | `qwen3\.6.*plus`     |
+
+### OpenAI (via OpenRouter)
+
+| Model ID                     | Input  | Output  | Regex pattern        |
+|------------------------------|--------|---------|----------------------|
+| `openai/gpt-5.5-pro`         | 30.00  |  180.00 | `gpt-5\.5.*pro`      |
+| `openai/gpt-5.5`             |  5.00  |   30.00 | `gpt-5\.5`           |
+
+### DeepSeek V4
+
+| Model ID                        | Input | Output | Regex pattern              |
+|---------------------------------|-------|--------|----------------------------|
+| `deepseek/deepseek-v4-pro`      |  1.74 |   3.48 | `deepseek.v4.*pro`         |
+| `deepseek/deepseek-v4-flash`    |  0.14 |   0.28 | `deepseek.v4.*flash`       |
+
+### Xiaomi MiMo V2.5
+
+| Model ID                     | Input | Output | Regex pattern        |
+|------------------------------|-------|--------|----------------------|
+| `xiaomi/mimo-v2.5-pro`       |  1.00 |   3.00 | `mimo.v2\.5.*pro`    |
+| `xiaomi/mimo-v2.5`           |  0.40 |   2.00 | `mimo.v2\.5`         |
+
+### Moonshot Kimi
+
+| Model ID                     | Input  | Output | Regex pattern |
+|------------------------------|--------|--------|---------------|
+| `moonshotai/kimi-k2.6`       | 0.7448 |  4.655 | `kimi.k2\.6`  |
+
+### MiniMax
+
+| Model ID                     | Input | Output | Regex pattern      |
+|------------------------------|-------|--------|--------------------|
+| `minimax/minimax-m2.7`       |  0.30 |   1.20 | `minimax.m2\.7`    |
 
 ## Notes
 

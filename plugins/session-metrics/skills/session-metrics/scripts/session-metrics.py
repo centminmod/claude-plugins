@@ -93,8 +93,48 @@ _PRICING: dict[str, dict[str, float]] = {
     "gemma4":                    {"input":  0.06, "output":  0.33, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
     # Qwen3.5 9B — OpenRouter: qwen/qwen3.5-9b @ $0.10/$0.15
     "qwen3.5:9b":                {"input":  0.10, "output":  0.15, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    # OpenAI GPT-5.5 family (via OpenRouter, 2026-04-25) — Pro before base
+    "openai/gpt-5.5-pro":        {"input": 30.00, "output": 180.00, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    "openai/gpt-5.5":            {"input":  5.00, "output":  30.00, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    # DeepSeek V4
+    "deepseek/deepseek-v4-pro":  {"input":  1.74, "output":   3.48, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    "deepseek/deepseek-v4-flash":{"input":  0.14, "output":   0.28, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    # Xiaomi MiMo V2.5 — Pro before base
+    "xiaomi/mimo-v2.5-pro":      {"input":  1.00, "output":   3.00, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    "xiaomi/mimo-v2.5":          {"input":  0.40, "output":   2.00, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    # Moonshot Kimi K2.6
+    "moonshotai/kimi-k2.6":      {"input": 0.7448, "output":  4.655, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    # Qwen 3.6 Plus
+    "qwen/qwen3.6-plus":         {"input": 0.325,  "output":   1.95, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    # MiniMax M2.7
+    "minimax/minimax-m2.7":      {"input":  0.30, "output":   1.20, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    # GLM-5-Turbo (Z.ai) — must precede glm-5 in prefix scan; regex guard also added below
+    "z-ai/glm-5-turbo":          {"input":  1.20, "output":   4.00, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
 }
 _DEFAULT_PRICING = {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75, "cache_write_1h": 6.00}
+
+# Regex patterns for flexible model-ID matching — checked between exact match and prefix
+# sweep. re.search so partial IDs (no provider prefix, date suffixes, :tag qualifiers)
+# still resolve. More-specific patterns must come first within each family.
+_PRICING_PATTERNS: list[tuple[re.Pattern[str], dict[str, float]]] = [
+    # OpenAI GPT-5.5 — Pro before base
+    (re.compile(r"gpt-5\.5.*pro",           re.I), _PRICING["openai/gpt-5.5-pro"]),
+    (re.compile(r"gpt-5\.5",                re.I), _PRICING["openai/gpt-5.5"]),
+    # DeepSeek V4 (separator between provider prefix and v4 may vary)
+    (re.compile(r"deepseek.v4.*pro",        re.I), _PRICING["deepseek/deepseek-v4-pro"]),
+    (re.compile(r"deepseek.v4.*flash",      re.I), _PRICING["deepseek/deepseek-v4-flash"]),
+    # Xiaomi MiMo V2.5 — Pro before base
+    (re.compile(r"mimo.v2\.5.*pro",         re.I), _PRICING["xiaomi/mimo-v2.5-pro"]),
+    (re.compile(r"mimo.v2\.5",              re.I), _PRICING["xiaomi/mimo-v2.5"]),
+    # Moonshot Kimi K2.6
+    (re.compile(r"kimi.k2\.6",              re.I), _PRICING["moonshotai/kimi-k2.6"]),
+    # Qwen 3.6 Plus
+    (re.compile(r"qwen3\.6.*plus",          re.I), _PRICING["qwen/qwen3.6-plus"]),
+    # MiniMax M2.7
+    (re.compile(r"minimax.m2\.7",           re.I), _PRICING["minimax/minimax-m2.7"]),
+    # GLM-5-Turbo before the bare glm-5 prefix entry
+    (re.compile(r"glm-5-turbo",             re.I), _PRICING["z-ai/glm-5-turbo"]),
+]
 
 # Module-level advisory state — populated during parsing, printed via atexit.
 # Sets/lists avoid the `global` keyword; atexit fires at normal process exit.
@@ -126,6 +166,11 @@ atexit.register(_print_run_advisories)
 def _pricing_for(model: str) -> dict[str, float]:
     if model in _PRICING:
         return _PRICING[model]
+    # Regex patterns before prefix sweep so specific variants (e.g. glm-5-turbo)
+    # aren't swallowed by a shorter prefix (e.g. glm-5).
+    for pattern, rates in _PRICING_PATTERNS:
+        if pattern.search(model):
+            return rates
     for prefix, rates in _PRICING.items():
         if model.startswith(prefix):
             return rates
