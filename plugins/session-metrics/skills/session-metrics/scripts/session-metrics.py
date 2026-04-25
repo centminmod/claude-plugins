@@ -6479,16 +6479,20 @@ def render_html(report: dict, variant: str = "single",
     )
 
     # Phase-A (v1.6.0) sections — skill/subagent tables + cache-break events.
-    # Attach at every variant so the data surfaces in both dashboard and
-    # detail views; each helper auto-hides when empty.
-    by_skill_html = _build_by_skill_html(report.get("by_skill", []) or [])
-    by_subagent_type_html = _build_by_subagent_type_html(
-        report.get("by_subagent_type", []) or [],
-        subagents_included=bool(report.get("include_subagents", False)))
-    cache_breaks_html = _build_cache_breaks_html(
-        report.get("cache_breaks", []) or [],
-        int(report.get("cache_break_threshold", _CACHE_BREAK_DEFAULT_THRESHOLD)),
-    )
+    # Dashboard/single only; detail page omits these (they already appear on dashboard).
+    if include_insights:
+        by_skill_html = _build_by_skill_html(report.get("by_skill", []) or [])
+        by_subagent_type_html = _build_by_subagent_type_html(
+            report.get("by_subagent_type", []) or [],
+            subagents_included=bool(report.get("include_subagents", False)))
+        cache_breaks_html = _build_cache_breaks_html(
+            report.get("cache_breaks", []) or [],
+            int(report.get("cache_break_threshold", _CACHE_BREAK_DEFAULT_THRESHOLD)),
+        )
+    else:
+        by_skill_html = ""
+        by_subagent_type_html = ""
+        cache_breaks_html = ""
 
     toggle_script_html = ""
     if include_chart and mode == "project":
