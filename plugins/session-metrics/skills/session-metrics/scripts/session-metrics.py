@@ -5246,6 +5246,30 @@ tr.subtotal td{font-weight:600}
 .models-table code{font-size:11px}
 .models-table th,.models-table td{padding:7px 12px}
 
+/* Cache breaks (Phase A v1.6.0) — surface gets per-theme background via theme override blocks below; CSS-variable-driven inner styles work across all four variants. */
+.cache-breaks{padding:14px 16px;border-radius:12px;display:flex;flex-direction:column;gap:8px}
+.cache-break-row{padding:10px 14px;border-radius:8px;border:1px solid var(--border);background:var(--surface-deep,var(--border-dim));font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;transition:border-color .15s ease,background .15s ease}
+.cache-break-row[open]{background:var(--hover,rgba(165,139,255,.05));border-color:var(--accent)}
+.cache-break-row summary{list-style:none;display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;line-height:1.6}
+.cache-break-row summary::-webkit-details-marker{display:none}
+.cache-break-row summary::before{content:"\25b8";display:inline-block;color:var(--accent);font-size:10px;margin-right:4px;transition:transform .15s ease;width:10px}
+.cache-break-row[open] summary::before{transform:rotate(90deg)}
+.cache-break-row .cb-uncached{color:#F87171}
+.cache-break-row .cb-uncached strong{font-size:12px;font-weight:600}
+.cache-break-row .cb-pct{opacity:.7}
+.cache-break-row .cb-proj{color:var(--accent);opacity:.85;font-weight:500}
+.cache-break-row .cb-ts{opacity:.6;font-size:10px}
+.cache-break-row .cb-snippet{opacity:.85;flex:1 1 240px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cb-context{list-style:none;margin:10px 0 4px;padding:8px 12px;border-left:2px solid var(--border);font-size:11px;line-height:1.6;background:var(--bg);border-radius:0 6px 6px 0}
+.cb-context li{padding:3px 0;display:flex;gap:10px;align-items:baseline;font-family:'JetBrains Mono',monospace}
+.cb-context .cb-ts{flex-shrink:0;opacity:.5;font-size:10px;min-width:140px}
+.cb-context .cb-txt{opacity:.85;word-break:break-word}
+.cb-context li.cb-here{background:rgba(251,191,36,.06);margin:4px -12px;padding:5px 12px;border-left:2px solid #FBBF24;border-radius:0}
+.cb-context li.cb-here .cb-mark{color:#FBBF24;font-size:10px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+
+/* Phase-B (v1.7.0) "+N subagents" badge on Prompts table rows. Teal contrasts with the purple slash-command badge so the two badges stay distinguishable when both render on the same row. */
+.prompts-subagent{display:inline-block;margin-left:6px;padding:1px 6px;font-size:10px;font-weight:500;letter-spacing:.04em;border-radius:4px;background:rgba(94,226,198,.14);color:#5EE2C6;border:1px solid rgba(94,226,198,.3);vertical-align:middle;cursor:help;white-space:nowrap}
+
 td.mode-fast{font-size:10px;font-weight:600}
 td.mode-std{font-size:10px;opacity:.55}
 
@@ -5398,6 +5422,7 @@ body.theme-beacon .kpi.featured .kpi-val{color:#A58BFF}
 body.theme-beacon details.insights,body.theme-beacon .usage-insights,
 body.theme-beacon .rollup,body.theme-beacon .blocks,body.theme-beacon .chart-card,
 body.theme-beacon .punch,body.theme-beacon .tod,body.theme-beacon .models-table,
+body.theme-beacon .cache-breaks,
 body.theme-beacon .cards .card,body.theme-beacon #chart-container,
 body.theme-beacon .legend-block,body.theme-beacon .prompts,
 body.theme-beacon .timeline-table,body.theme-beacon .chartrail-card,
@@ -5445,6 +5470,7 @@ body.theme-console .kpi.teal .kpi-val{color:#5EE2C6}
 body.theme-console details.insights,body.theme-console .usage-insights,
 body.theme-console .rollup,body.theme-console .blocks,body.theme-console .chart-card,
 body.theme-console .punch,body.theme-console .tod,body.theme-console .models-table,
+body.theme-console .cache-breaks,
 body.theme-console .cards .card,body.theme-console #chart-container,
 body.theme-console .legend-block,body.theme-console .prompts,
 body.theme-console .timeline-table,body.theme-console .chartrail-card,
@@ -5491,6 +5517,7 @@ body.theme-lattice .kpi .kpi-label{font-size:10px;letter-spacing:.08em}
 body.theme-lattice details.insights,body.theme-lattice .usage-insights,
 body.theme-lattice .rollup,body.theme-lattice .blocks,body.theme-lattice .chart-card,
 body.theme-lattice .punch,body.theme-lattice .tod,body.theme-lattice .models-table,
+body.theme-lattice .cache-breaks,
 body.theme-lattice .cards .card,body.theme-lattice #chart-container,
 body.theme-lattice .legend-block,body.theme-lattice .prompts,
 body.theme-lattice .timeline-table,body.theme-lattice .chartrail-card,
@@ -5538,6 +5565,7 @@ body.theme-pulse .kpi.cat-time .kpi-val{color:#FFB86B}
 body.theme-pulse details.insights,body.theme-pulse .usage-insights,
 body.theme-pulse .rollup,body.theme-pulse .blocks,body.theme-pulse .chart-card,
 body.theme-pulse .punch,body.theme-pulse .tod,body.theme-pulse .models-table,
+body.theme-pulse .cache-breaks,
 body.theme-pulse .cards .card,body.theme-pulse #chart-container,
 body.theme-pulse .legend-block,body.theme-pulse .prompts,
 body.theme-pulse .timeline-table,body.theme-pulse .chartrail-card,

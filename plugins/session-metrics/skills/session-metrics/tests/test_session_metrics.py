@@ -7203,7 +7203,11 @@ def test_phase_a_html_sections_auto_hide_when_empty():
     user_ts = sm._extract_user_timestamps(entries)
     r = sm._build_report("session", "mini", [("mini", turns, user_ts)])
     html = sm.render_html(r, variant="single", chart_lib="none")
-    assert "cache-break-row" not in html
+    # Auto-hide check: the *rendered element* must not be present.
+    # The CSS class names themselves live inside the embedded <style>
+    # block regardless of whether the section renders, so we look for
+    # the opening tag pattern that only the actual section emits.
+    assert '<details class="cache-break-row">' not in html
     assert ">Skills &amp; slash commands<" not in html
 
 
