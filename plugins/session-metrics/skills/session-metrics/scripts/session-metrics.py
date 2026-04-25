@@ -15,7 +15,7 @@ Usage:
   uv run python session-metrics.py --list                 # list sessions for project
   uv run python session-metrics.py --project-cost         # all sessions, timeline + totals
   uv run python session-metrics.py --output json html     # export to exports/session-metrics/
-  uv run python session-metrics.py --include-subagents    # include spawned agents
+  uv run python session-metrics.py --no-include-subagents # skip spawned agents (default: included)
 
 --output accepts one or more of: text json csv md html
   Writes to <cwd>/exports/session-metrics/<name>_<timestamp>.<ext>
@@ -2566,6 +2566,7 @@ def _build_report(
     cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
     subagent_attribution: bool = True,
     sort_prompts_by: str | None = None,
+    include_subagents: bool = False,
 ) -> dict:
     """Build a structured report dict from raw session data.
 
@@ -2692,6 +2693,11 @@ def _build_report(
         # stable. Value is preserved on the report dict so renderers
         # can do their own per-format defaulting.
         "sort_prompts_by": sort_prompts_by,
+        # Whether the loader was invoked with --include-subagents.
+        # Renderers read this to decide whether the Subagent-types table's
+        # zero token columns mean "no spawns happened" vs "spawn-count
+        # only · token data not loaded".
+        "include_subagents": include_subagents,
         # CLI opt-out for the Phase 7 model-compare insight card. Keyed
         # with an underscore so downstream JSON exports don't leak the
         # flag into user-facing schema; `_compute_usage_insights` reads
@@ -6477,7 +6483,8 @@ def render_html(report: dict, variant: str = "single",
     # detail views; each helper auto-hides when empty.
     by_skill_html = _build_by_skill_html(report.get("by_skill", []) or [])
     by_subagent_type_html = _build_by_subagent_type_html(
-        report.get("by_subagent_type", []) or [])
+        report.get("by_subagent_type", []) or [],
+        subagents_included=bool(report.get("include_subagents", False)))
     cache_breaks_html = _build_cache_breaks_html(
         report.get("cache_breaks", []) or [],
         int(report.get("cache_break_threshold", _CACHE_BREAK_DEFAULT_THRESHOLD)),
@@ -7174,6 +7181,7 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
         cache_break_threshold=cache_break_threshold,
         subagent_attribution=subagent_attribution,
         sort_prompts_by=sort_prompts_by,
+        include_subagents=include_subagents,
     )
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib)
 
@@ -7216,6 +7224,7 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
         cache_break_threshold=cache_break_threshold,
         subagent_attribution=subagent_attribution,
         sort_prompts_by=sort_prompts_by,
+        include_subagents=include_subagents,
     )
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib)
 
@@ -7664,6 +7673,7 @@ def _run_all_projects(formats: list[str],
             cache_break_threshold=cache_break_threshold,
             subagent_attribution=subagent_attribution,
             sort_prompts_by=sort_prompts_by,
+            include_subagents=include_subagents,
         )
         project_reports.append(pr)
         all_sessions_raw.extend(sessions_raw)
@@ -8410,8 +8420,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Export formats in addition to stdout text. "
                         "One or more of: json csv md html. "
                         "Written to exports/session-metrics/ in the project root.")
-    p.add_argument("--include-subagents", action="store_true",
-                   help="Also tally spawned subagent JSONL files.")
+    p.add_argument("--include-subagents", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Tally spawned subagent JSONL files (default: on). "
+                        "Pass --no-include-subagents to skip for faster runs.")
     p.add_argument("--cache-break-threshold", type=int,
                    default=_CACHE_BREAK_DEFAULT_THRESHOLD, metavar="TOKENS",
                    help=(f"Turns whose input + cache_creation exceed TOKENS are "

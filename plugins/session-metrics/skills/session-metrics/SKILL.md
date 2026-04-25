@@ -110,12 +110,12 @@ project root, named `session_<id8>_<YYYYMMDD_HHMMSS>.<ext>` (single) or
 | `--tz <IANA>`                | IANA timezone for time-of-day bucketing **and timeline/export timestamps**. Defaults to the system local tz (auto-detected via `TZ` env var or the OS setting). |
 | `--utc-offset <H>`           | Fixed UTC offset, DST-naive. Use `--tz` for DST-aware. |
 | `--no-cache`                 | Skip `~/.cache/session-metrics/parse/` and always re-parse from scratch. |
-| `--include-subagents`        | Also tally spawned subagent JSONL files. |
+| `--no-include-subagents`     | Skip spawned subagent JSONL files. Subagents are included by default; use this for faster runs when subagent detail is not needed. |
 | `--cache-break-threshold <N>` | Turns whose `input + cache_creation` exceed N are flagged as **cache-break events** (default 100 000). Matches Anthropic's `session-report` convention. |
 | `--no-subagent-attribution`  | Disable Phase-B subagent → parent-prompt token attribution. Default behaviour rolls every subagent's tokens up onto the user prompt that spawned the chain (additional `attributed_subagent_*` fields, no double-counting). |
 | `--sort-prompts-by {total,self}` | How to rank top prompts in HTML/MD output. `total` (default) = parent + attributed subagent cost, surfaces cheap-prompt-spawning-expensive-subagent turns. `self` = parent only (pre-Phase-B order). CSV/JSON keep `self` ordering for stability regardless of this flag. |
 
-> **Invocation note for the AI.** Don't pass `--tz` or `--utc-offset` unless the user explicitly asks for a specific timezone. The script auto-detects the user's system tz and renders all human-facing timestamps (timeline, session headers, generated-at banner, block anchors) in that tz. JSON/CSV raw `timestamp` fields stay UTC ISO-8601 as a machine-readable audit trail.
+> **Invocation note for the AI.** Don't pass `--tz` or `--utc-offset` unless the user explicitly asks for a specific timezone. The script auto-detects the user's system tz and renders all human-facing timestamps (timeline, session headers, generated-at banner, block anchors) in that tz. JSON/CSV raw `timestamp` fields stay UTC ISO-8601 as a machine-readable audit trail. Don't pass `--include-subagents` — subagents are included by default. Only pass `--no-include-subagents` if the user explicitly asks for a faster/leaner run without subagent detail.
 
 ## Output columns
 
@@ -182,9 +182,8 @@ export.
   merge with Skill-tool invocations of the same name.
 - **Subagent types** — one row per resolved `subagent_type` (from
   `Agent` / `Task` tool_use `input.subagent_type`). Shows spawn count
-  always; token/cost columns populate when `--include-subagents` is
-  passed (subagent JSONLs are tagged with their type via meta.json →
-  filename regex → `fork` fallback).
+  always; token/cost columns populate from subagent JSONLs (default behaviour —
+  pass `--no-include-subagents` to skip).
 
 **UUID-based dedup** runs at project and instance scope to prevent
 resumed-session replays from double-counting. Session scope keeps the
@@ -192,8 +191,7 @@ existing `message.id` streaming-split dedup.
 
 ### Subagent → parent-prompt attribution (v1.7.0 — Phase B)
 
-When `--include-subagents` is on, every spawned subagent's token usage
-rolls up onto the **user prompt** that originally triggered the chain:
+Subagent token usage is included by default and rolls up onto the **user prompt** that originally triggered the chain:
 
 - Three new turn-record fields populate on the spawning prompt's row —
   `attributed_subagent_tokens`, `attributed_subagent_cost`,
@@ -216,8 +214,8 @@ rolls up onto the **user prompt** that originally triggered the chain:
   `nested_levels_seen`, `cycles_detected`. Useful for sanity checks
   when pointing at unfamiliar history.
 
-Disable with `--no-subagent-attribution` for performance-sensitive
-instance-mode runs or to compare against pre-Phase-B reports.
+Disable subagent loading entirely with `--no-include-subagents` (fastest, no subagent token detail).
+Disable only the attribution rollup while still loading subagents with `--no-subagent-attribution` (compare against pre-Phase-B reports).
 
 ## Instance dashboard (all projects)
 
