@@ -51,6 +51,29 @@ and for prefix-matching fallback when a model ID isn't explicitly listed.
 | `claude-3-opus`         | 15.00 |  75.00 |       1.50 |          18.75 |          30.00 |
 | (default fallback)      |  3.00 |  15.00 |       0.30 |           3.75 |           6.00 |
 
+## Non-Anthropic models
+
+These entries use OpenRouter as the pricing source of truth. Cache columns are
+all 0 (prompt caching is Claude-specific and not charged for by OpenRouter).
+The `gemma4` entry is a prefix fallback that covers Ollama local variants
+(`gemma4-26b-32k`, `gemma4-26b-48k`, `gemma4:e4b`, etc.) at the Gemma 4 26B A4B
+OpenRouter rate — a reasonable estimate for mixed-environment JSONL files.
+
+Source: [OpenRouter pricing](https://openrouter.ai/pricing) — snapshot 2026-04-25.
+
+| Model ID (prefix match)      | Input | Output | Cache read | 5m Cache write | 1h Cache write |
+|------------------------------|-------|--------|------------|----------------|----------------|
+| `glm-4.7`                    |  0.38 |   1.74 |       0.00 |           0.00 |           0.00 |
+| `glm-5`                      |  0.60 |   2.08 |       0.00 |           0.00 |           0.00 |
+| `glm-5.1`                    |  1.05 |   3.50 |       0.00 |           0.00 |           0.00 |
+| `google/gemma-4-26b-a4b`     |  0.06 |   0.33 |       0.00 |           0.00 |           0.00 |
+| `gemma4`                     |  0.06 |   0.33 |       0.00 |           0.00 |           0.00 |
+| `qwen3.5:9b`                 |  0.10 |   0.15 |       0.00 |           0.00 |           0.00 |
+
+> **GLM ordering note**: `glm-5.1` and `glm-5` are exact-match lookups (not
+> prefix), so they will never cross-match. Order within `_PRICING` does not
+> affect them.
+
 ## Notes
 
 - **Prefix fallback order matters**: dict insertion order is traversed until

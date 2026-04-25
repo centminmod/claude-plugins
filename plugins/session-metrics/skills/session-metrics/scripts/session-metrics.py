@@ -28,6 +28,7 @@ Environment variables (all optional — CLI flags take precedence):
 """
 
 import argparse
+import atexit
 import csv as csv_mod
 import functools
 import gzip
@@ -82,8 +83,44 @@ _PRICING: dict[str, dict[str, float]] = {
     "claude-3-5-haiku":          {"input":  0.80, "output":  4.00, "cache_read": 0.08,  "cache_write":  1.00, "cache_write_1h":  1.60},
     # --- Opus 3 (deprecated; old-tier rates) ---
     "claude-3-opus":             {"input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75, "cache_write_1h": 30.00},
+    # --- Non-Anthropic models (OpenRouter rates, 2026-04-25; no prompt caching) ---
+    # GLM models — Z.ai / Zhipu AI
+    "glm-4.7":                   {"input":  0.38, "output":  1.74, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    "glm-5":                     {"input":  0.60, "output":  2.08, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    "glm-5.1":                   {"input":  1.05, "output":  3.50, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    # Google Gemma 4 — OpenRouter: google/gemma-4-26b-a4b-it @ $0.06/$0.33; prefix covers Ollama variants
+    "google/gemma-4-26b-a4b":    {"input":  0.06, "output":  0.33, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    "gemma4":                    {"input":  0.06, "output":  0.33, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
+    # Qwen3.5 9B — OpenRouter: qwen/qwen3.5-9b @ $0.10/$0.15
+    "qwen3.5:9b":                {"input":  0.10, "output":  0.15, "cache_read": 0.00, "cache_write": 0.00, "cache_write_1h": 0.00},
 }
 _DEFAULT_PRICING = {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75, "cache_write_1h": 6.00}
+
+# Module-level advisory state — populated during parsing, printed via atexit.
+# Sets/lists avoid the `global` keyword; atexit fires at normal process exit.
+_UNKNOWN_MODELS_SEEN: set[str] = set()
+_FAST_MODE_TURNS: list[int] = [0]  # [0] is the running count
+
+
+def _print_run_advisories() -> None:
+    if _UNKNOWN_MODELS_SEEN:
+        names = ", ".join(sorted(_UNKNOWN_MODELS_SEEN))
+        print(
+            f"[warn] Unknown model(s) priced at Sonnet rates ($3/$15 per 1M tokens): {names}. "
+            "Add to references/pricing.md to fix.",
+            file=sys.stderr,
+        )
+    if _FAST_MODE_TURNS[0]:
+        n = _FAST_MODE_TURNS[0]
+        print(
+            f"[note] {n} fast-mode turn{'s' if n != 1 else ''} detected; "
+            "cost shown is base-rate × 1.0 (actual is ~6×). "
+            "See references/pricing.md § Fast mode.",
+            file=sys.stderr,
+        )
+
+
+atexit.register(_print_run_advisories)
 
 
 def _pricing_for(model: str) -> dict[str, float]:
@@ -92,6 +129,7 @@ def _pricing_for(model: str) -> dict[str, float]:
     for prefix, rates in _PRICING.items():
         if model.startswith(prefix):
             return rates
+    _UNKNOWN_MODELS_SEEN.add(model)
     return _DEFAULT_PRICING
 
 
@@ -1327,6 +1365,8 @@ def _build_turn_record(global_index: int, entry: dict,
                 "name":          name if isinstance(name, str) else str(name),
                 "input_preview": _summarise_tool_input(name, block.get("input")),
             })
+    if u.get("speed") == "fast":
+        _FAST_MODE_TURNS[0] += 1
     return {
         "index":                  global_index,
         "timestamp":              entry.get("timestamp", ""),
@@ -4313,7 +4353,7 @@ tr.turn-row:focus{outline:1px solid var(--accent);outline-offset:-1px}
 .drawer-tools-list li:first-child{border-top:none}
 .drawer-tool-preview{font-size:10px;opacity:.7;margin-left:6px;word-break:break-word}
 .drawer-savings{color:#3fb950;font-size:11px;margin-top:6px;font-family:'JetBrains Mono',monospace}
-.drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .2s ease;z-index:999}
+.drawer-backdrop{position:fixed;inset:0;background:var(--backdrop,rgba(0,0,0,.5));opacity:0;pointer-events:none;transition:opacity .2s ease;z-index:999}
 .drawer-backdrop.open{opacity:1;pointer-events:auto}
 
 /* Chart-rail (horizontally-scrollable per-turn column chart) */
@@ -4389,6 +4429,7 @@ body.theme-beacon{
   --bg:#0A0A0C;--surface:#111114;--surface-deep:#0E0E12;--border:#1E1E22;--border-dim:#16161a;
   --fg:#EDECEF;--fg-dim:#8C8B93;--accent:#A58BFF;--accent-soft:#7C6BD9;
   --punch-empty:#141418;--bar-bg:#1a1a1f;--hover:rgba(165,139,255,.05);
+  --backdrop:rgba(0,0,0,.65);
   background:#0A0A0C;color:#EDECEF;
 }
 body.theme-beacon .topbar{background:rgba(10,10,12,.78);border-bottom:1px solid #16161a}
@@ -4427,6 +4468,7 @@ body.theme-console{
   --border:rgba(165,139,255,.16);--border-dim:rgba(165,139,255,.08);
   --fg:#E8E6F0;--fg-dim:#8A88A0;--accent:#A58BFF;--accent-soft:#5EE2C6;
   --punch-empty:rgba(165,139,255,.05);--bar-bg:rgba(165,139,255,.08);--hover:rgba(165,139,255,.07);
+  --backdrop:rgba(0,0,0,.7);
   background:#08080A;color:#E8E6F0;
   background-image:radial-gradient(circle at 1px 1px,#1A1A20 1px,transparent 1px);
   background-size:24px 24px;
@@ -4472,6 +4514,7 @@ body.theme-lattice{
   --bg:#09090C;--surface:#101014;--surface-deep:#0C0C10;--border:#17171C;--border-dim:#121216;
   --fg:#E4E2E8;--fg-dim:#7E7C88;--accent:#A58BFF;--accent-soft:#7C6BD9;
   --punch-empty:#131318;--bar-bg:#17171C;--hover:rgba(165,139,255,.05);
+  --backdrop:rgba(0,0,0,.65);
   background:#09090C;color:#E4E2E8;font-size:12px;
 }
 body.theme-lattice .shell{padding-top:24px}
@@ -4519,6 +4562,7 @@ body.theme-pulse{
   --bg:#0D0B14;--surface:#15121C;--surface-deep:#110F18;--border:#2A2438;--border-dim:#1D1928;
   --fg:#F2EFF7;--fg-dim:#9E9AAE;--accent:#C084FC;--accent-soft:#FFB86B;
   --punch-empty:#1D1928;--bar-bg:#1D1928;--hover:rgba(192,132,252,.08);
+  --backdrop:rgba(0,0,0,.65);
   background:radial-gradient(circle at 85% -20%,rgba(255,184,107,.08),transparent 40%),radial-gradient(circle at -10% 120%,rgba(192,132,252,.12),transparent 50%),#0D0B14;
   color:#F2EFF7;
 }
@@ -4569,6 +4613,10 @@ body.theme-pulse tr.subtotal td{background:#15121C;border-top:1px solid #2A2438}
   .topbar .nav{margin-left:0}
   .switcher{margin-left:0}
   .drawer{width:100%}
+}
+@media print{
+  .drawer,.drawer-backdrop,.topbar,.switcher{display:none!important}
+  .shell{max-width:none;padding:0}
 }
 </style>"""
 
@@ -5866,6 +5914,7 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="chart-lib" content="{chart_lib}">
 <title>Session Metrics — {slug}{title_suffix}</title>
 {chart_head_html}
 {_theme_css()}
@@ -6956,6 +7005,7 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="chart-lib" content="{chart_lib}">
 <title>{page_title}</title>
 {_theme_css()}
 {_theme_bootstrap_head_js()}
@@ -7147,7 +7197,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # code paths so natural-language prompts ("session cost?") never fall
     # into this branch — dispatch only happens when the user explicitly
     # passes two specifiers via ``--compare``.
-    p.add_argument("--compare", nargs=2, metavar=("A", "B"),
+    # The four primary-mode flags are mutually exclusive at the CLI: passing
+    # two of them together is caught here rather than silently last-wins.
+    _mode = p.add_mutually_exclusive_group()
+    _mode.add_argument("--compare", nargs=2, metavar=("A", "B"),
                    help="Run a model-compare report over two sessions. Each "
                         "arg may be a .jsonl path, a session UUID, or a "
                         "'last-<family>' / 'all-<family>' magic token. "
@@ -7176,7 +7229,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         "count-tokens API mode, multi-trial runs). Accepted "
                         "now for CLI-shape stability.")
     # --- Compare capture-protocol helper (Phase 4) -----------------------
-    p.add_argument("--compare-prep", nargs="*", metavar="MODEL",
+    _mode.add_argument("--compare-prep", nargs="*", metavar="MODEL",
                    default=None,
                    help="Emit the capture protocol + canonical prompt suite "
                         "to stdout. Takes 0-2 positional model IDs; defaults "
@@ -7237,7 +7290,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         "hint is noisy (e.g. a project with many historical "
                         "families but no interest in running a benchmark).")
     # --- Phase 8 — count_tokens API mode --------------------------------
-    p.add_argument("--count-tokens-only", action="store_true",
+    _mode.add_argument("--count-tokens-only", action="store_true",
                    help="Compare input-token counts between two models using "
                         "the /v1/messages/count_tokens API — no inference, no "
                         "cost (other than request rate). Requires "
@@ -7252,7 +7305,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         "claude-opus-4-7'. A single model is accepted for "
                         "input-token measurement without ratios.")
     # --- Phase 10 — Automated headless capture ---------------------------
-    p.add_argument("--compare-run", nargs="*", metavar="MODEL",
+    _mode.add_argument("--compare-run", nargs="*", metavar="MODEL",
                    default=None,
                    help="Fully automated compare: spawns two 'claude -p' "
                         "(headless) sessions, feeds each the canonical "

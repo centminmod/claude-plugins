@@ -6945,3 +6945,145 @@ def test_render_html_instance_chart_uses_day_axis_label(instance_env):
     assert 'id="chartrail-data"' not in html, (
         "instance HTML must not contain the per-session chartrail"
     )
+
+
+# ===========================================================================
+# T1.3 — Unknown-model advisory (F4, v2 audit)
+# ===========================================================================
+
+def test_pricing_unknown_model_adds_to_seen_set(monkeypatch):
+    """_pricing_for accumulates unknown model names into _UNKNOWN_MODELS_SEEN."""
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    sm._pricing_for("claude-entirely-fictional-99")
+    assert "claude-entirely-fictional-99" in sm._UNKNOWN_MODELS_SEEN
+
+
+def test_pricing_known_model_not_added_to_seen_set(monkeypatch):
+    """A model present in _PRICING must not be added to _UNKNOWN_MODELS_SEEN."""
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    sm._pricing_for("claude-opus-4-7")
+    assert not sm._UNKNOWN_MODELS_SEEN
+
+
+def test_pricing_unknown_model_returns_default_rates(monkeypatch):
+    """An unrecognised model falls back to the Sonnet-rate default pricing dict."""
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    r = sm._pricing_for("claude-totally-unknown-model")
+    assert r is sm._DEFAULT_PRICING
+
+
+def test_print_advisories_warns_unknown_models(monkeypatch, capsys):
+    """_print_run_advisories emits a [warn] line to stderr listing unknown models."""
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", {"claude-fake-model-x"})
+    monkeypatch.setattr(sm, "_FAST_MODE_TURNS", [0])
+    sm._print_run_advisories()
+    err = capsys.readouterr().err
+    assert "[warn]" in err
+    assert "claude-fake-model-x" in err
+    assert "Sonnet rates" in err
+
+
+def test_print_advisories_silent_when_nothing_to_warn(monkeypatch, capsys):
+    """_print_run_advisories is silent when both advisory sets are empty/zero."""
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    monkeypatch.setattr(sm, "_FAST_MODE_TURNS", [0])
+    sm._print_run_advisories()
+    assert capsys.readouterr().err == ""
+
+
+# ===========================================================================
+# T1.4 — Fast-mode advisory (F1, v2 audit)
+# ===========================================================================
+
+def _make_fast_turn_entry(speed: str = "fast") -> dict:
+    return {
+        "message": {
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "speed": speed,
+            },
+            "model": "claude-opus-4-7",
+        },
+        "timestamp": "2025-01-01T00:00:00.000Z",
+    }
+
+
+def test_fast_mode_turn_increments_counter(monkeypatch):
+    """_build_turn_record increments _FAST_MODE_TURNS[0] for speed==\"fast\" turns."""
+    monkeypatch.setattr(sm, "_FAST_MODE_TURNS", [0])
+    sm._build_turn_record(0, _make_fast_turn_entry("fast"))
+    assert sm._FAST_MODE_TURNS[0] == 1
+
+
+def test_standard_turn_does_not_increment_fast_mode_counter(monkeypatch):
+    """_build_turn_record leaves _FAST_MODE_TURNS[0] unchanged for non-fast turns."""
+    monkeypatch.setattr(sm, "_FAST_MODE_TURNS", [0])
+    sm._build_turn_record(0, _make_fast_turn_entry(""))
+    assert sm._FAST_MODE_TURNS[0] == 0
+
+
+def test_print_advisories_warns_fast_mode_plural(monkeypatch, capsys):
+    """_print_run_advisories emits a [note] advisory when fast-mode turns exist (plural)."""
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    monkeypatch.setattr(sm, "_FAST_MODE_TURNS", [3])
+    sm._print_run_advisories()
+    err = capsys.readouterr().err
+    assert "[note]" in err
+    assert "3 fast-mode turns" in err
+    assert "~6×" in err
+
+
+def test_print_advisories_warns_fast_mode_singular(monkeypatch, capsys):
+    """_print_run_advisories uses singular 'turn' for exactly one fast-mode turn."""
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    monkeypatch.setattr(sm, "_FAST_MODE_TURNS", [1])
+    sm._print_run_advisories()
+    err = capsys.readouterr().err
+    assert "1 fast-mode turn " in err  # singular — no trailing 's'
+
+
+# ===========================================================================
+# T1.5 — argparse mutually-exclusive mode group (F5, v2 audit)
+# ===========================================================================
+
+def test_argparse_mutex_compare_and_compare_run_conflict():
+    """--compare and --compare-run together must raise SystemExit(2)."""
+    with pytest.raises(SystemExit) as excinfo:
+        sm._build_parser().parse_args(
+            ["--compare", "a.jsonl", "b.jsonl", "--compare-run"]
+        )
+    assert excinfo.value.code != 0
+
+
+def test_argparse_mutex_compare_and_count_tokens_only_conflict():
+    """--compare and --count-tokens-only together must raise SystemExit."""
+    with pytest.raises(SystemExit) as excinfo:
+        sm._build_parser().parse_args(
+            ["--compare", "a.jsonl", "b.jsonl", "--count-tokens-only"]
+        )
+    assert excinfo.value.code != 0
+
+
+def test_argparse_mutex_compare_prep_and_compare_run_conflict():
+    """--compare-prep and --compare-run together must raise SystemExit."""
+    with pytest.raises(SystemExit) as excinfo:
+        sm._build_parser().parse_args(["--compare-prep", "--compare-run"])
+    assert excinfo.value.code != 0
+
+
+def test_argparse_compare_alone_accepted():
+    """--compare with two args and no conflicting flags must parse successfully."""
+    args = sm._build_parser().parse_args(["--compare", "a.jsonl", "b.jsonl"])
+    assert args.compare == ["a.jsonl", "b.jsonl"]
+    assert args.compare_run is None
+    assert args.compare_prep is None
+
+
+def test_argparse_compare_run_alone_accepted():
+    """--compare-run with no conflicting flags must parse successfully."""
+    args = sm._build_parser().parse_args(["--compare-run"])
+    assert args.compare_run == []  # nargs="*" with no values gives []
+    assert args.compare is None

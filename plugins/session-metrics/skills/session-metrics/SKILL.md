@@ -236,6 +236,8 @@ the existing `context-tier-mismatch` advisory on the report.
 | `compare-prep`              | Print the manual capture protocol. Only suggest when `claude -p` is unavailable (e.g. CI container without the CLI). |
 | `count-tokens`              | API-key tokenizer smoke test. NOT a subscription path; do not suggest to users comparing two subscription sessions. |
 
+**Output formats for compare mode.** Compare mode supports `--output text md json csv html`. The HTML report is always single-page (a compact scored per-prompt table); `--single-page` and `--chart-lib` are ignored when `--compare` is active.
+
 **`compare-run` auto-extras.** When `compare-run` is invoked with
 `--output <fmt>`, it emits the compare report *and* five companion
 files in `exports/session-metrics/`: a per-session dashboard + detail
