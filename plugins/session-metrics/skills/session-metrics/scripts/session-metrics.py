@@ -5489,6 +5489,7 @@ body.theme-console th{background:rgba(165,139,255,.05);border-bottom:1px solid r
 body.theme-console td{border-bottom:1px solid rgba(165,139,255,.08)}
 body.theme-console tr.session-header td{background:rgba(165,139,255,.08);color:#A58BFF;border-top:1px solid rgba(165,139,255,.2)}
 body.theme-console tr.subtotal td{background:rgba(165,139,255,.05);border-top:1px solid rgba(165,139,255,.16)}
+body.theme-console .drawer{background:var(--bg)}
 
 /* =========================================================================
    THEME 3 — LATTICE COMPACT
