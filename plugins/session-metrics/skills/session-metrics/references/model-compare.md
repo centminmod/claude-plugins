@@ -164,6 +164,60 @@ labels to appear even though they're not recorded in the transcript):
   this flag is relevant only for the manual-capture / re-render
   workflows.
 
+Prompt-steering flags for the `compare-run` route:
+
+- `--compare-run-prompt-steering VARIANT` — wrap every prompt in the
+  suite with steering text before feeding it to `claude -p`. VARIANT
+  is one of `concise`, `think-step-by-step`, `ultrathink`, or
+  `no-tools`. Applied symmetrically to both sides so the A/B remains
+  apples-to-apples; what shifts is each model's behaviour under the
+  same instruction, surfaced as token / cost / thinking / tool-call
+  deltas vs the unsteered baseline.
+
+- `--compare-run-prompt-steering-position {prefix,append,both}` —
+  controls where the steering text lands relative to the prompt body.
+  `prefix` prepends, `append` appends, `both` sandwiches the body
+  between the variant's prefix and suffix. Default `prefix`. Ignored
+  when `--compare-run-prompt-steering` is absent.
+
+**On steering vs IFEval predicates.** The 10 prompts each carry an
+IFEval predicate (e.g. exactly 120 words, exactly 3 bullets, no CJK
+codepoints, valid JSON shape). When steering is applied, predicate
+pass rates may legitimately differ from the unsteered baseline —
+"be concise" can violate the 120-word constraint; "use extended
+reasoning" can inflate output past the 200-token bound on the
+stack-trace prompt. **That is the measurement, not a regression.**
+Read pass-rate deltas under steering as a behavioural signal, not a
+quality regression: a variant that compresses output but breaks two
+strict predicates may still be the right tool for tasks where length
+matters more than format compliance. For multi-variant sweeps with
+auto-rendered comparison articles ranking variants on the
+quality-vs-cost tradeoff, use the `benchmark-effort-prompt` skill.
+
+**Variant phrasings.** The concise and think-step-by-step variants
+quote the canonical phrasings from Anthropic's prompting best-
+practices guide
+([source](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices)).
+The ultrathink variant approximates the doc's "think harder /
+thoroughly" guidance — Anthropic does not use the literal word
+"ultrathink" in the guide; that is a Claude Code CLI magic word, not
+a docs-recommended steer. The no-tools variant has no canonical
+phrasing because the guide focuses on encouraging appropriate tool
+*use* rather than blanket suppression. Edit
+`_PROMPT_STEERING_VARIANTS` in `session_metrics_compare.py` to swap
+phrasings; no callers depend on the wording.
+
+**Note on thinking-word sensitivity.** Anthropic's guide notes that
+Claude Opus 4.5 is "particularly sensitive to the word 'think' and
+its variants" when extended thinking is *disabled*. That means the
+deltas the benchmark measures for `think-step-by-step` and
+`ultrathink` are conditional on the model's thinking configuration:
+under adaptive thinking (the 4.6 / 4.7 default) the steers behave as
+expected; with thinking disabled they may produce larger or
+opposite-direction shifts than the unsteered baseline. When
+interpreting cross-model results, hold the thinking configuration
+constant or report it explicitly alongside the deltas.
+
 If any single `claude -p` call fails, the orchestrator aborts with
 the stderr from that call and leaves the partial JSONL on disk for
 inspection. No retry loop — Claude Code itself handles transient

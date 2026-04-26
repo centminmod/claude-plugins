@@ -3806,6 +3806,99 @@ _DEFAULT_COMPARE_RUN_TIMEOUT_SEC = 900.0  # 15 min / prompt; tool-heavy #5 is sl
 # sides to a common level matters more than matching each model's default.
 _COMPARE_RUN_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
+# Prompt-steering variants applied symmetrically to both sides of a
+# ``--compare-run`` so the A/B stays clean. Each variant supplies a ``prefix``
+# (prepended to the prompt body) and a ``suffix`` (appended); ``--compare-run-
+# prompt-steering-position`` selects which one(s) to actually wrap with. The
+# wrapper is opt-in — when ``steering_variant`` is None, the behaviour is
+# byte-identical to the pre-flag pipeline.
+#
+# Phrasings are pulled from Anthropic's prompting best-practices guide where
+# a canonical sentence exists for the steer, and Anthropic-style approximations
+# elsewhere. Source:
+# https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices
+#
+# Caveat on the thinking-word variants: that doc notes Claude Opus 4.5 is
+# particularly sensitive to the word "think" and its variants when extended
+# thinking is *disabled* — which means the ``think-step-by-step`` and
+# ``ultrathink`` deltas measured by the benchmark will be larger when
+# adaptive thinking is on (the default for 4.6/4.7) than when it is off.
+# When interpreting the benchmark, treat thinking-related variants as
+# conditional on the model's thinking configuration.
+_PROMPT_STEERING_VARIANTS: dict[str, dict[str, str]] = {
+    "concise": {
+        # Verbatim from Anthropic's "Response length and verbosity" section.
+        "prefix": (
+            "Provide concise, focused responses. Skip non-essential context, "
+            "and keep examples minimal."
+        ),
+        "suffix": "Keep your response as short as possible.",
+    },
+    "think-step-by-step": {
+        # Verbatim from Anthropic's "Calibrating effort and thinking depth"
+        # section — the recommended targeted-guidance phrasing when raising
+        # the effort parameter isn't an option.
+        "prefix": (
+            "This task involves multi-step reasoning. Think carefully "
+            "through the problem before responding."
+        ),
+        "suffix": "Show your reasoning step by step.",
+    },
+    "ultrathink": {
+        # Anthropic's guide doesn't use the literal "ultrathink" phrase
+        # (that is a Claude Code CLI magic word, not a docs-recommended
+        # steer). The closest canonical formulation in the guide is
+        # "think harder / think thoroughly", combined here so the variant
+        # tests both an escalation phrase and an extended-reasoning cue.
+        "prefix": (
+            "Think harder and more thoroughly about this problem. Use "
+            "extended reasoning before responding."
+        ),
+        "suffix": "Take time to reason carefully before answering.",
+    },
+    "no-tools": {
+        # No direct canonical phrasing in Anthropic's guide for prompt-level
+        # tool suppression — the guide focuses on encouraging appropriate
+        # tool USE rather than blanket suppression. Phrasing here is a
+        # neutral Anthropic-style instruction; if you find this variant
+        # under-triggers, the next thing to try is adding "even if you
+        # think a tool would help" to make the override more decisive.
+        "prefix": (
+            "Do not invoke any tools. Answer from your own knowledge and "
+            "reasoning only."
+        ),
+        "suffix": "Do not invoke any tools to produce this answer.",
+    },
+}
+
+_PROMPT_STEERING_POSITIONS = frozenset({"prefix", "append", "both"})
+
+
+def _apply_steering(
+    body: str,
+    variant: str | None,
+    position: str = "prefix",
+) -> str:
+    """Wrap a prompt body with steering text per the selected variant/position.
+
+    Returns the body unchanged when ``variant`` is None or empty — that
+    pre-flag-equivalent path keeps the no-flag baseline byte-identical so
+    JSONL fingerprints don't drift for users who never opt in. Raises
+    ``KeyError`` for unknown variants and ``ValueError`` for unknown
+    positions; both are pre-flight conditions the CLI dispatcher validates
+    before any subprocess fires.
+    """
+    if not variant:
+        return body
+    v = _PROMPT_STEERING_VARIANTS[variant]
+    if position == "prefix":
+        return f"{v['prefix']}\n\n{body}"
+    if position == "append":
+        return f"{body}\n\n{v['suffix']}"
+    if position == "both":
+        return f"{v['prefix']}\n\n{body}\n\n{v['suffix']}"
+    raise ValueError(f"unknown steering position: {position!r}")
+
 
 class CompareRunError(RuntimeError):
     """Raised when the ``--compare-run`` orchestrator can't continue.
@@ -3907,6 +4000,8 @@ def _run_compare_side(
     subprocess_run,
     progress_out,
     effort: str | None = None,
+    steering_variant: str | None = None,
+    steering_position: str = "prefix",
 ) -> list[dict]:
     """Feed the full prompt suite into one model via ``claude -p``.
 
@@ -3914,6 +4009,12 @@ def _run_compare_side(
     disk). First iteration uses ``--session-id``; later iterations use
     ``--resume`` against the same UUID so every turn lands in a single
     JSONL at ``~/.claude/projects/<slug-of-cwd>/<session_id>.jsonl``.
+
+    ``steering_variant`` / ``steering_position`` — when ``steering_variant``
+    is non-None, every prompt body is wrapped via :func:`_apply_steering`
+    before reaching the subprocess. Both sides get the same wrapper so the
+    A/B comparison stays clean. The compare-suite sentinel sits inside the
+    body and survives the wrap; pairing logic is unaffected.
 
     Returns the list of per-prompt JSON results from stdout (for
     diagnostics / rollup). Raises :class:`CompareRunError` on the
@@ -3927,8 +4028,11 @@ def _run_compare_side(
             f"  [{model}] prompt {i}/{total}: {name}\n"
         )
         progress_out.flush()
+        steered_body = _apply_steering(
+            entry["body"], steering_variant, steering_position,
+        )
         out_json = _claude_headless_call(
-            entry["body"],
+            steered_body,
             model=model,
             session_id=session_id,
             is_first_turn=(i == 1),
@@ -3954,6 +4058,8 @@ def _confirm_compare_run_or_exit(
     stdin=None,
     effort_a: str | None = None,
     effort_b: str | None = None,
+    steering_variant: str | None = None,
+    steering_position: str = "prefix",
 ) -> None:
     """Confirmation gate before firing 2 × N headless inference calls.
 
@@ -3964,7 +4070,9 @@ def _confirm_compare_run_or_exit(
     emphasises that rather than rate-limit requests. ``effort_a`` /
     ``effort_b`` surface on the model line only when set — silent fallback
     to Claude Code's per-model defaults preserves the existing output
-    shape for the no-flag case.
+    shape for the no-flag case. ``steering_variant`` surfaces on its own
+    line under the same conditional so the no-flag baseline banner is
+    unchanged.
     """
     if stdin is None:
         stdin = sys.stdin
@@ -3980,6 +4088,13 @@ def _confirm_compare_run_or_exit(
         f"  Side A: {model_a}{suffix_a}   Side B: {model_b}{suffix_b}",
         file=sys.stderr,
     )
+    if steering_variant:
+        print(
+            f"  Steering: {steering_variant} ({steering_position}) — "
+            f"applied symmetrically to both sides; IFEval pass rates may "
+            f"differ from unsteered baseline.",
+            file=sys.stderr,
+        )
     print(
         f"  Scratch dir: {scratch_dir}",
         file=sys.stderr,
@@ -4040,6 +4155,8 @@ def _run_compare_run(
     compare_run_extras: bool = True,
     effort_a: str | None = None,
     effort_b: str | None = None,
+    steering_variant: str | None = None,
+    steering_position: str = "prefix",
 ) -> dict:
     """Orchestrator for ``--compare-run``: capture both sides, then compare.
 
@@ -4097,6 +4214,28 @@ def _run_compare_run(
     effort_a = effort_a or None
     effort_b = effort_b or None
 
+    # Steering: validate variant + position before any subprocess fires. Empty
+    # string normalises to None so the CLI can stay branch-free, mirroring the
+    # effort-level pattern above.
+    if steering_variant in (None, ""):
+        steering_variant = None
+    elif steering_variant not in _PROMPT_STEERING_VARIANTS:
+        print(
+            f"[error] --compare-run-prompt-steering: {steering_variant!r} is "
+            f"not a known variant. Expected one of: "
+            f"{', '.join(sorted(_PROMPT_STEERING_VARIANTS))}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if steering_position not in _PROMPT_STEERING_POSITIONS:
+        print(
+            f"[error] --compare-run-prompt-steering-position: "
+            f"{steering_position!r} is not valid. Expected one of: "
+            f"{', '.join(sorted(_PROMPT_STEERING_POSITIONS))}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Step 1: scratch dir. Resolve symlinks (``/tmp`` → ``/private/tmp`` on
     # macOS) so the slug we compute later matches what Claude Code derives
     # from its own cwd when the subprocess runs — otherwise the JSONLs land
@@ -4125,6 +4264,8 @@ def _run_compare_run(
         model_a, model_b, len(suite),
         scratch_dir=scratch_dir, assume_yes=assume_yes, stdin=stdin,
         effort_a=effort_a, effort_b=effort_b,
+        steering_variant=steering_variant,
+        steering_position=steering_position,
     )
 
     # Step 3: capture side A then side B
@@ -4151,6 +4292,8 @@ def _run_compare_run(
                 subprocess_run=subprocess_run,
                 progress_out=progress_out,
                 effort=side_effort,
+                steering_variant=steering_variant,
+                steering_position=steering_position,
             )
         except CompareRunError as exc:
             print(f"[error] side {side_label} ({model}): {exc}", file=sys.stderr)

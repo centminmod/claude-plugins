@@ -5565,6 +5565,201 @@ def test_cli_compare_run_effort_three_values_refused(monkeypatch, tmp_path, caps
 
 
 # =============================================================================
+# Prompt-steering wrapper for --compare-run (foundation for benchmark-effort-prompt)
+# =============================================================================
+#
+# These tests pin the contract for the ``--compare-run-prompt-steering`` flag:
+#   * ``_apply_steering(body, variant, position)`` is the pure helper.
+#   * The wrapper threads through ``_run_compare_run`` →
+#     ``_run_compare_side`` → ``_claude_headless_call`` so the steered body
+#     lands in argv at position [2] (right after ``claude -p``).
+#   * The catalog at ``_PROMPT_STEERING_VARIANTS`` is sticky public surface —
+#     renaming a key would break user invocations and the
+#     ``benchmark-effort-prompt`` orchestrator's matrix builder.
+
+
+def test_apply_steering_no_variant_returns_body_unchanged():
+    body = "summarise this in 120 words"
+    assert smc._apply_steering(body, None, "prefix") is body
+    assert smc._apply_steering(body, "", "prefix") is body
+    assert smc._apply_steering(body, None, "append") is body
+
+
+def test_apply_steering_prefix_prepends_variant_text():
+    body = "ORIGINAL"
+    out = smc._apply_steering(body, "concise", "prefix")
+    assert out.endswith("ORIGINAL")
+    assert out.startswith(smc._PROMPT_STEERING_VARIANTS["concise"]["prefix"])
+    assert out.count("ORIGINAL") == 1
+    # Suffix must NOT be present in prefix-only mode.
+    assert smc._PROMPT_STEERING_VARIANTS["concise"]["suffix"] not in out
+
+
+def test_apply_steering_append_appends_variant_suffix():
+    body = "ORIGINAL"
+    out = smc._apply_steering(body, "ultrathink", "append")
+    assert out.startswith("ORIGINAL")
+    assert out.endswith(smc._PROMPT_STEERING_VARIANTS["ultrathink"]["suffix"])
+    # Prefix must NOT be present in append-only mode.
+    assert smc._PROMPT_STEERING_VARIANTS["ultrathink"]["prefix"] not in out
+
+
+def test_apply_steering_both_sandwiches_body():
+    body = "ORIGINAL"
+    out = smc._apply_steering(body, "think-step-by-step", "both")
+    pre = smc._PROMPT_STEERING_VARIANTS["think-step-by-step"]["prefix"]
+    suf = smc._PROMPT_STEERING_VARIANTS["think-step-by-step"]["suffix"]
+    assert out.startswith(pre)
+    assert out.endswith(suf)
+    assert "ORIGINAL" in out
+    assert out.index(pre) < out.index("ORIGINAL") < out.index(suf)
+
+
+def test_apply_steering_unknown_variant_raises_keyerror():
+    with pytest.raises(KeyError):
+        smc._apply_steering("body", "not-a-real-variant", "prefix")
+
+
+def test_apply_steering_unknown_position_raises_valueerror():
+    with pytest.raises(ValueError, match="unknown steering position"):
+        smc._apply_steering("body", "concise", "diagonal")
+
+
+def test_apply_steering_preserves_compare_suite_sentinel():
+    """The compare-suite sentinel must survive wrapping so pairing logic
+    in _extract_sentinels keeps matching steered turns to their prompts."""
+    body = (
+        "[session-metrics:compare-suite:v1:prompt=claudemd_summarise]\n\n"
+        "Summarise the doc."
+    )
+    for variant in ("concise", "think-step-by-step", "ultrathink", "no-tools"):
+        for position in ("prefix", "append", "both"):
+            out = smc._apply_steering(body, variant, position)
+            sentinels = smc._extract_sentinels(out)
+            assert sentinels == [(1, "claudemd_summarise")], (
+                f"sentinel lost under variant={variant} position={position}"
+            )
+
+
+def test_run_compare_side_threads_steering_into_subprocess_argv(tmp_path, monkeypatch):
+    """Wrapped body must reach the subprocess at argv[2]. Both sides see
+    the same wrapper because steering is symmetric."""
+    fake_run, calls = _make_fake_subprocess_run()
+    uuids = iter(["uuid-a", "uuid-b"])
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+
+    smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7",
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: next(uuids),
+        stdin=_FakeTty(False),
+        auto_resume=False,
+        steering_variant="concise",
+        steering_position="prefix",
+    )
+
+    assert len(calls) == 20
+    expected_prefix = smc._PROMPT_STEERING_VARIANTS["concise"]["prefix"]
+    for i, c in enumerate(calls):
+        prompt_arg = c[2]   # argv: ["claude", "-p", <prompt>, ...]
+        assert prompt_arg.startswith(expected_prefix), (
+            f"call {i} did not start with steering prefix"
+        )
+
+
+def test_run_compare_run_rejects_invalid_steering_variant(tmp_path, monkeypatch, capsys):
+    fake_run, _ = _make_fake_subprocess_run()
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    with pytest.raises(SystemExit) as exc:
+        smc._run_compare_run(
+            "claude-opus-4-6", "claude-opus-4-7",
+            scratch_dir=tmp_path,
+            assume_yes=True,
+            subprocess_run=fake_run,
+            uuid_factory=lambda: "uuid-x",
+            stdin=_FakeTty(False),
+            auto_resume=False,
+            steering_variant="bogus-variant",
+        )
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "not a known variant" in err
+    assert "concise" in err  # error message lists valid variants
+
+
+def test_run_compare_run_rejects_invalid_steering_position(tmp_path, monkeypatch, capsys):
+    fake_run, _ = _make_fake_subprocess_run()
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+    with pytest.raises(SystemExit) as exc:
+        smc._run_compare_run(
+            "claude-opus-4-6", "claude-opus-4-7",
+            scratch_dir=tmp_path,
+            assume_yes=True,
+            subprocess_run=fake_run,
+            uuid_factory=lambda: "uuid-x",
+            stdin=_FakeTty(False),
+            auto_resume=False,
+            steering_variant="concise",
+            steering_position="diagonal",
+        )
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "not valid" in err and "prefix" in err
+
+
+def test_run_compare_run_baseline_unchanged_when_steering_unset(tmp_path, monkeypatch):
+    """No-flag invocation must be byte-identical to pre-flag behaviour:
+    the prompt body reaches the subprocess with no wrapper at all."""
+    fake_run, calls = _make_fake_subprocess_run()
+    uuids = iter(["uuid-a", "uuid-b"])
+    monkeypatch.setattr(smc, "_run_compare", lambda *a, **kw: None)
+
+    smc._run_compare_run(
+        "claude-opus-4-6", "claude-opus-4-7",
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        subprocess_run=fake_run,
+        uuid_factory=lambda: next(uuids),
+        stdin=_FakeTty(False),
+        auto_resume=False,
+    )
+
+    for variant in smc._PROMPT_STEERING_VARIANTS.values():
+        for c in calls:
+            prompt_arg = c[2]
+            assert variant["prefix"] not in prompt_arg
+            assert variant["suffix"] not in prompt_arg
+
+
+def test_compare_run_confirmation_banner_shows_steering(tmp_path, capsys):
+    """Banner must print a Steering: line when the variant is set, and
+    stay silent otherwise so the no-flag baseline output is unchanged."""
+    smc._confirm_compare_run_or_exit(
+        "model-a", "model-b", 10,
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        stdin=_FakeTty(False),
+        steering_variant="ultrathink",
+        steering_position="both",
+    )
+    err = capsys.readouterr().err
+    assert "Steering: ultrathink (both)" in err
+    assert "applied symmetrically" in err
+
+    # Now without steering — the line must be absent.
+    smc._confirm_compare_run_or_exit(
+        "model-a", "model-b", 10,
+        scratch_dir=tmp_path,
+        assume_yes=True,
+        stdin=_FakeTty(False),
+    )
+    err2 = capsys.readouterr().err
+    assert "Steering:" not in err2
+
+
+# =============================================================================
 # Phase 8 — compare-run auto-extras (per-session dashboards + analysis.md)
 # =============================================================================
 #
@@ -7411,3 +7606,136 @@ def test_phase_b_cli_flags_parsed():
     args_default = sm._build_parser().parse_args([])
     assert args_default.no_subagent_attribution is False
     assert args_default.sort_prompts_by is None
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock + per-turn latency surfacing (Stage 1a — feeds the benchmark
+# orchestrators, which extract Wall clock from the markdown Summary table)
+# ---------------------------------------------------------------------------
+
+def _latency_entries(prompt_ts: str, asst_ts: str, msg_id: str = "msg_lat") -> list[dict]:
+    """Build a minimal user-prompt → assistant pair for latency tests."""
+    return [
+        {"type": "user", "timestamp": prompt_ts,
+         "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "timestamp": asst_ts,
+         "message": {"id": msg_id, "model": "claude-opus-4-7",
+                     "role": "assistant",
+                     "usage": {"input_tokens": 5, "output_tokens": 10,
+                               "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0},
+                     "content": [{"type": "text", "text": "hello"}]}},
+    ]
+
+
+def test_extract_turns_attaches_preceding_user_timestamp():
+    # The user-prompt timestamp immediately before each assistant turn must
+    # round-trip onto the turn entry as ``_preceding_user_timestamp`` so
+    # downstream layers can compute per-turn latency.
+    entries = _latency_entries("2026-04-26T10:00:00Z", "2026-04-26T10:00:05Z")
+    turns = sm._extract_turns(entries)
+    assert len(turns) == 1
+    assert turns[0]["_preceding_user_timestamp"] == "2026-04-26T10:00:00Z"
+
+
+def test_build_turn_record_computes_latency_seconds():
+    # Per-turn ``latency_seconds`` = assistant_ts - preceding_user_ts.
+    entries = _latency_entries("2026-04-26T10:00:00Z", "2026-04-26T10:00:05.250Z")
+    turns = sm._extract_turns(entries)
+    rec = sm._build_turn_record(1, turns[0], tz_offset_hours=0.0)
+    assert rec["latency_seconds"] == 5.25
+
+
+def test_build_turn_record_latency_none_when_predecessor_missing():
+    # A bare assistant entry (no preceding user) leaves latency_seconds None
+    # rather than fabricating a fake gap.
+    entries = [
+        {"type": "assistant", "timestamp": "2026-04-26T10:00:05Z",
+         "message": {"id": "msg_orphan", "model": "claude-opus-4-7",
+                     "role": "assistant",
+                     "usage": {"input_tokens": 5, "output_tokens": 10,
+                               "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0},
+                     "content": []}},
+    ]
+    turns = sm._extract_turns(entries)
+    rec = sm._build_turn_record(1, turns[0], tz_offset_hours=0.0)
+    assert rec["latency_seconds"] is None
+
+
+def test_md_summary_includes_wall_clock_and_mean_latency():
+    # End-to-end: a two-turn fixture session yields a session.md whose
+    # Summary table carries both Wall clock and Mean turn latency rows —
+    # the two anchors the benchmark orchestrators parse for headline
+    # latency. Uses ``_build_report`` directly to avoid touching disk.
+    entries = [
+        {"type": "user", "timestamp": "2026-04-26T10:00:00Z",
+         "message": {"role": "user", "content": "first"}},
+        {"type": "assistant", "timestamp": "2026-04-26T10:00:04Z",
+         "message": {"id": "msg_a", "model": "claude-opus-4-7",
+                     "role": "assistant",
+                     "usage": {"input_tokens": 5, "output_tokens": 10,
+                               "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0},
+                     "content": [{"type": "text", "text": "ok"}]}},
+        {"type": "user", "timestamp": "2026-04-26T10:00:10Z",
+         "message": {"role": "user", "content": "second"}},
+        {"type": "assistant", "timestamp": "2026-04-26T10:00:18Z",
+         "message": {"id": "msg_b", "model": "claude-opus-4-7",
+                     "role": "assistant",
+                     "usage": {"input_tokens": 5, "output_tokens": 10,
+                               "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0},
+                     "content": [{"type": "text", "text": "ok"}]}},
+    ]
+    turns = sm._extract_turns(entries)
+    user_ts = sm._extract_user_timestamps(entries)
+    report = sm._build_report("session", "test-slug",
+                                [("session-uuid", turns, user_ts)])
+    md = sm.render_md(report)
+    assert "| Wall clock |" in md
+    # 10:00:00 → 10:00:18 = 18s. Formatted as "18s".
+    assert "| Wall clock | 18s |" in md
+    # Two turns with latency 4s and 8s → mean 6.00s.
+    assert "| Mean turn latency | 6.00s (2 turns) |" in md
+    # Per-session record must carry the new wall_clock_seconds field.
+    assert report["sessions"][0]["wall_clock_seconds"] == 18
+
+
+def test_extract_turns_does_not_inherit_prior_user_timestamp_when_blank():
+    # Regression: a user entry whose timestamp is empty/missing must NOT
+    # inherit the previous user's timestamp — otherwise the next assistant
+    # turn will compute latency_seconds against an unrelated earlier
+    # predecessor instead of None. Pre-fix code at session-metrics.py:421
+    # used ``... or last_user_timestamp`` which silently fabricated a gap.
+    entries = [
+        {"type": "user", "timestamp": "2026-04-26T10:00:00Z",
+         "message": {"role": "user", "content": "first"}},
+        {"type": "assistant", "timestamp": "2026-04-26T10:00:04Z",
+         "message": {"id": "msg_a", "model": "claude-opus-4-7",
+                     "role": "assistant",
+                     "usage": {"input_tokens": 5, "output_tokens": 10,
+                               "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0},
+                     "content": [{"type": "text", "text": "ok"}]}},
+        # Second user entry has no timestamp; downstream assistant must
+        # treat this as "no usable predecessor" rather than inheriting
+        # the 10:00:00Z from the first user.
+        {"type": "user",
+         "message": {"role": "user", "content": "second"}},
+        {"type": "assistant", "timestamp": "2026-04-26T10:00:30Z",
+         "message": {"id": "msg_b", "model": "claude-opus-4-7",
+                     "role": "assistant",
+                     "usage": {"input_tokens": 5, "output_tokens": 10,
+                               "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0},
+                     "content": [{"type": "text", "text": "ok"}]}},
+    ]
+    turns = sm._extract_turns(entries)
+    assert len(turns) == 2
+    # First turn has the legitimate 10:00:00Z predecessor.
+    assert turns[0]["_preceding_user_timestamp"] == "2026-04-26T10:00:00Z"
+    # Second turn must not inherit it.
+    assert turns[1]["_preceding_user_timestamp"] == ""
+    rec_b = sm._build_turn_record(2, turns[1], tz_offset_hours=0.0)
+    assert rec_b["latency_seconds"] is None

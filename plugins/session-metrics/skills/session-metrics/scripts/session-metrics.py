@@ -397,6 +397,12 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
     last_entry: dict[str, dict] = {}
     merged_content: dict[str, list] = {}
     preceding_user: dict[str, object] = {}
+    # Per-turn predecessor timestamp — the ISO-8601 timestamp of the user or
+    # tool_result entry immediately before this assistant turn's first
+    # streaming chunk. Drives ``latency_seconds`` (the model's wall-clock
+    # response time for this single turn). First-occurrence wins, mirroring
+    # ``preceding_user`` above.
+    preceding_user_ts: dict[str, str] = {}
     # Phase-B: links from a user entry's ``toolUseResult.agentId`` to the
     # ``tool_use_id`` of every ``tool_result`` block in its content. Indexed
     # by the *next* assistant ``msg_id`` so subagent attribution can map
@@ -405,12 +411,18 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
     resume_marker_msg_ids: set[str] = set()
     recent_user_contents: list[object] = []
     last_user_content = None
+    last_user_timestamp: str = ""
     last_user_agent_links: list[tuple[str, str]] = []
     for entry in entries:
         t = entry.get("type")
         if t == "user":
             msg = entry.get("message") or {}
             last_user_content = msg.get("content")
+            # Use the entry's own timestamp; do not fall back to the previous
+            # user's. Empty/missing → blank, so downstream latency math
+            # records ``None`` rather than fabricating a gap against an
+            # earlier (unrelated) user turn.
+            last_user_timestamp = entry.get("timestamp", "") or ""
             recent_user_contents.append(last_user_content)
             if len(recent_user_contents) > _RESUME_LOOKBACK_USER_ENTRIES:
                 recent_user_contents.pop(0)
@@ -458,6 +470,7 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
         # the first streaming chunk.
         if msg_id not in preceding_user:
             preceding_user[msg_id] = last_user_content
+            preceding_user_ts[msg_id] = last_user_timestamp
             preceding_user_agent_links[msg_id] = list(last_user_agent_links)
         content = msg.get("content")
         if isinstance(content, list):
@@ -470,6 +483,7 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
             **entry,
             "message": merged_msg,
             "_preceding_user_content": preceding_user.get(msg_id),
+            "_preceding_user_timestamp": preceding_user_ts.get(msg_id, ""),
             "_preceding_user_agent_links": preceding_user_agent_links.get(msg_id, []),
             "_is_resume_marker": msg_id in resume_marker_msg_ids,
         })
@@ -1483,10 +1497,34 @@ def _build_turn_record(global_index: int, entry: dict,
                 agent_links.append((pair[0], pair[1]))
     if u.get("speed") == "fast":
         _FAST_MODE_TURNS[0] += 1
+    # Per-turn latency: wall-clock seconds from the immediately preceding
+    # user / tool_result entry to this assistant turn's settled timestamp.
+    # ``_preceding_user_timestamp`` is set in ``_extract_turns`` (first
+    # streaming chunk wins). For headless ``claude -p`` benchmark runs this
+    # is the model's response time for the single turn; for tool-using
+    # turns it represents the model's time after the tool result landed.
+    # ``None`` when either timestamp is missing or unparseable, or when the
+    # gap is non-positive (clock skew on truncated files, synthetic resume
+    # markers — the JSONL writer guarantees monotone timestamps within one
+    # session in practice).
+    _prev_iso = entry.get("_preceding_user_timestamp", "") or ""
+    _this_iso = entry.get("timestamp", "") or ""
+    latency_seconds: float | None = None
+    if _prev_iso and _this_iso:
+        _prev_dt = _parse_iso_dt(_prev_iso)
+        _this_dt = _parse_iso_dt(_this_iso)
+        if _prev_dt and _this_dt:
+            try:
+                _gap = (_this_dt - _prev_dt).total_seconds()
+                if _gap >= 0:
+                    latency_seconds = round(_gap, 3)
+            except (ValueError, AttributeError, TypeError, OSError):
+                latency_seconds = None
     return {
         "index":                  global_index,
         "timestamp":              entry.get("timestamp", ""),
         "timestamp_fmt":          _fmt_ts(entry.get("timestamp", ""), tz_offset_hours),
+        "latency_seconds":        latency_seconds,
         "model":                  model,
         "input_tokens":           inp,
         "output_tokens":          out,
@@ -2628,12 +2666,25 @@ def _build_report(
         first_epoch = _parse_iso_epoch(raw_turns[0].get("timestamp", "")) if raw_turns else 0
         last_epoch  = _parse_iso_epoch(raw_turns[-1].get("timestamp", "")) if raw_turns else 0
         duration_seconds = (last_epoch - first_epoch) if (first_epoch and last_epoch and last_epoch > first_epoch) else 0
+        # Wall-clock seconds (first user prompt → last assistant turn). Picks
+        # up the initial pre-first-response wait that ``duration_seconds``
+        # excludes — relevant for benchmark / headless ``claude -p`` runs
+        # where prompt #1 lands at session start. Falls back to
+        # ``duration_seconds`` when ``user_ts`` is empty (e.g. resumed
+        # session whose first user entry was filtered out).
+        first_user_epoch = user_ts[0] if user_ts else 0
+        wall_clock_seconds = (
+            (last_epoch - first_user_epoch)
+            if (first_user_epoch and last_epoch and last_epoch > first_user_epoch)
+            else duration_seconds
+        )
         session_dict = {
-            "session_id":       session_id,
-            "first_ts":         _fmt_ts(raw_turns[0].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
-            "last_ts":          _fmt_ts(raw_turns[-1].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
-            "duration_seconds": duration_seconds,
-            "turns":            turn_records,
+            "session_id":         session_id,
+            "first_ts":           _fmt_ts(raw_turns[0].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
+            "last_ts":            _fmt_ts(raw_turns[-1].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
+            "duration_seconds":   duration_seconds,
+            "wall_clock_seconds": wall_clock_seconds,
+            "turns":              turn_records,
             "subtotal":         _totals_from_turns(turn_records),
             "models":           _model_counts(turn_records),
             "time_of_day":      _build_time_of_day(user_ts, offset_hours=tz_offset_hours),
@@ -3400,6 +3451,20 @@ def render_md(report: dict) -> str:
     p(f"|--------|-------|")
     p(f"| Sessions | {len(report['sessions'])} |")
     p(f"| Total turns | {totals['turns']:,} |")
+    # Wall clock + mean turn latency. ``Wall clock`` is the sum of per-session
+    # first→last assistant-turn intervals; for benchmark / headless ``claude
+    # -p`` runs this approximates the orchestrator's perceived wall-clock.
+    # ``Mean turn latency`` is the average ``latency_seconds`` across every
+    # assistant turn that had a parseable predecessor — drops resume markers
+    # and any turn whose predecessor timestamp couldn't be parsed.
+    _wall_total = sum(int(s.get("wall_clock_seconds", 0) or s.get("duration_seconds", 0)) for s in report["sessions"])
+    _turn_lats = [t["latency_seconds"] for s in report["sessions"]
+                   for t in s["turns"] if t.get("latency_seconds") is not None]
+    if _wall_total > 0:
+        p(f"| Wall clock | {_fmt_duration(_wall_total)} |")
+    if _turn_lats:
+        _mean_lat = sum(_turn_lats) / len(_turn_lats)
+        p(f"| Mean turn latency | {_mean_lat:.2f}s ({len(_turn_lats)} turns) |")
     p(f"| Total cost | ${totals['cost']:.4f} |")
     p(f"| Cache savings | ${totals['cache_savings']:.4f} |")
     p(f"| Cache hit ratio | {totals['cache_hit_pct']:.1f}% |")
@@ -8667,6 +8732,28 @@ def _build_parser() -> argparse.ArgumentParser:
                         "text-only stdout path stays file-free regardless). "
                         "Use this flag to restore the pre-v1.7.0 minimal "
                         "single-artefact output.")
+    p.add_argument("--compare-run-prompt-steering", metavar="VARIANT",
+                   default=None,
+                   help="Wrap each of the 10 canonical prompts with prompt-"
+                        "steering text before feeding them to 'claude -p'. "
+                        "VARIANT must be one of: concise, think-step-by-step, "
+                        "ultrathink, no-tools. Applied symmetrically to both "
+                        "sides so the A/B comparison stays clean. Default: "
+                        "unset (no wrapper, identical to baseline behaviour). "
+                        "IFEval pass rates may differ from baseline under "
+                        "steering by design — predicate breakage is the "
+                        "measurement, not a regression. For multi-variant "
+                        "sweeps with auto-rendered comparison articles use "
+                        "the benchmark-effort-prompt skill instead.")
+    p.add_argument("--compare-run-prompt-steering-position",
+                   metavar="POSITION", default="prefix",
+                   choices=["prefix", "append", "both"],
+                   help="Where to inject the steering text relative to the "
+                        "prompt body when --compare-run-prompt-steering is "
+                        "set. 'prefix' prepends; 'append' appends; 'both' "
+                        "sandwiches the prompt between the steering prefix "
+                        "and suffix. Default: prefix. Ignored when "
+                        "--compare-run-prompt-steering is absent.")
     return p
 
 
@@ -8877,6 +8964,8 @@ def main() -> None:
             compare_run_extras=not args.no_compare_run_extras,
             effort_a=effort_a,
             effort_b=effort_b,
+            steering_variant=args.compare_run_prompt_steering,
+            steering_position=args.compare_run_prompt_steering_position,
         )
         return
 

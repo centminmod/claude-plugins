@@ -316,6 +316,21 @@ saved to `~/.session-metrics/prompts/` and runs automatically on every subsequen
 count before spending on inference. Use `--compare-remove-prompt <name>` to remove.
 Full guide: [`references/custom-prompts.md`](references/custom-prompts.md).
 
+**Prompt steering.** `--compare-run-prompt-steering <variant>` wraps every
+prompt in the suite with a steering instruction before feeding it to
+`claude -p`. The four built-in variants are `concise`,
+`think-step-by-step`, `ultrathink`, and `no-tools`. The wrapper is
+applied symmetrically to both sides so the A/B stays clean — what shifts
+is the model's behaviour under the same instruction, surfaced as token /
+cost / thinking / tool-call deltas. Use
+`--compare-run-prompt-steering-position {prefix,append,both}` (default
+`prefix`) to control where the steering text lands relative to the body.
+IFEval pass rates may differ from the unsteered baseline by design —
+predicate breakage (e.g. "be concise" violating the 50-word stacked
+constraint) is the *measurement*, not a regression. For multi-variant
+sweeps with auto-rendered comparison articles + cross-variant summary,
+use the `benchmark-effort-prompt` skill instead.
+
 **Before proposing any compare-mode command, read
 [`references/model-compare.md`](references/model-compare.md).** That
 doc has the full flag table, four workflow recipes, 4-way Opus combo
