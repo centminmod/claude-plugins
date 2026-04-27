@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or usage help
+    url: https://github.com/centminmod/claude-plugins#readme
+    about: "How do I install / use a plugin? See the README — install instructions, plugin table, and links to per-plugin docs live there."
+  - name: Report a security vulnerability
+    url: https://github.com/centminmod/claude-plugins/security/advisories/new
+    about: "Use GitHub Private Vulnerability Reporting for any security issue. Do NOT open a public issue."
+  - name: Per-plugin documentation
+    url: https://github.com/centminmod/claude-plugins/tree/master/plugins
+    about: "Each plugin's own README has its flags, examples, and changelog."

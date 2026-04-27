@@ -1,0 +1,89 @@
+name: Feature request
+description: Suggest an enhancement to an existing plugin in this marketplace.
+title: "[feature] <plugin>: <one-line summary>"
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to request a change to an existing plugin. To propose a brand-new plugin for the marketplace, use the *Plugin proposal* template instead.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checklist
+      options:
+        - label: I searched existing open and closed issues for duplicates.
+          required: true
+        - label: I am on the latest plugin version.
+          required: true
+
+  - type: dropdown
+    id: plugin
+    attributes:
+      label: Plugin
+      options:
+        - session-metrics
+    validations:
+      required: true
+
+  - type: input
+    id: plugin_version
+    attributes:
+      label: Plugin version
+      placeholder: "e.g. 1.24.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What are you trying to accomplish? Why does the current behaviour block it? Please describe the underlying need, not just the desired feature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Concrete behaviour, flag, output, or interface you'd like to see.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you tried or considered, and why they fall short. ("None" is rarely the right answer — please think about workarounds first.)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: audience
+    attributes:
+      label: Who benefits
+      options:
+        - "Just me / my workflow"
+        - "My team or a few similar users"
+        - "Broad audience of plugin users"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: pr
+    attributes:
+      label: Willing to contribute a PR?
+      options:
+        - "Yes"
+        - "Maybe — with guidance"
+        - "No"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+    validations:
+      required: false

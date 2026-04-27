@@ -1,0 +1,139 @@
+name: Bug report
+description: Report a bug in a plugin from this marketplace.
+title: "[bug] <plugin>: <one-line summary>"
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please complete every section — issues missing required context will be closed without triage.
+
+        **Not a bug?**
+        - "How do I…" questions → see the [README](https://github.com/centminmod/claude-plugins#readme).
+        - Security vulnerabilities → use [Private Vulnerability Reporting](https://github.com/centminmod/claude-plugins/security/advisories/new), not this form.
+        - Feature requests → use the *Feature request* template instead.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checklist
+      description: All boxes must be ticked.
+      options:
+        - label: I searched existing open and closed issues for duplicates.
+          required: true
+        - label: I am on the latest plugin version (`/plugin update <name>@centminmod`, or re-`rsync` if installed manually from `my-claude-code-setup`).
+          required: true
+        - label: I have removed any secrets, API keys, PII, file paths, repo names, or proprietary code from logs/transcripts pasted below.
+          required: true
+        - label: This is not a security vulnerability. (For vulns, use GitHub's Private Vulnerability Reporting — see SECURITY.md.)
+          required: true
+
+  - type: dropdown
+    id: plugin
+    attributes:
+      label: Plugin
+      description: Which plugin is affected?
+      options:
+        - session-metrics
+    validations:
+      required: true
+
+  - type: input
+    id: plugin_version
+    attributes:
+      label: Plugin version
+      description: Shown by `/plugin` or in `plugin.json`.
+      placeholder: "e.g. 1.24.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Install method
+      options:
+        - "/plugin install <name>@centminmod (marketplace)"
+        - "Direct copy from my-claude-code-setup"
+        - "Cloned dev source (session-metrics repo)"
+        - "Other"
+    validations:
+      required: true
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One-line description of the bug.
+      placeholder: "e.g. session-metrics --html crashes on sessions with zero turns"
+    validations:
+      required: true
+
+  - type: input
+    id: cli_version
+    attributes:
+      label: Claude Code CLI version
+      description: Output of `claude --version`.
+      placeholder: "e.g. 1.0.42 (Claude Code)"
+    validations:
+      required: true
+
+  - type: input
+    id: os_shell
+    attributes:
+      label: OS and shell
+      placeholder: "e.g. macOS 14.5 / zsh, Ubuntu 24.04 / bash"
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: What you ran
+      description: Exact command, slash command, or skill trigger phrase.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: Actual behaviour, including any error messages.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Numbered steps starting from a clean state. If you cannot reliably reproduce, say so.
+      placeholder: |
+        1. Install the plugin via …
+        2. Run …
+        3. Observe …
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / output
+      description: |
+        Paste a **minimal excerpt**, not full transcripts. JSONL logs contain your prompts, file paths, repo names, and code — redact aggressively. If the only useful repro is a full transcript, attach it via a private vulnerability report instead.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+    validations:
+      required: false

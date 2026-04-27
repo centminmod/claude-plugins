@@ -1,0 +1,115 @@
+name: Plugin proposal
+description: Propose a new plugin to add to this marketplace.
+title: "[plugin-proposal] <plugin name>"
+labels: ["plugin-proposal", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This marketplace is curated by a single maintainer. Proposals are evaluated on license compatibility, redistribution rights, maintenance commitment, and fit. Please answer every question — vague proposals will be closed.
+
+        If your plugin already works as a standalone Claude Code plugin, you can publish your own marketplace and host it yourself. This form is specifically for inclusion in `centminmod/claude-plugins`.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checklist
+      options:
+        - label: The proposed plugin already exists as working, installable code (not just an idea).
+          required: true
+        - label: I have read the existing plugins in this marketplace and confirmed there is no overlap.
+          required: true
+
+  - type: input
+    id: name
+    attributes:
+      label: Proposed plugin name
+      description: Short slug, lowercase, hyphenated. Will become the `@centminmod` install name and is sticky once published.
+      placeholder: "e.g. ai-image-creator"
+    validations:
+      required: true
+
+  - type: input
+    id: source_url
+    attributes:
+      label: Source repository URL
+      description: Public URL to the plugin source.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: license
+    attributes:
+      label: License
+      description: Anything non-permissive triggers a manual redistribution review.
+      options:
+        - "MIT"
+        - "Apache-2.0"
+        - "BSD (2-clause or 3-clause)"
+        - "ISC"
+        - "GPL / LGPL / AGPL"
+        - "Non-commercial (e.g. Highcharts NC)"
+        - "Proprietary / closed source"
+        - "Other"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: redistribution
+    attributes:
+      label: Redistribution rights
+      options:
+        - label: I confirm the license permits redistribution through this marketplace, and any third-party assets bundled with the plugin (fonts, libraries, models, vendored code) are either MIT-compatible or carry explicit redistribution clauses that allow this use.
+          required: true
+
+  - type: input
+    id: maintainer
+    attributes:
+      label: Maintainer
+      description: Who maintains it long-term, and what is their commitment to responding to issues filed here?
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What it does
+      description: One paragraph describing the plugin's purpose, primary commands or skills, and intended users.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why_here
+    attributes:
+      label: Why this marketplace
+      description: Why bundle the plugin here rather than publishing your own marketplace? What does it add that existing plugins don't?
+    validations:
+      required: true
+
+  - type: input
+    id: cadence
+    attributes:
+      label: Update cadence
+      description: How often do you expect version bumps, and who pushes them?
+      placeholder: "e.g. monthly bugfix releases; pushed by upstream maintainer via PR"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: telemetry
+    attributes:
+      label: Telemetry / network behaviour
+      description: Existing marketplace plugins are zero-network by default. New plugins should match.
+      options:
+        - "Zero network by default (no outbound calls without explicit user action)"
+        - "Optional network (off by default, opt-in via flag)"
+        - "Required network (calls external services unconditionally)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+    validations:
+      required: false
