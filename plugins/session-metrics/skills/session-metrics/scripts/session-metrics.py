@@ -413,11 +413,36 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
     last_user_content = None
     last_user_timestamp: str = ""
     last_user_agent_links: list[tuple[str, str]] = []
+    # Tracks slash commands seen in recent user entries so that skill-dispatch
+    # flows (which inject two user entries: the raw slash command entry then the
+    # SKILL.md payload) don't lose the slash command when the second entry
+    # becomes the immediate predecessor of the assistant turn.
+    last_user_slash_cmd: str = ""
+    preceding_user_slash_cmd: dict[str, str] = {}
+    # Suppresses slash-command tracking while inside a local-command group.
+    # Claude Code splits "/model"/"/clear" invocations into multiple consecutive
+    # user entries (caveat, command-name, stdout); only the caveat entry carries
+    # the local-command-caveat marker. We activate this flag on the caveat entry
+    # and clear it when an assistant first-occurrence fires, so the command-name
+    # and stdout entries are also suppressed without any per-entry string search.
+    _local_cmd_group_active: bool = False
     for entry in entries:
         t = entry.get("type")
         if t == "user":
             msg = entry.get("message") or {}
             last_user_content = msg.get("content")
+            _raw_str = last_user_content if isinstance(last_user_content, str) else ""
+            if "local-command-caveat" in _raw_str:
+                _local_cmd_group_active = True
+            elif isinstance(last_user_content, list):
+                for _blk in last_user_content:
+                    if isinstance(_blk, dict) and "local-command-caveat" in (_blk.get("text") or ""):
+                        _local_cmd_group_active = True
+                        break
+            if not _local_cmd_group_active:
+                candidate_slash = _extract_slash_command("", last_user_content)
+                if candidate_slash:
+                    last_user_slash_cmd = candidate_slash
             # Use the entry's own timestamp; do not fall back to the previous
             # user's. Empty/missing → blank, so downstream latency math
             # records ``None`` rather than fabricating a gap against an
@@ -472,6 +497,9 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
             preceding_user[msg_id] = last_user_content
             preceding_user_ts[msg_id] = last_user_timestamp
             preceding_user_agent_links[msg_id] = list(last_user_agent_links)
+            preceding_user_slash_cmd[msg_id] = last_user_slash_cmd
+            last_user_slash_cmd = ""
+            _local_cmd_group_active = False
         content = msg.get("content")
         if isinstance(content, list):
             merged_content.setdefault(msg_id, []).extend(content)
@@ -483,6 +511,7 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
             **entry,
             "message": merged_msg,
             "_preceding_user_content": preceding_user.get(msg_id),
+            "_preceding_user_slash_cmd": preceding_user_slash_cmd.get(msg_id, ""),
             "_preceding_user_timestamp": preceding_user_ts.get(msg_id, ""),
             "_preceding_user_agent_links": preceding_user_agent_links.get(msg_id, []),
             "_is_resume_marker": msg_id in resume_marker_msg_ids,
@@ -1443,7 +1472,8 @@ def _build_turn_record(global_index: int, entry: dict,
     # All three feed the HTML detail drawer + Prompts section. Resume-marker
     # turns keep empty strings here — the drawer excludes them anyway.
     prompt_text = _extract_user_prompt_text(user_raw)
-    slash_cmd   = _extract_slash_command(prompt_text, user_raw)
+    slash_cmd   = (_extract_slash_command(prompt_text, user_raw)
+                   or entry.get("_preceding_user_slash_cmd", ""))
     asst_text   = _extract_assistant_text(assist_content)
     tool_detail: list[dict] = []
     # Phase-A additions (v1.6.0): cross-turn signals for the skill/subagent-type
@@ -5304,6 +5334,7 @@ tr:hover td{background:var(--hover,transparent)}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 td.ts{white-space:nowrap;opacity:.75}
 td.model{font-size:11px}
+.skill-tag{display:inline-block;font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(99,102,241,.2);color:#a5b4fc;margin-left:5px;white-space:nowrap;vertical-align:middle;letter-spacing:.02em}
 td.cost{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .bar{display:inline-block;height:7px;border-radius:2px;margin-right:6px;vertical-align:middle}
 tr.session-header{cursor:pointer}
@@ -6273,12 +6304,19 @@ def render_html(report: dict, variant: str = "single",
         # project-mode reports with multiple sessions don't collide on the
         # per-session turn index.
         turn_key = f'{session_id[:8]}-{t["index"]}'
+        _si = t.get("skill_invocations") or []
+        _sc = t.get("slash_command") or ""
+        _skill_label = _si[0] if _si else (_sc.lstrip("/") if _sc else "")
+        _skill_badge = (
+            f' <span class="skill-tag" title="skill: {html_mod.escape(_skill_label)}">'
+            f'{html_mod.escape(_skill_label)}</span>'
+        ) if _skill_label else ""
         return (
             f'<tr id="turn-{turn_key}" class="turn-row" data-session="{session_id[:8]}"'
             f' data-turn-id="{turn_key}" role="button" tabindex="0">'
             f'<td class="num">{t["index"]}</td>'
             f'<td class="ts">{t["timestamp_fmt"]}</td>'
-            f'<td class="model">{html_mod.escape(t["model"])}</td>'
+            f'<td class="model">{html_mod.escape(t["model"])}{_skill_badge}</td>'
             f'{mode_td}'
             f'<td class="num">{t["input_tokens"]:,}</td>'
             f'<td class="num">{t["output_tokens"]:,}</td>'
@@ -6634,6 +6672,7 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                     "cr":    t.get("cache_read_tokens", 0),
                     "cw":    t.get("cache_write_tokens", 0),
                     "cwt":   t.get("cache_write_ttl", ""),
+                    "si":    t.get("skill_invocations") or [],
                     "asnip": t.get("assistant_snippet", ""),
                     "atxt":  t.get("assistant_text", ""),
                 }
@@ -6702,6 +6741,8 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
         <dt>Model</dt><dd><code data-slot="model"></code></dd>
         <dt data-slot="slash-wrap-dt" hidden>Slash</dt>
         <dd data-slot="slash-wrap" hidden><code data-slot="slash"></code></dd>
+        <dt data-slot="skill-wrap-dt" hidden>Skill</dt>
+        <dd data-slot="skill-wrap" hidden><code data-slot="skill-name"></code></dd>
       </dl>
     </div>
     <div class="drawer-sec">
@@ -6859,6 +6900,17 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
     } else {
       if (slashWrap) slashWrap.hidden = true;
       if (slashWrapDt) slashWrapDt.hidden = true;
+    }
+    var skillWrap = sel('skill-wrap');
+    var skillWrapDt = sel('skill-wrap-dt');
+    var skillNameEl = sel('skill-name');
+    if (t.si && t.si.length) {
+      if (skillWrap) skillWrap.hidden = false;
+      if (skillWrapDt) skillWrapDt.hidden = false;
+      if (skillNameEl) skillNameEl.textContent = t.si.join(', ');
+    } else {
+      if (skillWrap) skillWrap.hidden = true;
+      if (skillWrapDt) skillWrapDt.hidden = true;
     }
 
     var snip = t.ps || '(no prompt captured)';
