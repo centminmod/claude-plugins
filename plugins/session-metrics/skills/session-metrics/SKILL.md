@@ -58,7 +58,7 @@ The following values are injected by Claude Code when this skill loads — Claud
 ```!
 printf "uv:    "; command -v uv >/dev/null 2>&1 && uv --version || echo "NOT FOUND — install: pip install uv"
 printf "script: "; test -f "${CLAUDE_SKILL_DIR}/scripts/session-metrics.py" && echo "ok" || echo "MISSING"
-printf "jsonl:  "; f="$HOME/.claude/projects/$(echo "$PWD" | sed 's|/|-|g; s|^-||')/${CLAUDE_SESSION_ID}.jsonl"; [ -f "$f" ] && echo "$f" || echo "not found for this session/project"
+printf "jsonl:  "; f="$HOME/.claude/projects/$(echo "$PWD" | sed 's|/|-|g')/${CLAUDE_SESSION_ID}.jsonl"; [ -f "$f" ] && echo "$f" || echo "not found for this session/project"
 ```
 
 ## Quick usage
