@@ -5,6 +5,30 @@ Versions match the `plugin.json` / `marketplace.json` version field.
 
 ---
 
+## v1.25.0 — 2026-04-28
+
+**Advisor turn support — cost correction + surface**
+
+The Claude Code Advisor (`advisor()` tool) runs a second model against the full conversation
+transcript. Its tokens were previously hidden in `usage.iterations[]` and not counted, causing
+advisor turns to be silently under-priced by up to 6.6×.
+
+- **Cost correction**: `_cost()` now reads `usage.iterations[type=="advisor_message"]` and
+  bills advisor tokens at the advisor model's list rates. The corrected `cost_usd` propagates
+  to all session/project/instance aggregates.
+- **New per-turn fields**: `advisor_calls`, `advisor_cost_usd`, `advisor_model`,
+  `advisor_input_tokens`, `advisor_output_tokens`.
+- **Session field**: `advisor_configured_model` from the top-level `advisorModel` JSONL field.
+- **Content classification**: `server_tool_use` → letter `v`; `advisor_tool_result` → letter `R`.
+  `"advisor"` appears in tool names and the drawer tools list.
+- **Dashboard card**: "Advisor calls" (amber badge, auto-hidden when unused).
+- **Session table**: amber annotation/badge in `--project-cost` HTML and text output.
+- **CLI footer**: `Advisor calls : N call(s)  +$X.XXXX` when advisor was used.
+- **Per-turn drawer**: cost section shows Primary / Advisor / Cost breakdown; TOKENS section
+  shows Advisor input / Advisor output rows. Both hidden on non-advisor turns.
+- **Schema docs** (`references/jsonl-schema.md`): four new fields documented.
+- Graceful degradation — sessions without advisor activity produce identical output.
+
 ## v1.24.0 — 2026-04-28
 
 **Fix: `file_reread` classification accuracy**
