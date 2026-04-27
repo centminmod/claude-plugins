@@ -3547,7 +3547,7 @@ def _text_legend(tz_label: str, show_mode: bool, show_ttl: bool,
         rows.append((
             "Content",
             "content blocks per turn: T thinking, u tool_use, x text, "
-            "r tool_result, i image (zeros omitted)",
+            "r tool_result, i image, v server_tool_use, R advisor_tool_result (zeros omitted)",
         ))
     w = max(len(k) for k, _ in rows)
     lines = ["Columns:"] + [f"  {k:<{w}}  {v}" for k, v in rows]
@@ -4220,7 +4220,8 @@ def render_md(report: dict) -> str:
     p("- **Cost $** — estimated USD for this turn")
     if has_content:
         p("- **Content** — per-turn content blocks: `T` thinking, `u` tool_use, "
-          "`x` text, `r` tool_result, `i` image (zero counts omitted)")
+          "`x` text, `r` tool_result, `i` image, `v` server_tool_use, "
+          "`R` advisor_tool_result (zero counts omitted)")
     p()
 
     for i, s in enumerate(report["sessions"], 1):
@@ -7368,7 +7369,8 @@ def render_html(report: dict, variant: str = "single",
                 '<b>Content</b> per-turn content blocks: '
                 '<code>T</code> thinking, <code>u</code> tool_use, '
                 '<code>x</code> text, <code>r</code> tool_result, '
-                '<code>i</code> image (zero counts omitted) · '
+                '<code>i</code> image, <code>v</code> server_tool_use, '
+                '<code>R</code> advisor_tool_result (zero counts omitted) · '
             )
         legend_parts.extend([
             '<b>Total</b> sum of the four billable token buckets · ',
@@ -7621,13 +7623,17 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                     "sc":    t.get("slash_command", ""),
                     "tl":    t.get("tool_use_detail", []) or [],
                     "cb":    t.get("content_blocks") or {},
-                    "cost":  t.get("cost_usd", 0.0),
-                    "nc":    t.get("no_cache_cost_usd", 0.0),
-                    "inp":   t.get("input_tokens", 0),
-                    "out":   t.get("output_tokens", 0),
-                    "cr":    t.get("cache_read_tokens", 0),
-                    "cw":    t.get("cache_write_tokens", 0),
-                    "cwt":   t.get("cache_write_ttl", ""),
+                    "cost":     t.get("cost_usd", 0.0),
+                    "nc":       t.get("no_cache_cost_usd", 0.0),
+                    "inp":      t.get("input_tokens", 0),
+                    "out":      t.get("output_tokens", 0),
+                    "cr":       t.get("cache_read_tokens", 0),
+                    "cw":       t.get("cache_write_tokens", 0),
+                    "cwt":      t.get("cache_write_ttl", ""),
+                    "adv_cost": t.get("advisor_cost_usd", 0.0),
+                    "adv_mdl":  t.get("advisor_model", "") or "",
+                    "adv_inp":  t.get("advisor_input_tokens", 0),
+                    "adv_out":  t.get("advisor_output_tokens", 0),
                     "si":    t.get("skill_invocations") or [],
                     "asnip": t.get("assistant_snippet", ""),
                     "atxt":  t.get("assistant_text", ""),
@@ -7740,6 +7746,10 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
     <div class="drawer-sec">
       <h4>Cost</h4>
       <dl class="drawer-kv">
+        <dt data-slot="cost-primary-dt" hidden>Primary</dt>
+        <dd data-slot="cost-primary" hidden></dd>
+        <dt data-slot="cost-advisor-dt" hidden>Advisor (<span data-slot="cost-advisor-model"></span>)</dt>
+        <dd data-slot="cost-advisor" hidden></dd>
         <dt>Cost</dt><dd data-slot="cost"></dd>
       </dl>
       <p data-slot="cache-savings" class="drawer-savings" hidden></p>
@@ -7931,7 +7941,8 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
     var dl = sel('content-dl'); dl.innerHTML = '';
     var cb = t.cb || {};
     var labels = {thinking:'Thinking', tool_use:'Tool use', text:'Text',
-                  tool_result:'Tool result', image:'Image'};
+                  tool_result:'Tool result', image:'Image',
+                  server_tool_use:'Server tool use', advisor_tool_result:'Advisor result'};
     Object.keys(labels).forEach(function (k) {
       var v = cb[k] || 0; if (!v) return;
       var dt = document.createElement('dt'); dt.textContent = labels[k];
@@ -7950,6 +7961,23 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
     var cw = formatNum(t.cw);
     if (t.cwt) cw += '  (' + t.cwt + ')';
     setText('tok-cache-write', cw);
+    var advCost = t.adv_cost || 0;
+    var primaryDt = sel('cost-primary-dt'), primaryDd = sel('cost-primary');
+    var advDt = sel('cost-advisor-dt'), advDd = sel('cost-advisor');
+    var advMdlEl = sel('cost-advisor-model');
+    if (advCost > 0) {
+      var primaryCost = (t.cost || 0) - advCost;
+      if (primaryDt) primaryDt.hidden = false;
+      if (primaryDd) { primaryDd.hidden = false; primaryDd.textContent = '$' + primaryCost.toFixed(4); }
+      if (advDt) advDt.hidden = false;
+      if (advDd) { advDd.hidden = false; advDd.textContent = '$' + advCost.toFixed(4); }
+      if (advMdlEl) advMdlEl.textContent = t.adv_mdl || 'advisor';
+    } else {
+      if (primaryDt) primaryDt.hidden = true;
+      if (primaryDd) primaryDd.hidden = true;
+      if (advDt) advDt.hidden = true;
+      if (advDd) advDd.hidden = true;
+    }
     setText('cost', '$' + (t.cost || 0).toFixed(4));
     var savings = (t.nc || 0) - (t.cost || 0);
     var sEl = sel('cache-savings');
