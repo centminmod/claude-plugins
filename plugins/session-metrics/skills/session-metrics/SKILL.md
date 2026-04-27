@@ -1,6 +1,8 @@
 ---
 name: session-metrics
 model: sonnet
+context: fork
+agent: general-purpose
 description: >
   Tally Claude Code session token usage and cost estimates from the raw JSONL
   conversation log. Trigger when the user asks about session cost, token usage,
