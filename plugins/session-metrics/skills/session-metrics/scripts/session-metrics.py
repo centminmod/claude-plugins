@@ -2055,6 +2055,10 @@ def _build_waste_analysis(sessions: list[dict]) -> dict:
         t["turn_character"]       = char
         t["turn_character_label"] = _TURN_CHARACTER_LABELS[char]
         t["turn_risk"]            = char in _RISK_CATEGORIES
+        if char == "file_reread":
+            t["reaccessed_paths"] = sorted(
+                reaccess_result["_turn_to_paths"].get(t.get("index", -1), set())
+            )
         distribution[char] += 1
 
     reaccess_out = {k: v for k, v in reaccess_result.items() if k != "_turn_to_paths"}
@@ -5936,8 +5940,10 @@ tr.subtotal td{font-weight:600}
 .wc-card .wc-cost{font-size:12px;font-weight:600;color:var(--accent);margin-bottom:4px}
 .wc-card ul{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:3px}
 .wc-card li{opacity:.85;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.wc-char{font-size:11px;max-width:160px;white-space:nowrap}
-.wc-risk-badge{display:inline-block;margin-left:5px;font-size:9px;padding:0 3px;border-radius:3px;background:rgba(248,113,113,.18);color:#f87171;border:1px solid rgba(248,113,113,.3);vertical-align:middle;cursor:help}
+.wc-char{font-size:11px}
+.wc-char-inner{display:flex;align-items:center;gap:4px;max-width:160px;overflow:hidden;white-space:nowrap}
+.wc-char-inner > span.wc-lbl{overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
+.wc-risk-badge{display:inline-block;flex-shrink:0;font-size:9px;padding:0 3px;border-radius:3px;background:rgba(248,113,113,.18);color:#f87171;border:1px solid rgba(248,113,113,.3);vertical-align:middle;cursor:help}
 
 /* Cache breaks (Phase A v1.6.0) — surface gets per-theme background via theme override blocks below; CSS-variable-driven inner styles work across all four variants. */
 .cache-breaks{padding:14px 16px;border-radius:12px;display:flex;flex-direction:column;gap:8px}
@@ -6037,6 +6043,10 @@ tr.turn-row:focus{outline:1px solid var(--accent);outline-offset:-1px}
 .drawer-tools-list li:first-child{border-top:none}
 .drawer-tool-preview{font-size:10px;opacity:.7;margin-left:6px;word-break:break-word}
 .drawer-savings{color:#3fb950;font-size:11px;margin-top:6px;font-family:'JetBrains Mono',monospace}
+.drawer-wc-label{font-weight:600;margin:0 0 6px;font-size:13px}
+.drawer-wc-label.risk{color:var(--acc-warn,#f0a500)}
+.drawer-wc-label.ok{color:#3fb950}
+.drawer-wc-explain{margin:0;font-size:12px;opacity:.8;line-height:1.55;font-family:'Inter',sans-serif}
 .drawer-backdrop{position:fixed;inset:0;background:var(--backdrop,rgba(0,0,0,.5));opacity:0;pointer-events:none;transition:opacity .2s ease;z-index:999}
 .drawer-backdrop.open{opacity:1;pointer-events:auto}
 
@@ -6935,10 +6945,13 @@ def render_html(report: dict, variant: str = "single",
         _char_lbl  = html_mod.escape(t.get("turn_character_label", ""))
         _risk      = t.get("turn_risk", False)
         _risk_badge = (
-            ' <span class="wc-risk-badge" title="Potentially wasteful turn type">&#9888;</span>'
+            '<span class="wc-risk-badge" title="Potentially wasteful turn type">&#9888;</span>'
         ) if _risk else ""
         waste_td   = (
-            f'<td class="wc-char" title="{_char}">{_char_lbl}{_risk_badge}</td>'
+            f'<td class="wc-char" title="{_char}">'
+            f'<div class="wc-char-inner">'
+            f'<span class="wc-lbl">{_char_lbl}</span>{_risk_badge}'
+            f'</div></td>'
         ) if show_waste else ""
         return (
             f'<tr id="turn-{turn_key}" class="turn-row" data-session="{session_id[:8]}"'
@@ -7388,6 +7401,10 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                     "asnip": t.get("assistant_snippet", ""),
                     "atxt":  t.get("assistant_text", ""),
                     "sr":    t.get("stop_reason", ""),
+                    "wc":    t.get("turn_character", "productive"),
+                    "wcl":   t.get("turn_character_label", "Productive"),
+                    "risk":  t.get("turn_risk", False),
+                    "wcp":   t.get("reaccessed_paths", []),
                 }
                 chartrail_data.append({
                     "n":    t["index"],
@@ -7459,6 +7476,11 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
         <dt data-slot="sr-wrap-dt" hidden>Stop reason</dt>
         <dd data-slot="sr-wrap" hidden><code data-slot="sr-val"></code></dd>
       </dl>
+    </div>
+    <div class="drawer-sec" id="wc-sec" hidden>
+      <h4>Turn Character</h4>
+      <p data-slot="wc-label" class="drawer-wc-label"></p>
+      <p data-slot="wc-explain" class="drawer-wc-explain"></p>
     </div>
     <div class="drawer-sec">
       <h4>Prompt</h4>
@@ -7718,6 +7740,47 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
         asstMore.hidden = true; asstFull.hidden = true; asstFull.textContent = '';
       }
     } else { asstSect.hidden = true; }
+
+    // Turn Character explanation (v1.8.0)
+    var wcSecEl = document.getElementById('wc-sec');
+    var wcLabelEl = sel('wc-label');
+    var wcExplainEl = sel('wc-explain');
+    if (wcSecEl && wcLabelEl && wcExplainEl && t.wc) {
+      var wc = t.wc;
+      var isRisk = !!t.risk;
+      wcLabelEl.textContent = t.wcl || wc;
+      wcLabelEl.className = 'drawer-wc-label' + (isRisk ? ' risk' : (wc === 'productive' ? ' ok' : ''));
+      var crAmt = t.cr || 0, inpAmt = t.inp || 0, cwAmt = t.cw || 0, outAmt = t.out || 0;
+      var crTot = inpAmt + crAmt;
+      var crPct = crTot > 0 ? Math.round(crAmt / crTot * 100) : 0;
+      var thinkCt = (t.cb && t.cb.thinking) || 0;
+      var paths = t.wcp || [];
+      var ex;
+      if (wc === 'subagent_overhead') {
+        ex = 'Spawned a subagent (Agent or Task tool). Overhead includes context bootstrapping and output tokens from the spawned task, both billed to this turn.';
+      } else if (wc === 'reasoning') {
+        ex = 'Used extended thinking (' + thinkCt + ' thinking block' + (thinkCt !== 1 ? 's' : '') + '). Thinking tokens are billed at output rates and can significantly increase cost.';
+      } else if (wc === 'cache_read') {
+        ex = crPct + '% of input came from cache reads (' + crAmt.toLocaleString() + ' cached vs ' + inpAmt.toLocaleString() + ' new tokens). Cache reads cost ~10× less than new input — this is efficient.';
+      } else if (wc === 'cache_write') {
+        ex = 'Wrote ' + cwAmt.toLocaleString() + ' tokens to the prompt cache. Large cache payloads create checkpoints that reduce cost for subsequent turns.';
+      } else if (wc === 'file_reread') {
+        var shortPaths = paths.slice(0, 4).map(function (p) { return p.split('/').pop(); });
+        ex = 'Re-read file(s) already accessed earlier in this session.' +
+          (shortPaths.length ? ' Files: ' + shortPaths.join(', ') + (paths.length > 4 ? ' +' + (paths.length - 4) + ' more' : '') + '.' : '') +
+          ' Repeated reads waste input tokens when the content is already in context.';
+      } else if (wc === 'oververbose_edit') {
+        ex = 'Edit turn with ' + outAmt.toLocaleString() + ' output tokens (threshold: 800). High output on an Edit turn may indicate over-explanation or unnecessary context repetition.';
+      } else if (wc === 'retry_error') {
+        ex = 'Prompt closely matches an earlier turn, suggesting a retry or repeated instruction. Retry chains waste tokens re-establishing context.';
+      } else if (wc === 'dead_end') {
+        ex = 'Response hit the max_tokens stop limit and was truncated. Follow-up turns may be needed to complete the task.';
+      } else {
+        ex = 'No waste signals detected — this turn made forward progress efficiently.';
+      }
+      wcExplainEl.textContent = ex;
+      wcSecEl.hidden = false;
+    } else if (wcSecEl) { wcSecEl.hidden = true; }
 
     drawer.classList.add('open');
     drawer.setAttribute('aria-hidden', 'false');
