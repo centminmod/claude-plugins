@@ -51,13 +51,14 @@ and a dashboard. No flags, no options needed.
 
 ---
 
-## The two most-used commands
+## The three most-used commands
 
 These are what almost everyone ends up wanting: **a shareable HTML
-report for the current session**, or **one for the whole project**.
-Both land as a self-contained HTML file in `exports/session-metrics/`
-under your project root, so you can open them in a browser or email
-them around.
+report for the current session**, **one for the whole project**, or
+**a dashboard across every project on your machine**. Session and
+project reports land in `exports/session-metrics/` under your project
+root; the all-projects dashboard lands in a dated subfolder under
+`exports/session-metrics/instance/`.
 
 ### 1 — Export the current session to HTML
 
@@ -109,7 +110,32 @@ blocks, weekly roll-up, hour-of-day punchcard. Output file:
 `project_<YYYYMMDD_HHMMSS>_dashboard.html` + `_detail.html` (or a
 single file with `--single-page`).
 
-### Useful HTML-specific flags (both scopes)
+### 3 — Instance dashboard (every project on your machine)
+
+**Natural-language ask:**
+
+> how much have I spent on Claude Code across all my projects?
+
+**Explicit invocation:**
+
+```
+/session-metrics all-projects
+```
+
+**Direct shell:**
+
+```bash
+uv run python ~/.claude/plugins/cache/centminmod/session-metrics/<version>/skills/session-metrics/scripts/session-metrics.py --all-projects --output html
+```
+
+Aggregates every project under `~/.claude/projects/` into one dashboard — total
+cost-to-date, per-project breakdown, and daily timeline. Output lands in
+`exports/session-metrics/instance/YYYY-MM-DD-HHMMSS/` (dated subfolder so successive
+runs don't overwrite each other): `index.html` hyperlinks each project row to a
+pre-rendered per-project HTML drilldown. Add `--no-project-drilldown` for a flat
+index in seconds.
+
+### Useful HTML-specific flags (scopes 1 and 2)
 
 | Flag | Purpose |
 |------|---------|
