@@ -1788,6 +1788,286 @@ def _detect_cache_breaks(session: dict,
     return breaks
 
 
+# ---------------------------------------------------------------------------
+# Token-waste classification (v1.8.0)
+# ---------------------------------------------------------------------------
+# 9-category taxonomy from Jock Reeves "Token Waste Management" (2026).
+# Four categories (cache_read, cache_write, reasoning, subagent_overhead)
+# were already tracked; this block adds the remaining five plus per-turn
+# labelling and cross-session detection helpers.
+
+_TURN_CHARACTER_LABELS: dict[str, str] = {
+    "subagent_overhead": "Subagent Dispatch",
+    "reasoning":         "Extended Thinking",
+    "cache_read":        "Cache-Heavy",
+    "cache_write":       "Cache Payload",
+    "file_reread":       "Inefficient File Access",
+    "oververbose_edit":  "Verbose Response",
+    "retry_error":       "Retry Attempt",
+    "dead_end":          "Stuck/Truncated",
+    "productive":        "Productive",
+}
+_RISK_CATEGORIES: frozenset[str] = frozenset(
+    {"retry_error", "dead_end", "oververbose_edit", "file_reread"}
+)
+
+
+def _analyze_stop_reasons(turns: list[dict]) -> dict:
+    """Aggregate stop_reason distribution across real (non-resume) turns."""
+    counts: dict[str, int] = {}
+    real = [t for t in turns if not t.get("is_resume_marker")]
+    for t in real:
+        r = t.get("stop_reason") or "unknown"
+        counts[r] = counts.get(r, 0) + 1
+    total = max(len(real), 1)
+    return {
+        "distribution": counts,
+        "max_tokens_count": counts.get("max_tokens", 0),
+        "max_tokens_pct":   counts.get("max_tokens", 0) / total * 100,
+        "end_turn_pct":     counts.get("end_turn",   0) / total * 100,
+        "tool_use_pct":     counts.get("tool_use",   0) / total * 100,
+    }
+
+
+def _detect_retry_chains(turns: list[dict], threshold: float = 0.80) -> dict:
+    """Detect retry patterns within a single session's turn list.
+
+    Compares consecutive user-prompt turns using SequenceMatcher. Call once
+    per session (not on a cross-session flat list) to avoid false positives
+    at session boundaries.
+    """
+    import re as _re
+    from difflib import SequenceMatcher
+
+    def _tok(text: str) -> list[str]:
+        return _re.findall(r"\w+", text.lower())
+
+    prompted = [t for t in turns
+                if not t.get("is_resume_marker") and (t.get("prompt_text") or "").strip()]
+
+    chains: list[dict] = []
+    processed: set[int] = set()
+
+    for i in range(len(prompted) - 1):
+        if i in processed:
+            continue
+        a_text = prompted[i]["prompt_text"]
+        a_toks = _tok(a_text)
+        chain = [prompted[i]["index"]]
+        j = i + 1
+        while j < len(prompted):
+            b_text = prompted[j]["prompt_text"]
+            if a_text == b_text or SequenceMatcher(None, a_toks, _tok(b_text)).ratio() >= threshold:
+                chain.append(prompted[j]["index"])
+                processed.add(j)
+                a_toks = _tok(b_text)
+                a_text = b_text
+                j += 1
+            else:
+                break
+        if len(chain) >= 2:
+            cost = sum(t.get("cost_usd", 0.0) for t in turns if t.get("index") in set(chain))
+            chains.append({"turn_indices": chain, "length": len(chain), "cost_usd": cost})
+
+    total_cost = sum(t.get("cost_usd", 0.0) for t in turns)
+    retry_cost = sum(c["cost_usd"] for c in chains)
+    return {
+        "chains":          chains,
+        "chain_count":     len(chains),
+        "retry_cost_pct":  retry_cost / total_cost * 100 if total_cost else 0.0,
+    }
+
+
+def _detect_file_reaccesses(turns: list[dict]) -> dict:
+    """Identify files accessed 2+ times across the provided turn list.
+
+    For Read/Edit/Write tools, input_preview IS the file path (produced by
+    _summarise_tool_input). For Bash, a regex extracts path-like substrings.
+    Returns a _turn_to_paths mapping for O(1) per-turn classification; callers
+    must strip this key before JSON serialisation.
+    """
+    import re as _re
+    from collections import Counter, defaultdict
+    _BASH_PATH_RE = _re.compile(r"(?:\.{0,2}/[\w.\-/]+\.\w+|~/[\w.\-/]+)")
+
+    access_count: Counter = Counter()
+    access_turns: dict[str, list[int]] = defaultdict(list)
+
+    for t in turns:
+        if t.get("is_resume_marker"):
+            continue
+        idx = t.get("index", -1)
+        for tool in t.get("tool_use_detail", []):
+            name    = tool.get("name", "")
+            preview = tool.get("input_preview", "")
+            if name in ("Read", "Edit", "Write") and preview:
+                access_count[preview] += 1
+                access_turns[preview].append(idx)
+            elif name == "Bash":
+                for path in _BASH_PATH_RE.findall(preview):
+                    access_count[path] += 1
+                    access_turns[path].append(idx)
+
+    reaccessed = {p: c for p, c in access_count.items() if c >= 2}
+    turn_to_paths: dict[int, set[str]] = defaultdict(set)
+    for path, indices in access_turns.items():
+        if path in reaccessed:
+            for idx in indices:
+                turn_to_paths[idx].add(path)
+
+    details = sorted(
+        [
+            {
+                "path":       p,
+                "count":      reaccessed[p],
+                "first_turn": min(access_turns[p]),
+                "cost_usd":   sum(
+                    t.get("cost_usd", 0.0) for t in turns
+                    if t.get("index") in set(access_turns[p])
+                ),
+            }
+            for p in reaccessed
+        ],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:10]
+
+    return {
+        "reaccessed_count":      len(reaccessed),
+        "details":               details,
+        "total_reaccess_cost":   sum(d["cost_usd"] for d in details),
+        "_turn_to_paths":        dict(turn_to_paths),   # internal; strip before export
+    }
+
+
+def _detect_verbose_edits(turns: list[dict], output_threshold: int = 800) -> dict:
+    """Flag Edit turns with output_tokens above threshold.
+
+    The original ratio heuristic (output/input) is not computable from
+    turn records (input_preview is summarised). This proxy — high output
+    on an Edit turn — catches genuine over-verbosity without needing raw
+    tool input. Threshold of 800 is calibrated for Sonnet/Opus; adjust via
+    the parameter if model mix shifts.
+    """
+    verbose = []
+    for t in turns:
+        if t.get("is_resume_marker"):
+            continue
+        if "Edit" not in (t.get("tool_use_names") or []):
+            continue
+        if t.get("output_tokens", 0) > output_threshold:
+            verbose.append({
+                "turn_index":    t["index"],
+                "output_tokens": t["output_tokens"],
+                "cost_usd":      t.get("cost_usd", 0.0),
+            })
+    verbose.sort(key=lambda x: x["output_tokens"], reverse=True)
+    return {
+        "verbose_count": len(verbose),
+        "details":       verbose[:10],
+        "total_cost":    sum(v["cost_usd"] for v in verbose),
+    }
+
+
+def _classify_turn(turn: dict, retry_idx: set[int],
+                   reaccess_idx: set[int], verbose_idx: set[int]) -> str:
+    """Assign a single waste category to a turn (priority waterfall).
+
+    Order: subagent_overhead > reasoning > cache_read > cache_write >
+           file_reread > oververbose_edit > retry_error > dead_end > productive
+    """
+    names    = turn.get("tool_use_names") or []
+    idx      = turn.get("index", -1)
+    cb       = turn.get("content_blocks") or {}
+    cr       = int(turn.get("cache_read_tokens", 0))
+    cw       = int(turn.get("cache_write_tokens", 0))
+    inp      = int(turn.get("input_tokens", 0))
+    total_in = inp + cr
+
+    if "Agent" in names or "Task" in names:
+        return "subagent_overhead"
+    if cb.get("thinking", 0) > 0:
+        return "reasoning"
+    if cr > 100_000 and total_in > 0 and cr / total_in > 0.5:
+        return "cache_read"
+    if cw > 100_000:
+        return "cache_write"
+    if idx in reaccess_idx:
+        return "file_reread"
+    if idx in verbose_idx:
+        return "oververbose_edit"
+    if idx in retry_idx:
+        return "retry_error"
+    if turn.get("stop_reason") == "max_tokens":
+        return "dead_end"
+    return "productive"
+
+
+def _build_waste_analysis(sessions: list[dict]) -> dict:
+    """Orchestrate all waste-detection passes and per-turn classification.
+
+    ``sessions`` must already have ``_attribute_subagent_tokens`` and
+    ``_detect_cache_breaks`` applied (both mutate turn dicts in place).
+
+    Modifies turn dicts in place, adding:
+        turn_character       str  — technical key
+        turn_character_label str  — display label
+        turn_risk            bool — True for inherently wasteful categories
+
+    Returns the top-level waste_analysis dict (stripped of internal keys).
+    """
+    from collections import Counter
+
+    all_turns = [t for s in sessions for t in s.get("turns", [])]
+
+    # Retry: per-session to avoid cross-session false matches
+    all_chains: list[dict] = []
+    for s in sessions:
+        r = _detect_retry_chains(s.get("turns", []))
+        all_chains.extend(r["chains"])
+    total_cost = sum(t.get("cost_usd", 0.0) for t in all_turns)
+    retry_cost = sum(c["cost_usd"] for c in all_chains)
+    retry_result = {
+        "chains":         all_chains,
+        "chain_count":    len(all_chains),
+        "retry_cost_pct": retry_cost / total_cost * 100 if total_cost else 0.0,
+    }
+
+    # File re-access, verbose edits, stop reasons: cross-session is valid
+    stop_reasons    = _analyze_stop_reasons(all_turns)
+    reaccess_result = _detect_file_reaccesses(all_turns)
+    verbose_result  = _detect_verbose_edits(all_turns)
+
+    # Build O(1) lookup sets for classifier
+    retry_idx    = {i for c in retry_result["chains"]           for i in c["turn_indices"]}
+    reaccess_idx = set(reaccess_result["_turn_to_paths"].keys())
+    verbose_idx  = {v["turn_index"] for v in verbose_result["details"]}
+
+    # Classify and annotate every turn in place
+    distribution: Counter = Counter()
+    for t in all_turns:
+        if t.get("is_resume_marker"):
+            t["turn_character"]       = "productive"
+            t["turn_character_label"] = _TURN_CHARACTER_LABELS["productive"]
+            t["turn_risk"]            = False
+            continue
+        char = _classify_turn(t, retry_idx, reaccess_idx, verbose_idx)
+        t["turn_character"]       = char
+        t["turn_character_label"] = _TURN_CHARACTER_LABELS[char]
+        t["turn_risk"]            = char in _RISK_CATEGORIES
+        distribution[char] += 1
+
+    reaccess_out = {k: v for k, v in reaccess_result.items() if k != "_turn_to_paths"}
+
+    return {
+        "stop_reasons":    stop_reasons,
+        "retry_chains":    retry_result,
+        "file_reaccesses": reaccess_out,
+        "verbose_edits":   verbose_result,
+        "distribution":    dict(distribution),
+    }
+
+
 def _empty_skill_row(name: str) -> dict:
     return {
         "name":             name,
@@ -2804,6 +3084,11 @@ def _build_report(
     # Sort global cache_breaks by uncached desc to keep "worst-first" order.
     report["cache_breaks"].sort(key=lambda b: -int(b.get("uncached", 0)))
     report["usage_insights"] = _compute_usage_insights(report)
+    # v1.8.0: token-waste classification — runs after attribution + cache-break
+    # detection (both mutate turn dicts in place); annotates turns with
+    # turn_character / turn_character_label / turn_risk and attaches
+    # the top-level waste_analysis summary dict.
+    report["waste_analysis"] = _build_waste_analysis(sessions_out)
     # Drop the internal flag after use so the report dict stays clean
     # for downstream renderers / JSON export.
     report.pop("_suppress_model_compare_insight", None)
@@ -3322,7 +3607,8 @@ def render_csv(report: dict) -> str:
                 # turns that didn't spawn a subagent (the common case).
                 "attributed_subagent_tokens", "attributed_subagent_cost",
                 "attributed_subagent_count",
-                "stop_reason", "is_cache_break"])
+                "stop_reason", "is_cache_break",
+                "turn_character", "turn_character_label", "turn_risk"])
     for s in report["sessions"]:
         for t in s["turns"]:
             cb = t.get("content_blocks") or {}
@@ -3344,6 +3630,9 @@ def render_csv(report: dict) -> str:
                 t.get("attributed_subagent_count", 0),
                 t.get("stop_reason", ""),
                 t.get("is_cache_break", False),
+                t.get("turn_character", ""),
+                t.get("turn_character_label", ""),
+                t.get("turn_risk", False),
             ])
 
     # Time-of-day summary section
@@ -3464,6 +3753,35 @@ def render_csv(report: dict) -> str:
                 cb.get("project", ""),
                 (cb.get("prompt_snippet") or "")[:240],
             ])
+
+    wa = report.get("waste_analysis")
+    if wa:
+        dist = wa.get("distribution") or {}
+        if dist:
+            w.writerow([])
+            w.writerow(["# TURN CHARACTER ANALYSIS"])
+            w.writerow(["turn_character", "turn_character_label", "count"])
+            for char, count in sorted(dist.items(), key=lambda x: -x[1]):
+                w.writerow([char, _TURN_CHARACTER_LABELS.get(char, char), count])
+        retry = wa.get("retry_chains") or {}
+        if retry.get("chain_count", 0) > 0:
+            w.writerow([])
+            w.writerow([f"# RETRY CHAINS ({retry['chain_count']} chains, "
+                        f"{retry.get('retry_cost_pct', 0):.1f}% of session cost)"])
+            w.writerow(["chain_length", "turn_indices", "cost_usd"])
+            for c in retry.get("chains") or []:
+                w.writerow([c["length"],
+                            ";".join(str(i) for i in c["turn_indices"]),
+                            f"{c['cost_usd']:.6f}"])
+        reaccess = wa.get("file_reaccesses") or {}
+        if reaccess.get("reaccessed_count", 0) > 0:
+            w.writerow([])
+            w.writerow([f"# FILE RE-ACCESSES ({reaccess['reaccessed_count']} files)"])
+            w.writerow(["path", "access_count", "first_turn", "cost_usd"])
+            for d in reaccess.get("details") or []:
+                w.writerow([d["path"], d["count"], d["first_turn"],
+                            f"{d['cost_usd']:.6f}"])
+
     return out.getvalue()
 
 
@@ -3550,6 +3868,10 @@ def render_md(report: dict) -> str:
     md_insights = _build_usage_insights_md(report.get("usage_insights", []) or [])
     if md_insights:
         p(md_insights)
+
+    md_waste = _build_waste_analysis_md(report.get("waste_analysis") or {})
+    if md_waste:
+        p(md_waste)
 
     # Time-of-day section
     tod = report.get("time_of_day", {})
@@ -5184,6 +5506,238 @@ def _build_usage_insights_md(insights: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _build_waste_analysis_html(wa: dict) -> str:
+    """Render the Turn Character & Efficiency Signals section for the dashboard.
+
+    Returns ``""`` when ``wa`` is empty or all detections found nothing — the
+    section disappears cleanly like the existing usage-insights panel.
+    """
+    if not wa:
+        return ""
+    dist   = wa.get("distribution") or {}
+    total  = max(sum(dist.values()), 1)
+    if total == 0:
+        return ""
+
+    # ---- Turn composition bar ------------------------------------------
+    # Ordered display: productive first, then waste categories by severity
+    _ORDER = [
+        "productive", "cache_read", "cache_write", "reasoning",
+        "subagent_overhead", "retry_error", "file_reread",
+        "oververbose_edit", "dead_end",
+    ]
+    _COLORS = {
+        "productive":        "#4ade80",  # green
+        "cache_read":        "#60a5fa",  # blue
+        "cache_write":       "#818cf8",  # indigo
+        "reasoning":         "#c084fc",  # purple
+        "subagent_overhead": "#fb923c",  # orange
+        "retry_error":       "#f87171",  # red
+        "file_reread":       "#fbbf24",  # amber
+        "oververbose_edit":  "#f472b6",  # pink
+        "dead_end":          "#9ca3af",  # grey
+    }
+    bar_parts = []
+    for cat in _ORDER:
+        n = dist.get(cat, 0)
+        if n == 0:
+            continue
+        pct  = n / total * 100
+        col  = _COLORS.get(cat, "#6b7280")
+        lbl  = html_mod.escape(_TURN_CHARACTER_LABELS.get(cat, cat))
+        tip  = f"{lbl}: {n} turns ({pct:.1f}%)"
+        bar_parts.append(
+            f'<div class="wc-bar-seg" style="width:{pct:.2f}%;background:{col}"'
+            f' title="{tip}"></div>'
+        )
+    bar_html = (
+        '<div class="wc-bar">' + "".join(bar_parts) + "</div>"
+        if bar_parts else ""
+    )
+
+    # ---- Distribution legend table -------------------------------------
+    legend_rows = []
+    for cat in _ORDER:
+        n = dist.get(cat, 0)
+        if n == 0:
+            continue
+        pct  = n / total * 100
+        col  = _COLORS.get(cat, "#6b7280")
+        lbl  = html_mod.escape(_TURN_CHARACTER_LABELS.get(cat, cat))
+        risk = "&#9888;" if cat in _RISK_CATEGORIES else ""
+        legend_rows.append(
+            f'<tr>'
+            f'<td><span class="wc-dot" style="background:{col}"></span>{lbl} {risk}</td>'
+            f'<td class="num">{n:,}</td>'
+            f'<td class="num">{pct:.1f}%</td>'
+            f'</tr>'
+        )
+    legend_table = (
+        '<table class="wc-legend">'
+        '<thead><tr><th>Category</th><th class="num">Turns</th><th class="num">%</th></tr></thead>'
+        '<tbody>' + "".join(legend_rows) + "</tbody>"
+        "</table>"
+    )
+
+    # ---- Retry chains card ---------------------------------------------
+    retry      = wa.get("retry_chains") or {}
+    retry_html = ""
+    if retry.get("chain_count", 0) > 0:
+        chains = retry.get("chains") or []
+        cost_pct = float(retry.get("retry_cost_pct", 0.0))
+        chain_rows = []
+        for c in chains[:5]:
+            idxs = ", ".join(str(i) for i in c.get("turn_indices", []))
+            chain_rows.append(
+                f'<tr><td class="num">{c.get("length", 0)}</td>'
+                f'<td class="num mono">{idxs}</td>'
+                f'<td class="num">${float(c.get("cost_usd", 0.0)):.4f}</td></tr>'
+            )
+        chain_table = (
+            '<table class="wc-legend">'
+            '<thead><tr><th class="num">Length</th><th>Turn indices</th>'
+            '<th class="num">Cost $</th></tr></thead>'
+            '<tbody>' + "".join(chain_rows) + "</tbody></table>"
+        ) if chain_rows else ""
+        retry_html = (
+            f'<div class="wc-card">'
+            f'<h3>&#9854; Retry Patterns</h3>'
+            f'<p>{retry["chain_count"]} chain{"s" if retry["chain_count"] != 1 else ""} '
+            f'detected &nbsp;·&nbsp; {cost_pct:.1f}% of session cost</p>'
+            f'{chain_table}'
+            f'</div>'
+        )
+
+    # ---- File re-access card ------------------------------------------
+    reaccess      = wa.get("file_reaccesses") or {}
+    reaccess_html = ""
+    if reaccess.get("reaccessed_count", 0) > 0:
+        det      = reaccess.get("details") or []
+        tot_cost = float(reaccess.get("total_reaccess_cost", 0.0))
+        ra_rows  = []
+        for d in det[:5]:
+            p = html_mod.escape(str(d.get("path", "")))
+            ra_rows.append(
+                f'<tr><td class="mono" title="{p}">{p[:50]}</td>'
+                f'<td class="num">{d.get("count", 0)}</td>'
+                f'<td class="num">${float(d.get("cost_usd", 0.0)):.4f}</td></tr>'
+            )
+        ra_table = (
+            '<table class="wc-legend">'
+            '<thead><tr><th>File</th><th class="num">Reads</th>'
+            '<th class="num">Cost $</th></tr></thead>'
+            '<tbody>' + "".join(ra_rows) + "</tbody></table>"
+        ) if ra_rows else ""
+        reaccess_html = (
+            f'<div class="wc-card">'
+            f'<h3>&#128196; File Re-Access</h3>'
+            f'<p>{reaccess["reaccessed_count"]} file{"s" if reaccess["reaccessed_count"] != 1 else ""} '
+            f're-read 2+ times &nbsp;·&nbsp; ${tot_cost:.4f} total</p>'
+            f'{ra_table}'
+            f'</div>'
+        )
+
+    # ---- Verbose edits card ------------------------------------------
+    verbose      = wa.get("verbose_edits") or {}
+    verbose_html = ""
+    if verbose.get("verbose_count", 0) > 0:
+        v_tot = float(verbose.get("total_cost", 0.0))
+        verbose_html = (
+            f'<div class="wc-card">'
+            f'<h3>&#128221; Verbose Responses</h3>'
+            f'<p>{verbose["verbose_count"]} Edit turn{"s" if verbose["verbose_count"] != 1 else ""} '
+            f'with output &gt; 800 tokens &nbsp;·&nbsp; ${v_tot:.4f} total</p>'
+            f'</div>'
+        )
+
+    # ---- Stop reasons card ------------------------------------------
+    sr        = wa.get("stop_reasons") or {}
+    sr_html   = ""
+    mt_count  = int(sr.get("max_tokens_count", 0))
+    mt_pct    = float(sr.get("max_tokens_pct", 0.0))
+    dist_sr   = sr.get("distribution") or {}
+    if dist_sr:
+        sr_parts = []
+        for reason, cnt in sorted(dist_sr.items(), key=lambda x: -x[1]):
+            sr_parts.append(f'<strong>{html_mod.escape(reason)}</strong> {cnt:,}')
+        warning = (
+            f' <span class="truncated-tag"'
+            f' title="stop_reason: max_tokens — responses were cut off">'
+            f'&#9986; {mt_count} truncated ({mt_pct:.1f}%)</span>'
+        ) if mt_pct >= 5.0 else ""
+        sr_html = (
+            f'<div class="wc-card">'
+            f'<h3>&#10003; Stop Reasons</h3>'
+            f'<p>{" &nbsp;·&nbsp; ".join(sr_parts)}{warning}</p>'
+            f'</div>'
+        )
+
+    cards_html = retry_html + reaccess_html + verbose_html + sr_html
+    if not cards_html:
+        cards_html = ""
+
+    return (
+        '<section class="section waste-analysis" aria-label="Turn character &amp; efficiency signals">\n'
+        '<div class="section-title"><h2>Turn Character &amp; Efficiency Signals</h2>'
+        '<span class="hint">9-category waste taxonomy · '
+        '<a href="https://thoughts.jock.pl/p/token-waste-management-opus-47-2026" '
+        'target="_blank" rel="noopener">methodology</a></span></div>\n'
+        f'{bar_html}\n'
+        f'{legend_table}\n'
+        + (f'<div class="wc-cards">{cards_html}</div>\n' if cards_html else "")
+        + "</section>"
+    )
+
+
+def _build_waste_analysis_md(wa: dict) -> str:
+    """Render the waste analysis summary as a Markdown section.
+    Returns ``""`` when there is nothing to show."""
+    if not wa:
+        return ""
+    dist  = wa.get("distribution") or {}
+    total = max(sum(dist.values()), 1)
+    if total == 0:
+        return ""
+
+    _ORDER = [
+        "productive", "cache_read", "cache_write", "reasoning",
+        "subagent_overhead", "retry_error", "file_reread",
+        "oververbose_edit", "dead_end",
+    ]
+    lines = ["## Turn Character & Efficiency Signals", ""]
+    for cat in _ORDER:
+        n = dist.get(cat, 0)
+        if n == 0:
+            continue
+        pct = n / total * 100
+        lbl = _TURN_CHARACTER_LABELS.get(cat, cat)
+        risk_marker = " ⚠" if cat in _RISK_CATEGORIES else ""
+        lines.append(f"- **{lbl}{risk_marker}**: {n:,} turns ({pct:.1f}%)")
+
+    retry = wa.get("retry_chains") or {}
+    if retry.get("chain_count", 0) > 0:
+        lines.append("")
+        lines.append(f"**Retry chains:** {retry['chain_count']} detected, "
+                     f"{float(retry.get('retry_cost_pct', 0.0)):.1f}% of session cost")
+
+    reaccess = wa.get("file_reaccesses") or {}
+    if reaccess.get("reaccessed_count", 0) > 0:
+        lines.append(f"**File re-accesses:** {reaccess['reaccessed_count']} files read 2+ times")
+
+    verbose = wa.get("verbose_edits") or {}
+    if verbose.get("verbose_count", 0) > 0:
+        lines.append(f"**Verbose edits:** {verbose['verbose_count']} Edit turns with output > 800 tokens")
+
+    sr = wa.get("stop_reasons") or {}
+    mt_count = int(sr.get("max_tokens_count", 0))
+    if mt_count > 0:
+        mt_pct = float(sr.get("max_tokens_pct", 0.0))
+        lines.append(f"**Truncated responses (max_tokens):** {mt_count} turns ({mt_pct:.1f}%)")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Theme layer — 4 themes (Beacon / Console / Lattice / Pulse) bundled in
 # every HTML export, with a top-right picker. Ported from
@@ -5366,6 +5920,24 @@ tr.subtotal td{font-weight:600}
 .models-table table{font-size:12px;font-family:'JetBrains Mono',monospace}
 .models-table code{font-size:11px}
 .models-table th,.models-table td{padding:7px 12px}
+
+/* Turn character & efficiency signals (v1.8.0) */
+.waste-analysis{padding:14px 16px;border-radius:12px}
+.waste-analysis h2{font-size:13px;font-weight:600;margin:0 0 10px;letter-spacing:.04em;text-transform:uppercase;opacity:.7}
+.wc-bar{display:flex;height:18px;border-radius:9px;overflow:hidden;width:100%;margin-bottom:12px;gap:1px}
+.wc-bar-seg{height:100%;min-width:2px;transition:opacity .15s}
+.wc-bar-seg:hover{opacity:.8;cursor:default}
+.wc-legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:11px;margin-bottom:14px}
+.wc-legend td{padding:2px 4px;font-size:11px}
+.wc-dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:middle}
+.wc-cards{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px}
+.wc-card{flex:1 1 200px;min-width:160px;padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface-deep,var(--border-dim));font-size:11px;font-family:'JetBrains Mono',monospace}
+.wc-card h3{font-size:11px;font-weight:600;margin:0 0 6px;opacity:.8;text-transform:uppercase;letter-spacing:.04em}
+.wc-card .wc-cost{font-size:12px;font-weight:600;color:var(--accent);margin-bottom:4px}
+.wc-card ul{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:3px}
+.wc-card li{opacity:.85;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wc-char{font-size:11px;max-width:160px;white-space:nowrap}
+.wc-risk-badge{display:inline-block;margin-left:5px;font-size:9px;padding:0 3px;border-radius:3px;background:rgba(248,113,113,.18);color:#f87171;border:1px solid rgba(248,113,113,.3);vertical-align:middle;cursor:help}
 
 /* Cache breaks (Phase A v1.6.0) — surface gets per-theme background via theme override blocks below; CSS-variable-driven inner styles work across all four variants. */
 .cache-breaks{padding:14px 16px;border-radius:12px;display:flex;flex-direction:column;gap:8px}
@@ -5559,7 +6131,7 @@ body.theme-beacon .kpi.featured .kpi-val{color:#A58BFF}
 body.theme-beacon details.insights,body.theme-beacon .usage-insights,
 body.theme-beacon .rollup,body.theme-beacon .blocks,body.theme-beacon .chart-card,
 body.theme-beacon .punch,body.theme-beacon .tod,body.theme-beacon .models-table,
-body.theme-beacon .cache-breaks,
+body.theme-beacon .cache-breaks,body.theme-beacon .waste-analysis,
 body.theme-beacon .cards .card,body.theme-beacon #chart-container,
 body.theme-beacon .legend-block,body.theme-beacon .prompts,
 body.theme-beacon .timeline-table,body.theme-beacon .chartrail-card,
@@ -5607,7 +6179,7 @@ body.theme-console .kpi.teal .kpi-val{color:#5EE2C6}
 body.theme-console details.insights,body.theme-console .usage-insights,
 body.theme-console .rollup,body.theme-console .blocks,body.theme-console .chart-card,
 body.theme-console .punch,body.theme-console .tod,body.theme-console .models-table,
-body.theme-console .cache-breaks,
+body.theme-console .cache-breaks,body.theme-console .waste-analysis,
 body.theme-console .cards .card,body.theme-console #chart-container,
 body.theme-console .legend-block,body.theme-console .prompts,
 body.theme-console .timeline-table,body.theme-console .chartrail-card,
@@ -5655,7 +6227,7 @@ body.theme-lattice .kpi .kpi-label{font-size:10px;letter-spacing:.08em}
 body.theme-lattice details.insights,body.theme-lattice .usage-insights,
 body.theme-lattice .rollup,body.theme-lattice .blocks,body.theme-lattice .chart-card,
 body.theme-lattice .punch,body.theme-lattice .tod,body.theme-lattice .models-table,
-body.theme-lattice .cache-breaks,
+body.theme-lattice .cache-breaks,body.theme-lattice .waste-analysis,
 body.theme-lattice .cards .card,body.theme-lattice #chart-container,
 body.theme-lattice .legend-block,body.theme-lattice .prompts,
 body.theme-lattice .timeline-table,body.theme-lattice .chartrail-card,
@@ -5703,7 +6275,7 @@ body.theme-pulse .kpi.cat-time .kpi-val{color:#FFB86B}
 body.theme-pulse details.insights,body.theme-pulse .usage-insights,
 body.theme-pulse .rollup,body.theme-pulse .blocks,body.theme-pulse .chart-card,
 body.theme-pulse .punch,body.theme-pulse .tod,body.theme-pulse .models-table,
-body.theme-pulse .cache-breaks,
+body.theme-pulse .cache-breaks,body.theme-pulse .waste-analysis,
 body.theme-pulse .cards .card,body.theme-pulse #chart-container,
 body.theme-pulse .legend-block,body.theme-pulse .prompts,
 body.theme-pulse .timeline-table,body.theme-pulse .chartrail-card,
@@ -6255,10 +6827,12 @@ def render_html(report: dict, variant: str = "single",
     show_mode    = _has_fast(report)
     show_ttl     = _has_1h_cache(report)
     show_content = _has_content_blocks(report)
+    show_waste   = bool(report.get("waste_analysis")) and include_chart
 
     # Total columns = #, Time, Model, [Mode], Input, Output, CacheRd, CacheWr,
-    #                 [Content], Total, Cost
-    _full_cols = 10 + (1 if show_mode else 0) + (1 if show_content else 0)
+    #                 [Content], Total, Cost, [Turn Character]
+    _full_cols = (10 + (1 if show_mode else 0) + (1 if show_content else 0)
+                     + (1 if show_waste else 0))
     # Label cell in subtotal rows spans the non-numeric prefix: #, Time, Model, [Mode]
     _label_span = 4 if show_mode else 3
 
@@ -6357,6 +6931,15 @@ def render_html(report: dict, variant: str = "single",
             ' <span class="truncated-tag"'
             ' title="stop_reason: max_tokens — response was cut off">&#9986; truncated</span>'
         ) if t.get("stop_reason") == "max_tokens" else ""
+        _char      = t.get("turn_character", "")
+        _char_lbl  = html_mod.escape(t.get("turn_character_label", ""))
+        _risk      = t.get("turn_risk", False)
+        _risk_badge = (
+            ' <span class="wc-risk-badge" title="Potentially wasteful turn type">&#9888;</span>'
+        ) if _risk else ""
+        waste_td   = (
+            f'<td class="wc-char" title="{_char}">{_char_lbl}{_risk_badge}</td>'
+        ) if show_waste else ""
         return (
             f'<tr id="turn-{turn_key}" class="turn-row" data-session="{session_id[:8]}"'
             f' data-turn-id="{turn_key}" role="button" tabindex="0">'
@@ -6372,6 +6955,7 @@ def render_html(report: dict, variant: str = "single",
             f'<td class="num">{t["total_tokens"]:,}</td>'
             f'<td class="cost"><span class="bar" style="width:{bar_w}px"></span>'
             f'${t["cost_usd"]:.4f}</td>'
+            f'{waste_td}'
             f'</tr>'
         )
 
@@ -6401,6 +6985,7 @@ def render_html(report: dict, variant: str = "single",
         cwr_td = _cwr_cell(st["cache_write"], tokens_5m, tokens_1h, sub_ttl, bold=True)
         content_td = ('<td class="content-blocks muted">&nbsp;</td>'
                       if show_content else "")
+        waste_td = '<td class="wc-char muted">&nbsp;</td>' if show_waste else ""
         return (
             f'<tr class="subtotal">'
             f'<td colspan="{_label_span}"><strong>{label}</strong></td>'
@@ -6411,6 +6996,7 @@ def render_html(report: dict, variant: str = "single",
             f'{content_td}'
             f'<td class="num"><strong>{st["total"]:,}</strong></td>'
             f'<td class="cost"><strong>${st["cost"]:.4f}</strong></td>'
+            f'{waste_td}'
             f'</tr>'
         )
 
@@ -6565,9 +7151,15 @@ def render_html(report: dict, variant: str = "single",
             '<b>Total</b> sum of the four billable token buckets · ',
             '<b>Cost $</b> estimated USD for this turn.',
         ])
+        if show_waste:
+            legend_parts.append(
+                ' · <b>Turn Character</b> 9-category waste classification '
+                '(⚠ = potentially wasteful)'
+            )
         legend_html = '<p class="legend-block">' + ''.join(legend_parts) + '</p>'
         content_th = ('<th class="content-blocks">Content</th>'
                       if show_content else "")
+        waste_th = '<th class="wc-char">Turn Character</th>' if show_waste else ""
         table_section_html = (
             '<section class="section">\n'
             '<div class="section-title"><h2>Timeline</h2></div>\n'
@@ -6579,6 +7171,7 @@ def render_html(report: dict, variant: str = "single",
             '  <th class="num">CacheRd</th><th class="num">CacheWr</th>\n'
             f'  {content_th}\n'
             '  <th class="num">Total</th><th class="num">Cost $</th>\n'
+            f'  {waste_th}\n'
             f'</tr></thead>\n<tbody>\n{"".join(table_rows)}\n</tbody>\n</table>\n'
             '</section>'
         )
@@ -6692,6 +7285,12 @@ def render_html(report: dict, variant: str = "single",
     # rides the same `include_insights` gate as `summary_cards_html` above.
     usage_insights_html = (
         _build_usage_insights_html(report.get("usage_insights", []) or [])
+        if include_insights else ""
+    )
+
+    # v1.8.0: Turn Character & Efficiency Signals — dashboard/single only.
+    waste_analysis_html = (
+        _build_waste_analysis_html(report.get("waste_analysis") or {})
         if include_insights else ""
     )
 
@@ -7230,6 +7829,7 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 </header>
 {summary_cards_html}
 {usage_insights_html}
+{waste_analysis_html}
 {cache_breaks_html}
 {by_skill_html}
 {by_subagent_type_html}
@@ -7550,6 +8150,7 @@ def _project_summary_from_report(project_report: dict) -> dict:
         "models":           project_report.get("models", {}),
         "cost_usd":         float(totals.get("cost", 0.0)),
         "sessions":         session_summaries,
+        "waste_dist":       (project_report.get("waste_analysis") or {}).get("distribution") or {},
     }
 
 
@@ -8460,6 +9061,18 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
             )
         else:
             name_cell = f'<code>{slug_safe}</code>'
+        wd = proj.get("waste_dist") or {}
+        _wn = sum(wd.values()) or 1
+        if wd:
+            waste_cells = (
+                f'<td class="num">{wd.get("productive", 0) / _wn * 100:.0f}%</td>'
+                f'<td class="num">{wd.get("retry_error", 0) / _wn * 100:.0f}%</td>'
+                f'<td class="num">{wd.get("file_reread", 0) / _wn * 100:.0f}%</td>'
+                f'<td class="num">{wd.get("oververbose_edit", 0) / _wn * 100:.0f}%</td>'
+                f'<td class="num">{wd.get("dead_end", 0) / _wn * 100:.0f}%</td>'
+            )
+        else:
+            waste_cells = '<td colspan="5" class="muted">—</td>'
         proj_rows_html_parts.append(
             f'<tr>'
             f'<td class="num">{i}</td>'
@@ -8470,8 +9083,16 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
             f'<td class="ts">{html_mod.escape(proj.get("first_ts", ""))}</td>'
             f'<td class="ts">{html_mod.escape(proj.get("last_ts", ""))}</td>'
             f'<td class="cost">${float(proj.get("cost_usd", 0.0)):.4f}</td>'
+            f'{waste_cells}'
             f'</tr>'
         )
+    # Only show waste columns if at least one project has waste data
+    any_waste = any(proj.get("waste_dist") for proj in projects)
+    waste_th = (
+        '<th class="num">Productive</th><th class="num">Retry</th>'
+        '<th class="num">File Rrd</th><th class="num">Verbose</th>'
+        '<th class="num">Stuck</th>'
+    ) if any_waste else ""
     projects_table_html = (
         f'<section class="section">'
         f'<div class="section-title"><h2>Projects breakdown</h2>'
@@ -8481,6 +9102,7 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
         f'<th class="num">#</th><th>Project</th><th>Path</th>'
         f'<th class="num">Sessions</th><th class="num">Turns</th>'
         f'<th>First</th><th>Last</th><th class="num">Cost $</th>'
+        f'{waste_th}'
         f'</tr></thead>'
         f'<tbody>{"".join(proj_rows_html_parts)}</tbody>'
         f'</table>'
