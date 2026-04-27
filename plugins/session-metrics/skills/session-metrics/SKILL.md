@@ -54,13 +54,8 @@ benchmark.
 
 ## Pre-flight context
 
-The following values are injected by Claude Code when this skill loads — Claude sees the rendered output, not the commands.
-
-```!
-printf "uv:    "; command -v uv >/dev/null 2>&1 && uv --version || echo "NOT FOUND — install: pip install uv"
-printf "script: "; test -f "${CLAUDE_SKILL_DIR}/scripts/session-metrics.py" && echo "ok" || echo "MISSING"
-printf "jsonl:  "; f="$HOME/.claude/projects/$(echo "$PWD" | sed 's|/|-|g')/${CLAUDE_SESSION_ID}.jsonl"; [ -f "$f" ] && echo "$f" || echo "not found for this session/project"
-```
+- skill-dir: ${CLAUDE_SKILL_DIR}
+- session-id: ${CLAUDE_SESSION_ID}
 
 ## Quick usage
 
