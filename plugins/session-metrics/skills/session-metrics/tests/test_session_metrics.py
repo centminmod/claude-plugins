@@ -631,26 +631,32 @@ def test_fixture_content_block_counts_per_turn():
     # msg_A: thinking + tool_use Bash + text (u2 text → no tool_result/image)
     assert turns[0]["content_blocks"] == {
         "thinking": 1, "tool_use": 1, "text": 1, "tool_result": 0, "image": 0,
+        "server_tool_use": 0, "advisor_tool_result": 0,
     }
     # msg_B: text only; preceded by u3 (tool_result)
     assert turns[1]["content_blocks"] == {
         "thinking": 0, "tool_use": 0, "text": 1, "tool_result": 1, "image": 0,
+        "server_tool_use": 0, "advisor_tool_result": 0,
     }
     # msg_C: text only; preceded by u5 (sidechain text) — no attributable blocks
     assert turns[2]["content_blocks"] == {
         "thinking": 0, "tool_use": 0, "text": 1, "tool_result": 0, "image": 0,
+        "server_tool_use": 0, "advisor_tool_result": 0,
     }
     # msg_D: tool_use WebFetch + text; preceded by u7 (tool_result)
     assert turns[3]["content_blocks"] == {
         "thinking": 0, "tool_use": 1, "text": 1, "tool_result": 1, "image": 0,
+        "server_tool_use": 0, "advisor_tool_result": 0,
     }
     # msg_E: thinking + text (pure 1h turn, preceded by u8 text)
     assert turns[4]["content_blocks"] == {
         "thinking": 1, "tool_use": 0, "text": 1, "tool_result": 0, "image": 0,
+        "server_tool_use": 0, "advisor_tool_result": 0,
     }
     # msg_F: 2 tool_use + text; preceded by u9 (text + image)
     assert turns[5]["content_blocks"] == {
         "thinking": 0, "tool_use": 2, "text": 1, "tool_result": 0, "image": 1,
+        "server_tool_use": 0, "advisor_tool_result": 0,
     }
 
 
@@ -689,7 +695,8 @@ def test_fixture_totals_content_blocks_aggregate():
     r = _build_fixture_report()
     cb = r["totals"]["content_blocks"]
     assert cb == {"thinking": 2, "tool_use": 4, "text": 6,
-                  "tool_result": 2, "image": 1}
+                  "tool_result": 2, "image": 1,
+                  "server_tool_use": 0, "advisor_tool_result": 0}
     assert r["totals"]["tool_call_total"] == 4
     assert r["totals"]["tool_call_avg_per_turn"] == pytest.approx(4 / 6, abs=1e-6)
 
@@ -7739,3 +7746,89 @@ def test_extract_turns_does_not_inherit_prior_user_timestamp_when_blank():
     assert turns[1]["_preceding_user_timestamp"] == ""
     rec_b = sm._build_turn_record(2, turns[1], tz_offset_hours=0.0)
     assert rec_b["latency_seconds"] is None
+
+
+# --- Advisor feature (v1.25.0) -----------------------------------------------
+
+_ADV_FIXTURE = _HERE / "fixtures" / "advisor_session.jsonl"
+
+# Sonnet 4.6 rates: $3/$15/$0.30/$3.75 per 1M
+# Opus 4.7 rates:   $5/$25 per 1M (advisor, no caching)
+#
+# Turn 2 (advisor turn) costs:
+#   primary: 200*3 + 80*15 + 1000*0.30 + 500*3.75  = 3975   → $0.003975
+#   advisor: 10000*5 + 500*25                        = 62500  → $0.062500
+#   total:   $0.066475
+_ADV_PRIMARY_COST  = (200*3 + 80*15 + 1000*0.30 + 500*3.75) / 1_000_000   # $0.003975
+_ADV_ADVISOR_COST  = (10_000*5 + 500*25) / 1_000_000                        # $0.062500
+_ADV_TURN2_TOTAL   = _ADV_PRIMARY_COST + _ADV_ADVISOR_COST                  # $0.066475
+
+
+def _build_advisor_report():
+    sid, turns, user_ts = sm._load_session(_ADV_FIXTURE, include_subagents=False)
+    return sm._build_report("session", "adv-test-slug", [(sid, turns, user_ts)])
+
+
+def test_advisor_cost_includes_iterations():
+    """Turn-level cost_usd includes advisor iteration tokens at Opus 4.7 rates."""
+    r = _build_advisor_report()
+    turns = r["sessions"][0]["turns"]
+    assert turns[1]["cost_usd"] == pytest.approx(_ADV_TURN2_TOTAL, abs=1e-7)
+
+
+def test_advisor_call_count_per_turn():
+    """advisor_calls == 1 on the advisor turn, 0 on all others."""
+    r = _build_advisor_report()
+    turns = r["sessions"][0]["turns"]
+    assert turns[0]["advisor_calls"] == 0
+    assert turns[1]["advisor_calls"] == 1
+    assert turns[2]["advisor_calls"] == 0
+
+
+def test_advisor_model_field_per_turn():
+    """advisor_model is set on the advisor turn and None on others."""
+    r = _build_advisor_report()
+    turns = r["sessions"][0]["turns"]
+    assert turns[0]["advisor_model"] is None
+    assert turns[1]["advisor_model"] == "claude-opus-4-7"
+    assert turns[2]["advisor_model"] is None
+
+
+def test_advisor_tool_in_tool_names():
+    """server_tool_use blocks with name 'advisor' appear in tool_use_names."""
+    r = _build_advisor_report()
+    turns = r["sessions"][0]["turns"]
+    assert "advisor" in turns[1]["tool_use_names"]
+
+
+def test_advisor_content_blocks_classified():
+    """server_tool_use and advisor_tool_result content blocks are counted."""
+    r = _build_advisor_report()
+    turns = r["sessions"][0]["turns"]
+    cb = turns[1]["content_blocks"]
+    assert cb["server_tool_use"] == 1
+    assert cb["advisor_tool_result"] == 1
+
+
+def test_session_summary_advisor_fields():
+    """Session subtotals aggregate advisor_call_count, advisor_cost_usd, advisor_configured_model."""
+    r = _build_advisor_report()
+    s = r["sessions"][0]
+    st = s["subtotal"]
+    assert st["advisor_call_count"] == 1
+    assert st["advisor_cost_usd"] == pytest.approx(_ADV_ADVISOR_COST, abs=1e-7)
+    assert s["advisor_configured_model"] == "claude-opus-4-7"
+
+
+def test_no_advisor_session_unchanged():
+    """Sessions without advisor activity produce all-zero advisor fields; cost_usd unaffected."""
+    r = _build_fixture_report()
+    st = r["sessions"][0]["subtotal"]
+    assert st["advisor_call_count"] == 0
+    assert st["advisor_cost_usd"] == 0.0
+    for t in r["sessions"][0]["turns"]:
+        assert t["advisor_calls"] == 0
+        assert t["advisor_cost_usd"] == 0.0
+        assert t["advisor_model"] is None
+    # The well-known fixture total is unchanged.
+    assert r["totals"]["cost"] == pytest.approx(0.027845, abs=1e-7)

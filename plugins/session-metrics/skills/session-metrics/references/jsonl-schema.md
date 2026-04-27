@@ -102,6 +102,7 @@ The parser (`scripts/session-metrics.py`) reads token data only from
 | `isSidechain`     | `true` for subagent turns.                         | **tracked** (default filter; `--include-subagents` flips it) |
 | `slug`            | Project slug string.                               | redundant (derivable from `cwd`)                    |
 | `requestId`       | Anthropic API request ID.                          | available-not-shown — useful for API-log x-ref      |
+| `advisorModel`    | String — e.g. `"claude-opus-4-7"`. Stamped on **every** assistant entry when the Advisor feature is configured for the session, regardless of whether the advisor was actually called on that turn. Absent when Advisor is not configured. Use to detect advisor-enabled sessions and to look up advisor model pricing. | **tracked** (session-level `advisor_configured_model` field; drives "Advisor calls" dashboard card) |
 | `message`         | The payload (see below).                           | **tracked** (all cost data is here)                 |
 
 ### `message` fields (assistant role)
@@ -133,7 +134,7 @@ The parser (`scripts/session-metrics.py`) reads token data only from
 | `service_tier`                                | Metadata                           | `"standard"` observed; priority tier is a possible other value.                                      | N/A                                                               |
 | `speed`                                       | Metadata (drives multiplier)       | `"standard"` or `"fast"` (Claude Code `/fast` mode).                                                 | **tracked** (Mode column). 6× fast-mode multiplier is **not** applied in cost math — known limitation, see `references/pricing.md`. |
 | `inference_geo`                               | Multiplier (1.0× or 1.1×)          | Empty string in observed data. Anthropic documents US-only inference at 1.1× (data-residency surcharge). | available-not-shown                                               |
-| `iterations`                                  | Metadata                           | Array of per-iteration usage for turns that stream across multiple passes. Length 1 in all sampled turns. | N/A                                                               |
+| `iterations`                                  | **Yes** (when advisor called)      | Array of per-iteration usage for turns that stream across multiple passes. Length 1 on regular turns. On advisor turns the array has **3 entries**: `{type:"message"}` (pre-advisor pass), `{type:"advisor_message", input_tokens:N, output_tokens:M, model:"claude-opus-4-7"}` (the advisor model's own inference billed at list rates with no caching discount), and another `{type:"message"}` (post-advisor pass). The advisor iteration's tokens are **not** reflected in the top-level `usage` fields — they must be extracted from `iterations` to avoid a 6.6× cost under-count. | **tracked** (v1.25.0) — `_advisor_info()` extracts advisor tokens; cost added to `cost_usd` via `_cost()` |
 
 **Derived per-turn values the parser computes** (not fields in the JSONL):
 `total_tokens` (sum of the four billable token buckets) and `cost_usd`
@@ -193,6 +194,48 @@ metrics inflate 10-20× on tool-heavy sessions. Implementation:
 ### `image` (user-entry block)
 
 Pasted / attached image. Rare in shell-bound sessions.
+
+### `server_tool_use` (assistant-message block)
+
+Server-side tool invocation. The `id` field uses a `srvtoolu_` prefix
+(distinct from the `toolu_` prefix on client-side `tool_use` blocks).
+The `name` field identifies the server tool — currently only
+`"advisor"` is observed in practice.
+
+When `name == "advisor"`, this block marks an advisor call. The advisor
+model's inference cost is **not** in the top-level `usage` fields; it
+is carried by the `usage.iterations` entry with `type == "advisor_message"`.
+
+Observed shape:
+
+```json
+{"type": "server_tool_use", "id": "srvtoolu_01Abc", "name": "advisor", "input": {}}
+```
+
+**Content encoding.** Classified as letter `v` in the timeline Content
+column. The tool name `"advisor"` is added to `tool_use_names` and
+appears in the per-turn drawer's tools list alongside client-side tools.
+
+### `advisor_tool_result` (assistant-message block)
+
+The encrypted response returned by the advisor model. `content` is an
+array with a single `advisor_redacted_result` entry whose `data` field
+holds the encrypted payload — the advisor's feedback is not readable
+from the JSONL.
+
+Observed shape:
+
+```json
+{
+  "type": "advisor_tool_result",
+  "tool_use_id": "srvtoolu_01Abc",
+  "content": [{"type": "advisor_redacted_result", "data": "REDACTED_ENCRYPTED_CONTENT"}]
+}
+```
+
+**Content encoding.** Classified as letter `R` in the timeline Content
+column. Always paired with a preceding `server_tool_use` block with the
+same `tool_use_id`.
 
 ### `text` (user-entry block)
 
@@ -306,6 +349,7 @@ first. Each row is a candidate for a future report-expansion plan.
 | Cross-cutting derived insights (parallel sessions, big context, big cache misses, subagent-heavy, top-3 tool dominance, off-peak share, cost concentration, model mix, session pacing, long sessions) | **Proposal C** *(implemented v1.5.0)*. Computes 10 candidate "Usage Insights" with auto-hide thresholds; renders the highest-value as an above-the-fold prose insight + the rest in a `<details>` accordion on the HTML dashboard. Also flows into JSON (`usage_insights`) and Markdown (`## Usage Insights` section). Inspired by Anthropic's `/usage` slash command. No cost-math change — pure derivation pass. |
 | Cache-break events (single turns >100 k uncached) + `by_skill` + `by_subagent_type` aggregation + UUID-based cross-file dedup | **Proposal D** *(implemented v1.6.0)*. Inspired by Anthropic's `session-report` skill. Three new cross-cutting sections auto-hide when empty and render at every scope (session / project / instance): Cache breaks (configurable threshold via `--cache-break-threshold`, with ±2 user-prompt context), Skills & slash commands (invocations / turns / cost / % cached), and Subagent types (spawn count always; token cost when `--include-subagents`). UUID-based seen-set dedup runs at project + instance scope to prevent resumed-session replays from double-counting. No cost-math change for single-session reports; instance reports gain a correctness fix. |
 | `toolUseResult.agentId` (top-level on user entries) + Agent/Task `tool_use.id` + filename-derived subagent agentId | **Proposal E** *(implemented v1.7.0)*. Subagent → parent-prompt token attribution via three-stage linkage (mirrors Anthropic's `session-report` model): Stage 1 maps `tool_use.id → prompt_anchor_index`, Stage 2 maps `agentId → anchor` via `toolUseResult.agentId` paired with the tool_result block's `tool_use_id`, Stage 3 walks the chain (with cycle guard) to roll subagent tokens onto the **root** user prompt. New per-turn fields `attributed_subagent_tokens / _cost / _count` are purely additive — `cost_usd` and `total_tokens` on every turn are unchanged so existing aggregators see identical numbers. HTML prompts table sorts by `cost_usd + attributed_subagent_cost` by default (toggleable via `--sort-prompts-by`); CSV/JSON keep `self` ordering. Disable with `--no-subagent-attribution`. |
+| `advisorModel` (entry field) + `server_tool_use` / `advisor_tool_result` content blocks + `usage.iterations[type=="advisor_message"]` | **Implemented v1.25.0.** Advisor cost correction (up to 6.6× previously hidden cost per call), new content block classification letters `v` / `R`, per-turn advisor fields (`advisor_calls`, `advisor_cost_usd`, `advisor_model`, `advisor_input_tokens`, `advisor_output_tokens`), session-level `advisor_configured_model`, "Advisor calls" dashboard card, advisor annotation on project-cost session rows, and schema documentation for 4 new fields. Graceful degradation: sessions without advisor activity are unaffected. |
 | `server_tool_use.{web_search,web_fetch}_requests`                 | Separate per-request billing currently not applied; sessions that touch server-side web tools silently under-report cost. See **Adjacent**. |
 | `usage.speed == "fast"` cost multiplier                           | Fast-mode turns under-costed 6×. Already in `references/pricing.md` as a known limitation.                                                  |
 | `usage.inference_geo`                                             | 1.1× multiplier for US-only inference. Untracked; no non-empty values observed yet.                                                         |

@@ -202,13 +202,54 @@ def _cost(u: dict, model: str) -> float:
     # references/pricing.md § "Fast mode" for the full note.
     r = _pricing_for(model)
     tokens_5m, tokens_1h = _cache_write_split(u)
-    return (
+    primary = (
         u.get("input_tokens", 0)              * r["input"]           / 1_000_000
         + u.get("output_tokens", 0)           * r["output"]          / 1_000_000
         + u.get("cache_read_input_tokens", 0) * r["cache_read"]      / 1_000_000
         + tokens_5m                           * r["cache_write"]     / 1_000_000
         + tokens_1h                           * r["cache_write_1h"]  / 1_000_000
     )
+    # Advisor turns carry their own token counts in usage.iterations entries of
+    # type "advisor_message". These are billed at the advisor model's list rates
+    # with no prompt caching, and are NOT reflected in the top-level usage
+    # fields — so we must accumulate them separately here.
+    advisor = 0.0
+    for it in u.get("iterations", []):
+        if it.get("type") == "advisor_message":
+            adv_rates = _pricing_for(it.get("model", model))
+            advisor += (
+                it.get("input_tokens", 0)  * adv_rates["input"]  / 1_000_000
+              + it.get("output_tokens", 0) * adv_rates["output"] / 1_000_000
+            )
+    return primary + advisor
+
+
+def _advisor_info(u: dict) -> tuple[int, float, str | None, int, int]:
+    """Extract advisor metadata from usage.iterations.
+
+    Returns ``(call_count, advisor_cost_usd, advisor_model, input_tokens,
+    output_tokens)`` for all ``advisor_message`` iterations in this turn.
+    Returns all-zero/None when no advisor was called.
+    """
+    calls = 0
+    cost = 0.0
+    model: str | None = None
+    inp = 0
+    out = 0
+    for it in u.get("iterations", []):
+        if it.get("type") == "advisor_message":
+            calls += 1
+            adv_model = it.get("model") or ""
+            if adv_model and model is None:
+                model = adv_model
+            adv_rates = _pricing_for(adv_model) if adv_model else _DEFAULT_PRICING
+            cost += (
+                it.get("input_tokens", 0) * adv_rates["input"]  / 1_000_000
+              + it.get("output_tokens", 0) * adv_rates["output"] / 1_000_000
+            )
+            inp += it.get("input_tokens", 0)
+            out += it.get("output_tokens", 0)
+    return calls, cost, model, inp, out
 
 
 def _no_cache_cost(u: dict, model: str) -> float:
@@ -528,11 +569,13 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
 
 # Content-block letter codes used in the per-turn Content cell.
 _CONTENT_LETTERS = (
-    ("thinking",    "T"),
-    ("tool_use",    "u"),
-    ("text",        "x"),
-    ("tool_result", "r"),
-    ("image",       "i"),
+    ("thinking",            "T"),
+    ("tool_use",            "u"),
+    ("text",                "x"),
+    ("tool_result",         "r"),
+    ("image",               "i"),
+    ("server_tool_use",     "v"),
+    ("advisor_tool_result", "R"),
 )
 
 
@@ -545,7 +588,8 @@ def _count_content_blocks(content) -> tuple[dict[str, int], list[str]]:
     returned counts are all zero.
     """
     counts = {"thinking": 0, "tool_use": 0, "text": 0,
-              "tool_result": 0, "image": 0}
+              "tool_result": 0, "image": 0,
+              "server_tool_use": 0, "advisor_tool_result": 0}
     names: list[str] = []
     if not isinstance(content, list):
         return counts, names
@@ -555,7 +599,7 @@ def _count_content_blocks(content) -> tuple[dict[str, int], list[str]]:
         t = block.get("type", "")
         if t in counts:
             counts[t] += 1
-        if t == "tool_use":
+        if t in ("tool_use", "server_tool_use"):
             name = block.get("name")
             if isinstance(name, str) and name:
                 names.append(name)
@@ -1459,6 +1503,7 @@ def _build_turn_record(global_index: int, entry: dict,
         ttl = "mix"
     c = _cost(u, model)
     nc = _no_cache_cost(u, model)
+    adv_calls, adv_cost, adv_model, adv_inp, adv_out = _advisor_info(u)
     # Content-block distribution: assistant blocks come from this turn's own
     # message.content; tool_result / image blocks are attributed from the user
     # entry that immediately preceded this turn in the raw JSONL stream.
@@ -1467,11 +1512,13 @@ def _build_turn_record(global_index: int, entry: dict,
     assist_counts, tool_names = _count_content_blocks(assist_content)
     user_counts, _ = _count_content_blocks(user_raw)
     content_blocks = {
-        "thinking":    assist_counts["thinking"],
-        "tool_use":    assist_counts["tool_use"],
-        "text":        assist_counts["text"],
-        "tool_result": user_counts["tool_result"],
-        "image":       user_counts["image"],
+        "thinking":             assist_counts["thinking"],
+        "tool_use":             assist_counts["tool_use"],
+        "text":                 assist_counts["text"],
+        "tool_result":          user_counts["tool_result"],
+        "image":                user_counts["image"],
+        "server_tool_use":      assist_counts["server_tool_use"],
+        "advisor_tool_result":  assist_counts["advisor_tool_result"],
     }
     # Per-turn drill-down payload: the user prompt that triggered this turn,
     # the assistant's text reply, and a tool-call list with input previews.
@@ -1522,6 +1569,14 @@ def _build_turn_record(global_index: int, entry: dict,
                 bid = block.get("id")
                 if isinstance(bid, str) and bid:
                     tool_use_ids.append(bid)
+    # When advisor was called, surface it in the drawer tool list so it appears
+    # alongside Bash/Read etc. The actual advisor response is encrypted, so the
+    # preview is a fixed label.
+    if adv_calls > 0:
+        tool_detail.append({
+            "name":          "advisor",
+            "input_preview": "advisor call",
+        })
     # Subagent-type tag propagated from ``_load_session`` when the entry came
     # from a ``subagents/*.jsonl`` file. Main-session turns: empty string.
     subagent_type = str(entry.get("_subagent_type") or "")
@@ -1607,15 +1662,24 @@ def _build_turn_record(global_index: int, entry: dict,
         "attributed_subagent_tokens": 0,
         "attributed_subagent_cost":   0.0,
         "attributed_subagent_count":  0,
+        # Advisor fields (v1.25.0): populated from usage.iterations when advisor
+        # was called; all zero/None when advisor was disabled or not invoked.
+        "advisor_calls":         adv_calls,
+        "advisor_cost_usd":      adv_cost,
+        "advisor_model":         adv_model,
+        "advisor_input_tokens":  adv_inp,
+        "advisor_output_tokens": adv_out,
     }
 
 
 def _totals_from_turns(turn_records: list[dict]) -> dict:
     t = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
          "cache_write_5m": 0, "cache_write_1h": 0, "extra_1h_cost": 0.0,
-         "cost": 0.0, "no_cache_cost": 0.0, "turns": len(turn_records)}
+         "cost": 0.0, "no_cache_cost": 0.0, "turns": len(turn_records),
+         "advisor_call_count": 0, "advisor_cost_usd": 0.0}
     content_block_totals = {"thinking": 0, "tool_use": 0, "text": 0,
-                            "tool_result": 0, "image": 0}
+                            "tool_result": 0, "image": 0,
+                            "server_tool_use": 0, "advisor_tool_result": 0}
     thinking_turn_count = 0
     name_counts: dict[str, int] = {}
     for r in turn_records:
@@ -1625,8 +1689,10 @@ def _totals_from_turns(turn_records: list[dict]) -> dict:
         t["cache_write"]  += r["cache_write_tokens"]
         t["cache_write_5m"] += r.get("cache_write_5m_tokens", 0)
         t["cache_write_1h"] += r.get("cache_write_1h_tokens", 0)
-        t["cost"]         += r["cost_usd"]
-        t["no_cache_cost"] += r["no_cache_cost_usd"]
+        t["cost"]              += r["cost_usd"]
+        t["no_cache_cost"]     += r["no_cache_cost_usd"]
+        t["advisor_call_count"] += r.get("advisor_calls", 0)
+        t["advisor_cost_usd"]   += r.get("advisor_cost_usd", 0.0)
         # Extra cost paid for opting into the 1h TTL tier (vs pricing those
         # same tokens at the 5m rate). Meaningful only when cache_write_1h > 0.
         tokens_1h = r.get("cache_write_1h_tokens", 0)
@@ -3113,17 +3179,24 @@ def _build_report(
             if (first_user_epoch and last_epoch and last_epoch > first_user_epoch)
             else duration_seconds
         )
+        # advisorModel is stamped on every assistant JSONL entry when advisor
+        # is configured for the session — read it once from the first match.
+        advisor_configured_model: str | None = next(
+            (t.get("advisorModel") for t in raw_turns if t.get("advisorModel")),
+            None,
+        )
         session_dict = {
-            "session_id":         session_id,
-            "first_ts":           _fmt_ts(raw_turns[0].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
-            "last_ts":            _fmt_ts(raw_turns[-1].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
-            "duration_seconds":   duration_seconds,
-            "wall_clock_seconds": wall_clock_seconds,
-            "turns":              turn_records,
-            "subtotal":         _totals_from_turns(turn_records),
-            "models":           _model_counts(turn_records),
-            "time_of_day":      _build_time_of_day(user_ts, offset_hours=tz_offset_hours),
-            "resumes":          resumes,
+            "session_id":              session_id,
+            "first_ts":                _fmt_ts(raw_turns[0].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
+            "last_ts":                 _fmt_ts(raw_turns[-1].get("timestamp", ""), tz_offset_hours) if raw_turns else "",
+            "duration_seconds":        duration_seconds,
+            "wall_clock_seconds":      wall_clock_seconds,
+            "turns":                   turn_records,
+            "subtotal":                _totals_from_turns(turn_records),
+            "models":                  _model_counts(turn_records),
+            "time_of_day":             _build_time_of_day(user_ts, offset_hours=tz_offset_hours),
+            "resumes":                 resumes,
+            "advisor_configured_model": advisor_configured_model,
         }
         # Per-session phase-A aggregators: cache-breaks are intrinsically
         # session-scoped (a turn either breaks the cache in this session's
@@ -3524,6 +3597,13 @@ def _footer_text(totals: dict, models: dict[str, int],
             f"{totals.get('tool_call_avg_per_turn', 0.0):.1f}/turn  "
             f"(top: {top3_str})"
         )
+    if totals.get("advisor_call_count", 0) > 0:
+        _adv_n = totals["advisor_call_count"]
+        _adv_c = totals.get("advisor_cost_usd", 0.0)
+        lines.append(
+            f"Advisor calls                      : "
+            f"{_adv_n} call{'s' if _adv_n != 1 else ''}  +${_adv_c:.4f}"
+        )
     if models:
         lines.append("")
         lines.append("Models used:")
@@ -3618,7 +3698,14 @@ def render_text(report: dict) -> str:
         p()
         for i, s in enumerate(sessions, 1):
             p(wide)
-            p(f"  Session {s['session_id'][:8]}…  {s['first_ts']} → {s['last_ts']}  ({len(s['turns'])} turns)")
+            _adv_n = s["subtotal"].get("advisor_call_count", 0)
+            _adv_tag = ""
+            if _adv_n > 0:
+                _adv_c = s["subtotal"].get("advisor_cost_usd", 0.0)
+                _adv_m = s.get("advisor_configured_model") or ""
+                _adv_label = f" · {_adv_m}" if _adv_m else ""
+                _adv_tag = f"  [advisor: {_adv_n} call{'s' if _adv_n != 1 else ''}{_adv_label} · +${_adv_c:.4f}]"
+            p(f"  Session {s['session_id'][:8]}…  {s['first_ts']} → {s['last_ts']}  ({len(s['turns'])} turns){_adv_tag}")
             p(wide)
             p(hdr)
             for t in s["turns"]:
@@ -3969,6 +4056,10 @@ def render_md(report: dict) -> str:
             f"{totals.get('tool_call_avg_per_turn', 0.0):.1f}/turn "
             f"(top: {top3_str}) |"
         )
+    if totals.get("advisor_call_count", 0) > 0:
+        _adv_n = totals["advisor_call_count"]
+        _adv_c = totals.get("advisor_cost_usd", 0.0)
+        p(f"| Advisor calls | {_adv_n} call{'s' if _adv_n != 1 else ''} · +${_adv_c:.4f} |")
     p()
 
     # Usage Insights — derived from `_compute_usage_insights`. Renders only
@@ -6073,6 +6164,7 @@ tr.subtotal td{font-weight:600}
 
 /* Phase-B (v1.7.0) "+N subagents" badge on Prompts table rows. Teal contrasts with the purple slash-command badge so the two badges stay distinguishable when both render on the same row. */
 .prompts-subagent{display:inline-block;margin-left:6px;padding:1px 6px;font-size:10px;font-weight:500;letter-spacing:.04em;border-radius:4px;background:rgba(94,226,198,.14);color:#5EE2C6;border:1px solid rgba(94,226,198,.3);vertical-align:middle;cursor:help;white-space:nowrap}
+.advisor-badge{display:inline-block;margin-left:6px;padding:1px 6px;font-size:10px;font-weight:500;letter-spacing:.04em;border-radius:4px;background:rgba(251,191,36,.12);color:#FCD34D;border:1px solid rgba(251,191,36,.3);vertical-align:middle;cursor:help;white-space:nowrap}
 
 td.mode-fast{font-size:10px;font-weight:600}
 td.mode-std{font-size:10px;opacity:.55}
@@ -7081,6 +7173,18 @@ def render_html(report: dict, variant: str = "single",
         if mode != "project":
             return ""
         st = s["subtotal"]
+        _adv_n = st.get("advisor_call_count", 0)
+        _adv_badge = ""
+        if _adv_n > 0:
+            _adv_c = st.get("advisor_cost_usd", 0.0)
+            _adv_m = s.get("advisor_configured_model") or ""
+            _adv_label = f" · {html_mod.escape(_adv_m)}" if _adv_m else ""
+            _adv_badge = (
+                f'&nbsp;·&nbsp; <span class="advisor-badge" '
+                f'title="Advisor called {_adv_n} time(s) in this session '
+                f'(cost included in total above)">'
+                f'advisor{_adv_label} +${_adv_c:.4f}</span>'
+            )
         return (
             f'<tr class="session-header" data-toggle="sess-{i}" role="button">'
             f'<td colspan="{_full_cols}">'
@@ -7089,6 +7193,7 @@ def render_html(report: dict, variant: str = "single",
             f'&nbsp; {s["first_ts"]} → {s["last_ts"]}'
             f'&nbsp;·&nbsp; {len(s["turns"])} turns'
             f'&nbsp;·&nbsp; <strong>${st["cost"]:.4f}</strong>'
+            f'{_adv_badge}'
             f'</td></tr>'
         )
 
@@ -7348,6 +7453,27 @@ def render_html(report: dict, variant: str = "single",
                 f'<div class="kpi-label">Tool calls &middot; top: {top3_str}</div>'
                 f'<div class="kpi-val">{tc} · {avg:.1f}/turn</div></div>'
             )
+        advisor_card = ""
+        _adv_total = totals.get("advisor_call_count", 0)
+        if _adv_total > 0:
+            _adv_cost = totals.get("advisor_cost_usd", 0.0)
+            _adv_total_cost = totals.get("cost", 0.0)
+            # Pull configured model from first session that has it
+            _adv_cfgm = next(
+                (s.get("advisor_configured_model") for s in sessions
+                 if s.get("advisor_configured_model")),
+                None,
+            )
+            _adv_model_str = f" &middot; {html_mod.escape(_adv_cfgm)}" if _adv_cfgm else ""
+            _adv_pct = 100 * _adv_cost / _adv_total_cost if _adv_total_cost else 0.0
+            advisor_card = (
+                f'\n  <div class="kpi" title="Advisor turns are billed at the'
+                f' advisor model\'s list rates with no prompt caching. Cost is'
+                f' included in the Total cost above.">'
+                f'<div class="kpi-label">Advisor calls{_adv_model_str}</div>'
+                f'<div class="kpi-val">{_adv_total} call{"s" if _adv_total != 1 else ""}'
+                f' &middot; +${_adv_cost:.4f} ({_adv_pct:.0f}% of total)</div></div>'
+            )
         resumes_card = ""
         resumes_list = report.get("resumes") or []
         if resumes_list:
@@ -7395,7 +7521,7 @@ def render_html(report: dict, variant: str = "single",
   <div class="kpi cat-tokens"><div class="kpi-label">Input tokens (new)</div><div class="kpi-val">{totals['input']:,}</div></div>
   <div class="kpi cat-tokens"><div class="kpi-label">Output tokens</div><div class="kpi-val">{totals['output']:,}</div></div>
   <div class="kpi cat-tokens"><div class="kpi-label">Cache read tokens</div><div class="kpi-val">{totals['cache_read']:,}</div></div>
-  <div class="kpi cat-tokens"><div class="kpi-label">Cache write tokens</div><div class="kpi-val">{totals['cache_write']:,}</div></div>{ttl_mix_card}{thinking_card}{tool_calls_card}{resumes_card}{truncated_card}
+  <div class="kpi cat-tokens"><div class="kpi-label">Cache write tokens</div><div class="kpi-val">{totals['cache_write']:,}</div></div>{ttl_mix_card}{thinking_card}{tool_calls_card}{advisor_card}{resumes_card}{truncated_card}
 </div>'''
 
     # Usage Insights panel — sits between the summary cards and the
@@ -8389,11 +8515,13 @@ def _aggregate_totals(project_reports: list[dict]) -> dict:
     """Sum per-project ``totals`` dicts into one instance-wide total."""
     keys = ["input", "output", "cache_read", "cache_write",
             "cache_write_5m", "cache_write_1h", "extra_1h_cost",
-            "cost", "no_cache_cost", "turns"]
+            "cost", "no_cache_cost", "turns",
+            "advisor_call_count", "advisor_cost_usd"]
     out: dict = {k: 0 for k in keys}
     out["cost"] = 0.0
     out["no_cache_cost"] = 0.0
     out["extra_1h_cost"] = 0.0
+    out["advisor_cost_usd"] = 0.0
     content_blocks = {"thinking": 0, "tool_use": 0, "text": 0,
                       "tool_result": 0, "image": 0}
     thinking_turn_count = 0
