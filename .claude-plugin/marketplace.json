@@ -9,7 +9,7 @@
       "name": "session-metrics",
       "source": "./plugins/session-metrics",
       "description": "Per-turn token, cost, and cache metrics for Claude Code sessions. Multi-format export (text/JSON/CSV/MD/HTML) with 5-hour session blocks, weekly roll-up, hour-of-day punchcard, subagent attribution, pluggable chart libraries, and 9-category turn waste classification (stacked bar + drill-down cards: retry chains, file re-accesses, verbose edits, stop-reason). HTML timeline: idle-gap dividers, model-switch dividers, truncated-response badges, cache-break badges, Turn Character column, per-turn drawer with data-driven classification explanation. One-command --compare-run for A/B model benchmark; --compare renders IFEval pass-rate + shareable HTML.",
-      "version": "1.23.0",
+      "version": "1.24.0",
       "homepage": "https://github.com/centminmod/claude-plugins/tree/master/plugins/session-metrics",
       "author": {
         "name": "George Liu"

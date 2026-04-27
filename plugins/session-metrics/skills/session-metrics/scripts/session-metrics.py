@@ -1878,65 +1878,156 @@ def _detect_retry_chains(turns: list[dict], threshold: float = 0.80) -> dict:
     }
 
 
+def _assign_context_segments(turns: list[dict]) -> None:
+    """Annotate each turn with ``_ctx_seg`` (int).
+
+    A new segment starts when the model changes between consecutive real turns
+    or when a resume marker is encountered. Resume markers themselves get the
+    segment ID of the gap (not counted in file-reaccess logic since they are
+    skipped there anyway).
+
+    This is used by ``_detect_file_reaccesses`` to distinguish avoidable
+    same-context re-reads (risk) from expected cross-context re-reads (e.g.
+    a subagent spawned with a fresh context, or a resumed session).
+    """
+    seg = 0
+    prev_model: str | None = None
+    for t in turns:
+        if t.get("is_resume_marker"):
+            seg += 1
+            t["_ctx_seg"] = seg
+            prev_model = None
+            continue
+        mdl = t.get("model", "")
+        if prev_model is not None and mdl != prev_model:
+            seg += 1
+        t["_ctx_seg"] = seg
+        prev_model = mdl
+
+
 def _detect_file_reaccesses(turns: list[dict]) -> dict:
     """Identify files accessed 2+ times across the provided turn list.
 
     For Read/Edit/Write tools, input_preview IS the file path (produced by
-    _summarise_tool_input). For Bash, a regex extracts path-like substrings.
-    Returns a _turn_to_paths mapping for O(1) per-turn classification; callers
-    must strip this key before JSON serialisation.
+    _summarise_tool_input). For Bash, a regex extracts path-like substrings
+    with a known-extension allowlist (prevents hidden dirs like ``.claude``
+    from being matched as files).
+
+    Uses ``_ctx_seg`` annotations (set by ``_assign_context_segments``) to
+    distinguish two re-access kinds:
+
+    - **Same-segment**: the same context reads a file 2+ times → avoidable,
+      flagged as risk in ``_turn_to_paths``.
+    - **Cross-segment only**: a file accessed in different model-context
+      segments (subagent boundary or session resume) → expected, not risk,
+      in ``_turn_to_paths_ctx``.
+
+    Callers must strip ``_turn_to_paths`` and ``_turn_to_paths_ctx`` before
+    JSON serialisation.
     """
     import re as _re
-    from collections import Counter, defaultdict
-    _BASH_PATH_RE = _re.compile(r"(?:\.{0,2}/[\w.\-/]+\.\w+|~/[\w.\-/]+)")
+    from collections import defaultdict
+    _EXT_GROUP = (
+        r"py|js|ts|mjs|jsx|tsx|json|yaml|yml|toml|sh|bash|zsh|txt|csv|md|"
+        r"html|htm|css|scss|rs|go|rb|php|java|c|cpp|h|sql|xml|cfg|conf|log|"
+        r"ini|env|lock"
+    )
+    # (?!\w) prevents matching .c inside .claude, .go inside .golang, etc.
+    _BASH_PATH_RE = _re.compile(
+        r"(?:\.{0,2}/[\w.\-/]+\.(?:" + _EXT_GROUP + r")(?!\w)"
+        r"|~/[\w.\-/]+\.(?:py|js|ts|json|yaml|yml|md|sh|txt)(?!\w))"
+    )
+    # For Read/Edit/Write, filter out directory paths (no extension = not a file)
+    _READ_EXT_RE = _re.compile(r"\.(?:" + _EXT_GROUP + r")$")
 
-    access_count: Counter = Counter()
-    access_turns: dict[str, list[int]] = defaultdict(list)
+    # (path, seg) → list of turn indices that accessed path in that segment
+    seg_turns: dict[tuple[str, int], list[int]] = defaultdict(list)
+    # path → set of segments that touched it
+    path_segs: dict[str, set[int]] = defaultdict(set)
 
     for t in turns:
         if t.get("is_resume_marker"):
             continue
         idx = t.get("index", -1)
+        seg = t.get("_ctx_seg", 0)
         for tool in t.get("tool_use_detail", []):
             name    = tool.get("name", "")
             preview = tool.get("input_preview", "")
-            if name in ("Read", "Edit", "Write") and preview:
-                access_count[preview] += 1
-                access_turns[preview].append(idx)
+            if name in ("Read", "Edit", "Write") and preview and _READ_EXT_RE.search(preview):
+                seg_turns[(preview, seg)].append(idx)
+                path_segs[preview].add(seg)
             elif name == "Bash":
                 for path in _BASH_PATH_RE.findall(preview):
-                    access_count[path] += 1
-                    access_turns[path].append(idx)
+                    seg_turns[(path, seg)].append(idx)
+                    path_segs[path].add(seg)
 
-    reaccessed = {p: c for p, c in access_count.items() if c >= 2}
+    # Classify paths into same-segment re-reads (risk) vs cross-only (expected)
+    same_seg_paths: set[str] = set()
+    cross_only_paths: set[str] = set()
+    for path, segs in path_segs.items():
+        # Does any single segment have 2+ accesses?
+        has_same_seg = any(len(seg_turns[(path, s)]) >= 2 for s in segs)
+        total_accesses = sum(len(seg_turns[(path, s)]) for s in segs)
+        if total_accesses < 2:
+            continue
+        if has_same_seg:
+            same_seg_paths.add(path)
+        else:
+            cross_only_paths.add(path)
+
+    # Build per-turn path lookup dicts.
+    # Only RE-reads are flagged (skip the first access in each segment).
     turn_to_paths: dict[int, set[str]] = defaultdict(set)
-    for path, indices in access_turns.items():
-        if path in reaccessed:
-            for idx in indices:
+    for path in same_seg_paths:
+        for seg in path_segs[path]:
+            # Sort so the chronologically first turn in this segment is skipped
+            for idx in sorted(seg_turns[(path, seg)])[1:]:
                 turn_to_paths[idx].add(path)
+
+    # For cross-context paths, skip the earliest segment (the original read);
+    # flag only the later-segment accesses as informational re-reads.
+    turn_to_paths_ctx: dict[int, set[str]] = defaultdict(set)
+    for path in cross_only_paths:
+        min_seg = min(path_segs[path])
+        for seg in path_segs[path]:
+            if seg == min_seg:
+                continue  # original read; not a re-read
+            for idx in seg_turns[(path, seg)]:
+                if idx not in turn_to_paths:
+                    turn_to_paths_ctx[idx].add(path)
+
+    all_reaccessed = same_seg_paths | cross_only_paths
+    # Flatten all turn indices per path for cost/detail purposes
+    all_path_turns: dict[str, list[int]] = {
+        p: [i for s in path_segs[p] for i in seg_turns[(p, s)]]
+        for p in all_reaccessed
+    }
+    turn_idx_set: dict[str, set[int]] = {p: set(v) for p, v in all_path_turns.items()}
 
     details = sorted(
         [
             {
                 "path":       p,
-                "count":      reaccessed[p],
-                "first_turn": min(access_turns[p]),
+                "count":      len(all_path_turns[p]),
+                "first_turn": min(all_path_turns[p]),
+                "cross_ctx":  p in cross_only_paths,
                 "cost_usd":   sum(
                     t.get("cost_usd", 0.0) for t in turns
-                    if t.get("index") in set(access_turns[p])
+                    if t.get("index") in turn_idx_set[p]
                 ),
             }
-            for p in reaccessed
+            for p in all_reaccessed
         ],
         key=lambda x: x["count"],
         reverse=True,
     )[:10]
 
     return {
-        "reaccessed_count":      len(reaccessed),
+        "reaccessed_count":      len(all_reaccessed),
         "details":               details,
         "total_reaccess_cost":   sum(d["cost_usd"] for d in details),
-        "_turn_to_paths":        dict(turn_to_paths),   # internal; strip before export
+        "_turn_to_paths":        dict(turn_to_paths),      # risk; strip before export
+        "_turn_to_paths_ctx":    dict(turn_to_paths_ctx),  # expected; strip before export
     }
 
 
@@ -2020,6 +2111,9 @@ def _build_waste_analysis(sessions: list[dict]) -> dict:
 
     all_turns = [t for s in sessions for t in s.get("turns", [])]
 
+    # Annotate context segments before detection (model-switch = new context)
+    _assign_context_segments(all_turns)
+
     # Retry: per-session to avoid cross-session false matches
     all_chains: list[dict] = []
     for s in sessions:
@@ -2039,9 +2133,10 @@ def _build_waste_analysis(sessions: list[dict]) -> dict:
     verbose_result  = _detect_verbose_edits(all_turns)
 
     # Build O(1) lookup sets for classifier
-    retry_idx    = {i for c in retry_result["chains"]           for i in c["turn_indices"]}
-    reaccess_idx = set(reaccess_result["_turn_to_paths"].keys())
-    verbose_idx  = {v["turn_index"] for v in verbose_result["details"]}
+    retry_idx           = {i for c in retry_result["chains"] for i in c["turn_indices"]}
+    reaccess_idx        = set(reaccess_result["_turn_to_paths"].keys())
+    cross_ctx_reaccess_idx = set(reaccess_result["_turn_to_paths_ctx"].keys())
+    verbose_idx         = {v["turn_index"] for v in verbose_result["details"]}
 
     # Classify and annotate every turn in place
     distribution: Counter = Counter()
@@ -2050,18 +2145,28 @@ def _build_waste_analysis(sessions: list[dict]) -> dict:
             t["turn_character"]       = "productive"
             t["turn_character_label"] = _TURN_CHARACTER_LABELS["productive"]
             t["turn_risk"]            = False
+            t["reread_cross_ctx"]     = False
             continue
+        idx  = t.get("index", -1)
         char = _classify_turn(t, retry_idx, reaccess_idx, verbose_idx)
+        # Cross-context re-reads: same classification, but not a risk signal
+        if char != "file_reread" and idx in cross_ctx_reaccess_idx:
+            char = "file_reread"
+        cross_ctx = idx in cross_ctx_reaccess_idx and idx not in reaccess_idx
         t["turn_character"]       = char
         t["turn_character_label"] = _TURN_CHARACTER_LABELS[char]
-        t["turn_risk"]            = char in _RISK_CATEGORIES
+        t["turn_risk"]            = char in _RISK_CATEGORIES and not cross_ctx
+        t["reread_cross_ctx"]     = cross_ctx
         if char == "file_reread":
+            paths_map = (reaccess_result["_turn_to_paths_ctx"]
+                         if cross_ctx else reaccess_result["_turn_to_paths"])
             t["reaccessed_paths"] = sorted(
-                reaccess_result["_turn_to_paths"].get(t.get("index", -1), set())
+                paths_map.get(idx, set())
             )
         distribution[char] += 1
 
-    reaccess_out = {k: v for k, v in reaccess_result.items() if k != "_turn_to_paths"}
+    _STRIP = {"_turn_to_paths", "_turn_to_paths_ctx"}
+    reaccess_out = {k: v for k, v in reaccess_result.items() if k not in _STRIP}
 
     return {
         "stop_reasons":    stop_reasons,
@@ -7405,6 +7510,7 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                     "wcl":   t.get("turn_character_label", "Productive"),
                     "risk":  t.get("turn_risk", False),
                     "wcp":   t.get("reaccessed_paths", []),
+                    "wcctx": t.get("reread_cross_ctx", False),
                 }
                 chartrail_data.append({
                     "n":    t["index"],
@@ -7765,10 +7871,22 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
       } else if (wc === 'cache_write') {
         ex = 'Wrote ' + cwAmt.toLocaleString() + ' tokens to the prompt cache. Large cache payloads create checkpoints that reduce cost for subsequent turns.';
       } else if (wc === 'file_reread') {
+        var crossCtx = !!t.wcctx;
         var shortPaths = paths.slice(0, 4).map(function (p) { return p.split('/').pop(); });
-        ex = 'Re-read file(s) already accessed earlier in this session.' +
-          (shortPaths.length ? ' Files: ' + shortPaths.join(', ') + (paths.length > 4 ? ' +' + (paths.length - 4) + ' more' : '') + '.' : '') +
-          ' Repeated reads waste input tokens when the content is already in context.';
+        var fileList = shortPaths.length
+          ? ' Files: ' + shortPaths.join(', ') + (paths.length > 4 ? ' +' + (paths.length - 4) + ' more.' : '.')
+          : '';
+        if (crossCtx) {
+          ex = 'Re-read in a new context (model or session changed).' + fileList
+            + ' When a subagent or resumed session starts fresh, accessing the files it needs'
+            + ' is expected and unavoidable. To reduce cost: use offset/limit on large-file'
+            + ' Read calls to fetch only the relevant section, or pass key excerpts as part'
+            + ' of the task prompt.';
+        } else {
+          ex = 'Re-read a file already accessed earlier in this context.' + fileList
+            + ' Consider Grep to find specific content, or Read with offset/limit to avoid'
+            + ' re-fetching the full file.';
+        }
       } else if (wc === 'oververbose_edit') {
         ex = 'Edit turn with ' + outAmt.toLocaleString() + ' output tokens (threshold: 800). High output on an Edit turn may indicate over-explanation or unnecessary context repetition.';
       } else if (wc === 'retry_error') {
