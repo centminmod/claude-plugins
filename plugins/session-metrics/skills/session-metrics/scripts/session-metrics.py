@@ -7741,6 +7741,10 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
         <dt>Output</dt><dd data-slot="tok-output"></dd>
         <dt>Cache read</dt><dd data-slot="tok-cache-read"></dd>
         <dt>Cache write</dt><dd data-slot="tok-cache-write"></dd>
+        <dt data-slot="tok-adv-input-dt" hidden>Advisor input</dt>
+        <dd data-slot="tok-adv-input" hidden></dd>
+        <dt data-slot="tok-adv-output-dt" hidden>Advisor output</dt>
+        <dd data-slot="tok-adv-output" hidden></dd>
       </dl>
     </div>
     <div class="drawer-sec">
@@ -7961,6 +7965,19 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
     var cw = formatNum(t.cw);
     if (t.cwt) cw += '  (' + t.cwt + ')';
     setText('tok-cache-write', cw);
+    var advInpDt = sel('tok-adv-input-dt'), advInpDd = sel('tok-adv-input');
+    var advOutDt = sel('tok-adv-output-dt'), advOutDd = sel('tok-adv-output');
+    if ((t.adv_inp || 0) > 0 || (t.adv_out || 0) > 0) {
+      if (advInpDt) advInpDt.hidden = false;
+      if (advInpDd) { advInpDd.hidden = false; advInpDd.textContent = formatNum(t.adv_inp || 0); }
+      if (advOutDt) advOutDt.hidden = false;
+      if (advOutDd) { advOutDd.hidden = false; advOutDd.textContent = formatNum(t.adv_out || 0); }
+    } else {
+      if (advInpDt) advInpDt.hidden = true;
+      if (advInpDd) advInpDd.hidden = true;
+      if (advOutDt) advOutDt.hidden = true;
+      if (advOutDd) advOutDd.hidden = true;
+    }
     var advCost = t.adv_cost || 0;
     var primaryDt = sel('cost-primary-dt'), primaryDd = sel('cost-primary');
     var advDt = sel('cost-advisor-dt'), advDd = sel('cost-advisor');
