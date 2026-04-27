@@ -439,7 +439,13 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
                     if isinstance(_blk, dict) and "local-command-caveat" in (_blk.get("text") or ""):
                         _local_cmd_group_active = True
                         break
-            if not _local_cmd_group_active:
+            # Compaction summaries start with this sentinel. They contain quoted
+            # transcript text (including <command-name> tags) that must not be
+            # mistaken for a new slash-command invocation.
+            _is_compaction_entry = _raw_str.startswith(
+                "This session is being continued from a previous conversation"
+            )
+            if not _local_cmd_group_active and not _is_compaction_entry:
                 candidate_slash = _extract_slash_command("", last_user_content)
                 if candidate_slash:
                     last_user_slash_cmd = candidate_slash
@@ -1472,8 +1478,14 @@ def _build_turn_record(global_index: int, entry: dict,
     # All three feed the HTML detail drawer + Prompts section. Resume-marker
     # turns keep empty strings here — the drawer excludes them anyway.
     prompt_text = _extract_user_prompt_text(user_raw)
-    slash_cmd   = (_extract_slash_command(prompt_text, user_raw)
-                   or entry.get("_preceding_user_slash_cmd", ""))
+    _raw_user_str = user_raw if isinstance(user_raw, str) else ""
+    _user_is_compaction = _raw_user_str.startswith(
+        "This session is being continued from a previous conversation"
+    )
+    slash_cmd   = (
+        (not _user_is_compaction and _extract_slash_command(prompt_text, user_raw))
+        or entry.get("_preceding_user_slash_cmd", "")
+    )
     asst_text   = _extract_assistant_text(assist_content)
     tool_detail: list[dict] = []
     # Phase-A additions (v1.6.0): cross-turn signals for the skill/subagent-type
