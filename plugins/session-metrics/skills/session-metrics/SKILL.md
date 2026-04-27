@@ -51,11 +51,21 @@ answer them by running the default report on the current session and
 suggesting `/session-metrics compare-prep` if the user wants a real
 benchmark.
 
+## Pre-flight context
+
+The following values are injected by Claude Code when this skill loads — Claude sees the rendered output, not the commands.
+
+```!
+printf "uv:    "; command -v uv >/dev/null 2>&1 && uv --version || echo "NOT FOUND — install: pip install uv"
+printf "script: "; test -f "${CLAUDE_SKILL_DIR}/scripts/session-metrics.py" && echo "ok" || echo "MISSING"
+printf "jsonl:  "; f="$HOME/.claude/projects/$(echo "$PWD" | sed 's|/|-|g; s|^-||')/${CLAUDE_SESSION_ID}.jsonl"; [ -f "$f" ] && echo "$f" || echo "not found for this session/project"
+```
+
 ## Quick usage
 
 ```bash
-# Current session (auto-detected from cwd)
-uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py
+# Current session (pinned to session ID — no heuristic)
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --session ${CLAUDE_SESSION_ID}
 
 # Specific session ID
 uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --session <uuid>
