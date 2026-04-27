@@ -45,7 +45,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Bump when the parsed-entries shape changes — invalidates old parse caches.
-_SCRIPT_VERSION = "1.0-rc.4"
+_SCRIPT_VERSION = "1.0-rc.5"
 
 # ---------------------------------------------------------------------------
 # Pricing table  (USD per million tokens)
@@ -1562,6 +1562,7 @@ def _build_turn_record(global_index: int, entry: dict,
                     latency_seconds = round(_gap, 3)
             except (ValueError, AttributeError, TypeError, OSError):
                 latency_seconds = None
+    stop_reason: str = msg.get("stop_reason") or ""
     return {
         "index":                  global_index,
         "timestamp":              entry.get("timestamp", ""),
@@ -1579,6 +1580,8 @@ def _build_turn_record(global_index: int, entry: dict,
         "cost_usd":               c,
         "no_cache_cost_usd":      nc,
         "speed":                  u.get("speed", ""),
+        "stop_reason":            stop_reason,
+        "is_cache_break":         False,
         "content_blocks":         content_blocks,
         "tool_use_names":         tool_names,
         "is_resume_marker":       bool(entry.get("_is_resume_marker", False)),
@@ -1742,6 +1745,7 @@ def _detect_cache_breaks(session: dict,
         uncached = int(t.get("input_tokens", 0)) + int(t.get("cache_write_tokens", 0))
         if uncached <= threshold:
             continue
+        t["is_cache_break"] = True   # mutate in-place; used by HTML inline badge
         total = int(t.get("total_tokens", 0))
         pct = (100.0 * uncached / total) if total else 0.0
         # Locate this turn's position in the prompt stream — match by
@@ -3317,7 +3321,8 @@ def render_csv(report: dict) -> str:
                 # column count is stable across reports; values are 0 on
                 # turns that didn't spawn a subagent (the common case).
                 "attributed_subagent_tokens", "attributed_subagent_cost",
-                "attributed_subagent_count"])
+                "attributed_subagent_count",
+                "stop_reason", "is_cache_break"])
     for s in report["sessions"]:
         for t in s["turns"]:
             cb = t.get("content_blocks") or {}
@@ -3337,6 +3342,8 @@ def render_csv(report: dict) -> str:
                 t.get("attributed_subagent_tokens", 0),
                 f"{float(t.get('attributed_subagent_cost', 0.0)):.6f}",
                 t.get("attributed_subagent_count", 0),
+                t.get("stop_reason", ""),
+                t.get("is_cache_break", False),
             ])
 
     # Time-of-day summary section
@@ -5411,6 +5418,22 @@ tr.resume-marker-row td.resume-marker-cell{text-align:center;font-size:12px;opac
 .resume-marker-pill.terminal{background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.4)}
 .resume-marker-pill.terminal strong,.resume-marker-pill.terminal .resume-marker-icon{color:#FBBF24}
 
+/* Idle-gap dividers */
+tr.idle-gap-row td{padding:4px 10px;border-top:1px solid rgba(255,255,255,.06);border-bottom:1px solid rgba(255,255,255,.06)}
+.idle-gap-cell{text-align:center;font-size:11px;opacity:.6}
+.idle-gap-pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:10px;background:rgba(100,116,139,.12);border:1px solid rgba(100,116,139,.25);color:#94a3b8;font-variant-numeric:tabular-nums}
+
+/* Model-switch dividers */
+tr.model-switch-row td{padding:4px 10px;border-top:1px solid rgba(255,255,255,.06);border-bottom:1px solid rgba(255,255,255,.06)}
+.model-switch-cell{text-align:center;font-size:11px;opacity:.65}
+.model-switch-pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:10px;background:rgba(6,182,212,.08);border:1px solid rgba(6,182,212,.22);color:#67e8f9;font-variant-numeric:tabular-nums}
+
+/* Truncated-response badge */
+.truncated-tag{display:inline-block;font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(251,146,60,.18);color:#fb923c;margin-left:5px;white-space:nowrap;vertical-align:middle;letter-spacing:.02em}
+
+/* Cache-break inline badge */
+.cache-break-tag{display:inline-block;font-size:10px;padding:0 4px;border-radius:3px;background:rgba(251,191,36,.15);color:#fbbf24;margin-left:4px;white-space:nowrap;vertical-align:middle;cursor:help}
+
 tr.turn-row{cursor:pointer}
 tr.turn-row:focus{outline:1px solid var(--accent);outline-offset:-1px}
 
@@ -6158,7 +6181,8 @@ def _daily_cost_rail_script() -> str:
 
 def render_html(report: dict, variant: str = "single",
                 nav_sibling: str | None = None,
-                chart_lib: str = "highcharts") -> str:
+                chart_lib: str = "highcharts",
+                idle_gap_minutes: int = 10) -> str:
     """Render the full report as a dark-themed HTML page with interactive charts.
 
     ``variant`` picks the page layout:
@@ -6239,15 +6263,20 @@ def render_html(report: dict, variant: str = "single",
     _label_span = 4 if show_mode else 3
 
     def _cwr_cell(tokens: int, tokens_5m: int, tokens_1h: int,
-                  ttl: str, bold: bool = False) -> str:
+                  ttl: str, bold: bool = False,
+                  is_cache_break: bool = False) -> str:
         num = f"{tokens:,}"
         inner = f"<strong>{num}</strong>" if bold else num
+        cb_badge = (
+            ' <span class="cache-break-tag"'
+            ' title="Cache break — high uncached token spend on this turn">&#9889;</span>'
+        ) if is_cache_break else ""
         if ttl in ("1h", "mix"):
             cls = "ttl-1h" if ttl == "1h" else "ttl-mix"
             title = f"5m: {tokens_5m:,} · 1h: {tokens_1h:,} tokens"
             badge = f'<span class="badge-ttl {cls}" title="{title}">{ttl}</span>'
-            return f'<td class="num" title="{title}">{inner}{badge}</td>'
-        return f'<td class="num">{inner}</td>'
+            return f'<td class="num" title="{title}">{inner}{badge}{cb_badge}</td>'
+        return f'<td class="num">{inner}{cb_badge}</td>'
 
     def _content_cell(cb: dict) -> str:
         label = _fmt_content_cell(cb)
@@ -6308,6 +6337,7 @@ def render_html(report: dict, variant: str = "single",
             t.get("cache_write_5m_tokens", 0),
             t.get("cache_write_1h_tokens", 0),
             t.get("cache_write_ttl", ""),
+            is_cache_break=t.get("is_cache_break", False),
         )
         content_td = (_content_cell(t.get("content_blocks") or {})
                       if show_content else "")
@@ -6323,12 +6353,16 @@ def render_html(report: dict, variant: str = "single",
             f' <span class="skill-tag" title="skill: {html_mod.escape(_skill_label)}">'
             f'{html_mod.escape(_skill_label)}</span>'
         ) if _skill_label else ""
+        _truncated_badge = (
+            ' <span class="truncated-tag"'
+            ' title="stop_reason: max_tokens — response was cut off">&#9986; truncated</span>'
+        ) if t.get("stop_reason") == "max_tokens" else ""
         return (
             f'<tr id="turn-{turn_key}" class="turn-row" data-session="{session_id[:8]}"'
             f' data-turn-id="{turn_key}" role="button" tabindex="0">'
             f'<td class="num">{t["index"]}</td>'
             f'<td class="ts">{t["timestamp_fmt"]}</td>'
-            f'<td class="model">{html_mod.escape(t["model"])}{_skill_badge}</td>'
+            f'<td class="model">{html_mod.escape(t["model"])}{_skill_badge}{_truncated_badge}</td>'
             f'{mode_td}'
             f'<td class="num">{t["input_tokens"]:,}</td>'
             f'<td class="num">{t["output_tokens"]:,}</td>'
@@ -6380,14 +6414,69 @@ def render_html(report: dict, variant: str = "single",
             f'</tr>'
         )
 
+    def _idle_gap_row(gap_s: float) -> str:
+        mins = int(gap_s // 60)
+        if mins < 120:
+            label = f"{mins} min idle"
+        else:
+            h, m = divmod(mins, 60)
+            label = f"{h}h {m}m idle" if m else f"{h}h idle"
+        return (
+            f'<tr class="idle-gap-row">'
+            f'<td colspan="{_full_cols}" class="idle-gap-cell">'
+            f'<span class="idle-gap-pill">&#9646; {label}</span>'
+            f'</td></tr>'
+        )
+
+    def _model_switch_row(prev: str, cur: str) -> str:
+        def _short(m: str) -> str:
+            return m.removeprefix("claude-")
+        return (
+            f'<tr class="model-switch-row">'
+            f'<td colspan="{_full_cols}" class="model-switch-cell">'
+            f'<span class="model-switch-pill">'
+            f'&#8644; Model: {html_mod.escape(_short(prev))}'
+            f' &rarr; {html_mod.escape(_short(cur))}'
+            f'</span></td></tr>'
+        )
+
     table_rows: list[str] = []
     model_rows = ""
     if include_chart:
+        _idle_gap_s = (idle_gap_minutes * 60) if idle_gap_minutes > 0 else None
         for i, s in enumerate(sessions, 1):
             if mode == "project":
                 table_rows.append(session_header(i, s))
                 table_rows.append(f'<tbody class="session-body" id="sess-{i}" style="display:none">')
+            _prev_ts: str | None = None
+            _prev_model: str | None = None
+            _prev_was_resume = False
             for t in s["turns"]:
+                if not t.get("is_resume_marker"):
+                    t_ts    = t.get("timestamp", "")
+                    t_model = t.get("model", "")
+                    # Idle gap divider
+                    if _idle_gap_s and not _prev_was_resume and _prev_ts and t_ts:
+                        prev_dt = _parse_iso_dt(_prev_ts)
+                        cur_dt  = _parse_iso_dt(t_ts)
+                        if prev_dt and cur_dt:
+                            gap = (cur_dt - prev_dt).total_seconds()
+                            if gap >= _idle_gap_s:
+                                table_rows.append(_idle_gap_row(gap))
+                    # Model switch divider
+                    if (_prev_model is not None
+                            and not _prev_was_resume
+                            and t_model != _prev_model):
+                        table_rows.append(_model_switch_row(_prev_model, t_model))
+                    _prev_ts    = t_ts
+                    _prev_model = t_model
+                    _prev_was_resume = False
+                else:
+                    # Resume marker: update _prev_ts so the post-resume gap is not
+                    # measured from before the resume. Do NOT update _prev_model —
+                    # the synthetic "<synthetic>" model must not trigger a switch row.
+                    _prev_ts = t.get("timestamp", "") or _prev_ts
+                    _prev_was_resume = True
                 table_rows.append(turn_row(t, s["session_id"]))
             if mode == "project":
                 table_rows.append(subtotal_row(f"S{i:02} subtotal", s["subtotal"]))
@@ -6574,6 +6663,18 @@ def render_html(report: dict, variant: str = "single",
                 f'</div>'
                 f'<div class="kpi-val">&#8634; {n_resumes} detected</div></div>'
             )
+        _n_trunc = sum(
+            1 for s in sessions
+            for t in s.get("turns", [])
+            if t.get("stop_reason") == "max_tokens"
+        )
+        truncated_card = (
+            f'\n  <div class="kpi" title="Turns where Claude hit the output token'
+            f' limit (stop_reason=max_tokens). These responses are incomplete.">'
+            f'<div class="kpi-label">Truncated (max_tokens)</div>'
+            f'<div class="kpi-val">&#9986; {_n_trunc} turn{"s" if _n_trunc != 1 else ""}</div>'
+            f'</div>'
+        ) if _n_trunc > 0 else ""
         summary_cards_html = f'''\
 <div class="kpi-grid">
   <div class="kpi featured cat-tokens"><div class="kpi-label">Total cost (USD)</div><div class="kpi-val">${totals['cost']:.4f}</div></div>
@@ -6583,7 +6684,7 @@ def render_html(report: dict, variant: str = "single",
   <div class="kpi cat-tokens"><div class="kpi-label">Input tokens (new)</div><div class="kpi-val">{totals['input']:,}</div></div>
   <div class="kpi cat-tokens"><div class="kpi-label">Output tokens</div><div class="kpi-val">{totals['output']:,}</div></div>
   <div class="kpi cat-tokens"><div class="kpi-label">Cache read tokens</div><div class="kpi-val">{totals['cache_read']:,}</div></div>
-  <div class="kpi cat-tokens"><div class="kpi-label">Cache write tokens</div><div class="kpi-val">{totals['cache_write']:,}</div></div>{ttl_mix_card}{thinking_card}{tool_calls_card}{resumes_card}
+  <div class="kpi cat-tokens"><div class="kpi-label">Cache write tokens</div><div class="kpi-val">{totals['cache_write']:,}</div></div>{ttl_mix_card}{thinking_card}{tool_calls_card}{resumes_card}{truncated_card}
 </div>'''
 
     # Usage Insights panel — sits between the summary cards and the
@@ -6687,6 +6788,7 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                     "si":    t.get("skill_invocations") or [],
                     "asnip": t.get("assistant_snippet", ""),
                     "atxt":  t.get("assistant_text", ""),
+                    "sr":    t.get("stop_reason", ""),
                 }
                 chartrail_data.append({
                     "n":    t["index"],
@@ -6755,6 +6857,8 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
         <dd data-slot="slash-wrap" hidden><code data-slot="slash"></code></dd>
         <dt data-slot="skill-wrap-dt" hidden>Skill</dt>
         <dd data-slot="skill-wrap" hidden><code data-slot="skill-name"></code></dd>
+        <dt data-slot="sr-wrap-dt" hidden>Stop reason</dt>
+        <dd data-slot="sr-wrap" hidden><code data-slot="sr-val"></code></dd>
       </dl>
     </div>
     <div class="drawer-sec">
@@ -6923,6 +7027,18 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
     } else {
       if (skillWrap) skillWrap.hidden = true;
       if (skillWrapDt) skillWrapDt.hidden = true;
+    }
+    var srWrap = sel('sr-wrap');
+    var srWrapDt = sel('sr-wrap-dt');
+    var srValEl = sel('sr-val');
+    var sr = t.sr || '';
+    if (sr && sr !== 'end_turn') {
+      if (srValEl) srValEl.textContent = sr;
+      if (srWrap) srWrap.hidden = false;
+      if (srWrapDt) srWrapDt.hidden = false;
+    } else {
+      if (srWrap) srWrap.hidden = true;
+      if (srWrapDt) srWrapDt.hidden = true;
     }
 
     var snip = t.ps || '(no prompt captured)';
@@ -7290,6 +7406,7 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
                          single_page: bool = False,
                          use_cache: bool = True,
                          chart_lib: str = "highcharts",
+                         idle_gap_minutes: int = 10,
                          suppress_model_compare_insight: bool = False,
                          cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
                          subagent_attribution: bool = True,
@@ -7317,7 +7434,8 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
         sort_prompts_by=sort_prompts_by,
         include_subagents=include_subagents,
     )
-    _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib)
+    _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib,
+              idle_gap_minutes=idle_gap_minutes)
 
 
 def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
@@ -7326,6 +7444,7 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
                       single_page: bool = False,
                       use_cache: bool = True,
                       chart_lib: str = "highcharts",
+                      idle_gap_minutes: int = 10,
                       suppress_model_compare_insight: bool = False,
                       cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
                       subagent_attribution: bool = True,
@@ -7360,7 +7479,8 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
         sort_prompts_by=sort_prompts_by,
         include_subagents=include_subagents,
     )
-    _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib)
+    _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib,
+              idle_gap_minutes=idle_gap_minutes)
 
 
 # === instance mode: begin ===================================================
@@ -7748,6 +7868,7 @@ def _run_all_projects(formats: list[str],
                       single_page: bool = False,
                       use_cache: bool = True,
                       chart_lib: str = "highcharts",
+                      idle_gap_minutes: int = 10,
                       include_subagents: bool = False,
                       drilldown: bool = True,
                       suppress_model_compare_insight: bool = False,
@@ -7835,6 +7956,7 @@ def _run_all_projects(formats: list[str],
     _ = single_page
     _dispatch_instance(instance_report, project_reports, formats,
                         chart_lib=chart_lib,
+                        idle_gap_minutes=idle_gap_minutes,
                         drilldown=drilldown)
 
 
@@ -7849,6 +7971,7 @@ def _dispatch_instance(instance_report: dict,
                         project_reports: list[dict],
                         formats: list[str],
                         chart_lib: str = "highcharts",
+                        idle_gap_minutes: int = 10,
                         drilldown: bool = True) -> None:
     """Write all instance exports (and, optionally, per-project drilldown
     HTMLs) into a dated subfolder so successive runs don't overwrite each
@@ -7877,7 +8000,8 @@ def _dispatch_instance(instance_report: dict,
             instance_report_for_html["_drilldown_slugs"] = \
                 {pr["slug"] for pr in project_reports} if drilldown else set()
             content = render_html(instance_report_for_html, variant="single",
-                                   chart_lib=chart_lib)
+                                   chart_lib=chart_lib,
+                                   idle_gap_minutes=idle_gap_minutes)
         else:
             content = _RENDERERS[fmt](instance_report)
         out = root / f"index.{_EXTENSIONS[fmt]}"
@@ -7894,10 +8018,12 @@ def _dispatch_instance(instance_report: dict,
             try:
                 dash_html = render_html(pr, variant="dashboard",
                                          nav_sibling=f"{slug}_detail.html",
-                                         chart_lib=chart_lib)
+                                         chart_lib=chart_lib,
+                                         idle_gap_minutes=idle_gap_minutes)
                 det_html  = render_html(pr, variant="detail",
                                          nav_sibling=f"{slug}_dashboard.html",
-                                         chart_lib=chart_lib)
+                                         chart_lib=chart_lib,
+                                         idle_gap_minutes=idle_gap_minutes)
             except (ValueError, KeyError, RuntimeError) as exc:
                 print(f"[warn] {slug}: HTML render failed ({exc})",
                       file=sys.stderr)
@@ -8448,6 +8574,7 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
 def _dispatch(report: dict, formats: list[str],
                single_page: bool = False,
                chart_lib: str = "highcharts",
+               idle_gap_minutes: int = 10,
                redact_user_prompts: bool = False) -> None:
     # Always render text to stdout
     print(render_text(report))
@@ -8480,9 +8607,11 @@ def _dispatch(report: dict, formats: list[str],
             dashboard_name = f"{stem}_dashboard.html"
             detail_name    = f"{stem}_detail.html"
             dash = render_html(report, variant="dashboard",
-                                nav_sibling=detail_name, chart_lib=chart_lib)
+                                nav_sibling=detail_name, chart_lib=chart_lib,
+                                idle_gap_minutes=idle_gap_minutes)
             det  = render_html(report, variant="detail",
-                                nav_sibling=dashboard_name, chart_lib=chart_lib)
+                                nav_sibling=dashboard_name, chart_lib=chart_lib,
+                                idle_gap_minutes=idle_gap_minutes)
             p1   = _export_dir() / dashboard_name
             p2   = _export_dir() / detail_name
             _export_dir().mkdir(parents=True, exist_ok=True)
@@ -8492,7 +8621,8 @@ def _dispatch(report: dict, formats: list[str],
             print(f"[export] HTML (detail)    → {p2}", file=sys.stderr)
             continue
         if fmt == "html":
-            content = render_html(report, variant="single", chart_lib=chart_lib)
+            content = render_html(report, variant="single", chart_lib=chart_lib,
+                                   idle_gap_minutes=idle_gap_minutes)
         else:
             content = _RENDERERS[fmt](report)
         path = _write_output(fmt, content, report)
@@ -8611,6 +8741,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(missing manifest entry, missing file, hash mismatch) "
                         "from hard errors to stderr warnings. Default: fail "
                         "loudly so tampered or corrupted installs are caught.")
+    p.add_argument("--idle-gap-minutes", type=int, default=10, metavar="N",
+                   help="HTML: insert an idle-gap divider row when consecutive "
+                        "turns are separated by more than N wall-clock minutes. "
+                        "0 disables. Default: 10.")
     p.add_argument("--strict-tz", action="store_true",
                    help="When --tz / --peak-tz cannot be resolved (e.g. on "
                         "Windows without the 'tzdata' pip package), raise "
@@ -9096,6 +9230,7 @@ def main() -> None:
             formats, tz_offset, tz_label,
             peak=peak, single_page=args.single_page,
             use_cache=not args.no_cache, chart_lib=chart_lib,
+            idle_gap_minutes=args.idle_gap_minutes,
             include_subagents=args.include_subagents,
             drilldown=not args.no_project_drilldown,
             suppress_model_compare_insight=args.no_model_compare_insight,
@@ -9113,6 +9248,7 @@ def main() -> None:
             slug, args.include_subagents, formats, tz_offset, tz_label,
             peak=peak, single_page=args.single_page,
             use_cache=not args.no_cache, chart_lib=chart_lib,
+            idle_gap_minutes=args.idle_gap_minutes,
             suppress_model_compare_insight=args.no_model_compare_insight,
             cache_break_threshold=args.cache_break_threshold,
             subagent_attribution=not args.no_subagent_attribution,
@@ -9127,6 +9263,7 @@ def main() -> None:
         jsonl_path, resolved_slug, args.include_subagents, formats,
         tz_offset, tz_label, peak=peak, single_page=args.single_page,
         use_cache=not args.no_cache, chart_lib=chart_lib,
+        idle_gap_minutes=args.idle_gap_minutes,
         suppress_model_compare_insight=args.no_model_compare_insight,
         cache_break_threshold=args.cache_break_threshold,
         subagent_attribution=not args.no_subagent_attribution,
