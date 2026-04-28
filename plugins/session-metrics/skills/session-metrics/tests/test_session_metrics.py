@@ -7591,9 +7591,17 @@ def test_audit_quick_playbook_anchors():
     # allow null so the model is told never to guess.
     assert "estimated_impact_usd" in quick
     assert "null" in quick
-    # Cap was bumped from 5 → 7 with Tier-1 additions:
-    assert "exactly 7 finding" in quick or "exactly 7 findings" in quick
-    assert "Seven-finding contract" in quick
+    # v1.28.0: cap is "list every fired trigger, capped at 7" — no floor.
+    # Padding is explicitly forbidden.
+    assert "capped at 7" in quick
+    assert "Finding cap" in quick
+    assert "no floor" in quick.lower()
+    # Helper-script workflow is now the entry path:
+    assert "audit-extract.py" in quick
+    # Impact-formula reference table (v1.28.0):
+    assert "Impact formula" in quick
+    # LLM division of labor section:
+    assert "LLM division of labor" in quick
 
 
 def test_audit_detailed_playbook_anchors():
@@ -7621,9 +7629,15 @@ def test_audit_detailed_playbook_anchors():
     assert "weekly_rollup_regression" in detailed
     assert "peak_hour_concentration" in detailed
     assert "subagent_attribution_orphan" in detailed
-    # Cap was bumped from 12 → 16 with Tier-1 additions:
+    # v1.28.0: cap relaxed from "exactly N" to "up to N", no floor.
     assert "up to 16 finding" in detailed or "up to 16 findings" in detailed
-    assert "Sixteen-finding contract" in detailed
+    assert "Sixteen-finding cap" in detailed
+    assert "no floor" in detailed.lower()
+    # Helper-script workflow:
+    assert "audit-extract.py" in detailed
+    assert "detailed_candidates" in detailed
+    # LLM division of labor section:
+    assert "LLM division of labor" in detailed
     # Markdown render template section names:
     assert "Quick wins" in detailed
     assert "Structural fixes" in detailed
@@ -8338,3 +8352,359 @@ def test_no_advisor_session_unchanged():
         assert t["advisor_model"] is None
     # The well-known fixture total is unchanged.
     assert r["totals"]["cost"] == pytest.approx(0.027845, abs=1e-7)
+
+
+# ---------------------------------------------------------------------------
+# audit-session-metrics — audit-extract.py helper-script tests.
+#
+# The helper script is the trigger-evaluation engine. A bug here is silent —
+# every downstream audit picks it up unchallenged. Tests build minimal
+# synthetic JSON exports that contain just enough shape for one trigger to
+# fire and assert the script produces the right digest fields.
+# ---------------------------------------------------------------------------
+
+_AUDIT_EXTRACT = (_HERE.parent.parent / "audit-session-metrics"
+                  / "scripts" / "audit-extract.py")
+
+
+def _load_audit_extract():
+    """Lazy-load audit-extract.py as a module so tests can call its
+    functions directly without spawning a subprocess for each case."""
+    return _load_module("audit_extract", _AUDIT_EXTRACT)
+
+
+def _audit_min_export(**overrides) -> dict:
+    """Build a minimal session-metrics JSON export shape that the script's
+    trigger evaluation walks over. Callers pass `totals=`, `turns=`,
+    `cache_breaks=`, etc. to override per-test."""
+    base = {
+        "generated_at": "2026-04-29T00:00:00Z",
+        "mode": "single",
+        "slug": "-test",
+        "tz_offset_hours": 0,
+        "tz_label": "UTC",
+        "models": {"claude-opus-4-7": 1},
+        "totals": {
+            "input": 100, "output": 100, "cache_read": 0, "cache_write": 0,
+            "cache_write_5m": 0, "cache_write_1h": 0, "extra_1h_cost": 0,
+            "cost": 1.0, "no_cache_cost": 1.0, "turns": 1,
+            "advisor_call_count": 0, "advisor_cost_usd": 0.0,
+            "total": 200, "total_input": 100,
+            "cache_savings": 0.0, "cache_hit_pct": 0.0,
+            "thinking_turn_count": 0, "thinking_turn_pct": 0.0,
+            "tool_call_total": 0, "tool_names_top3": [],
+        },
+        "sessions": [{"subtotal": {}, "turns": []}],
+        "cache_breaks": [],
+        "by_skill": [],
+        "by_subagent_type": [],
+        "subagent_attribution_summary": {
+            "attributed_turns": 0, "orphan_subagent_turns": 0,
+            "nested_levels_seen": 0, "cycles_detected": 0},
+        "subagent_share_stats": {
+            "include_subagents": True, "has_attribution": False,
+            "total_cost": 1.0, "attributed_cost": 0.0, "share_pct": 0.0,
+            "spawn_count": 0, "attributed_count": 0, "orphan_turns": 0},
+        "weekly_rollup": {"has_data": False},
+    }
+    base.update(overrides)
+    return base
+
+
+def _audit_min_turn(index: int = 1, **overrides) -> dict:
+    """Minimal turn record matching session-metrics export shape."""
+    base = {
+        "index": index, "input_tokens": 10, "output_tokens": 10,
+        "cache_read_tokens": 0, "cache_write_tokens": 0,
+        "cache_write_5m_tokens": 0, "cache_write_1h_tokens": 0,
+        "cost_usd": 0.01, "model": "claude-opus-4-7",
+        "slash_command": "", "prompt_text": "",
+        "tool_use_names": [], "tool_use_detail": [],
+        "stop_reason": "end_turn",
+        "attributed_subagent_cost": 0.0, "attributed_subagent_count": 0,
+        "advisor_calls": 0, "advisor_cost_usd": 0.0, "advisor_model": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_audit_extract_script_exists_and_executable():
+    assert _AUDIT_EXTRACT.exists(), f"missing: {_AUDIT_EXTRACT}"
+    assert os.access(_AUDIT_EXTRACT, os.R_OK)
+
+
+def test_audit_extract_filename_parser_canonical():
+    ae = _load_audit_extract()
+    id8, ts = ae.session_filename_parts("/p/session_8461c187_20260428T211457Z.json")
+    assert id8 == "8461c187"
+    assert ts == "20260428T211457Z"
+
+
+def test_audit_extract_filename_parser_legacy():
+    ae = _load_audit_extract()
+    id8, ts = ae.session_filename_parts("/p/session_abc12345_20260101_120000.json")
+    assert id8 == "abc12345"
+    assert ts == "20260101_120000"
+
+
+def test_audit_extract_filename_parser_fallback():
+    ae = _load_audit_extract()
+    # Unrecognised pattern → fallback splits on '_'
+    id8, ts = ae.session_filename_parts("/p/something_weird_format.json")
+    assert id8 == "weird"  # second segment
+
+
+def test_audit_extract_baseline_io_ratio_uses_uncached():
+    ae = _load_audit_extract()
+    # 1000 total input, 950 cache reads → 50 uncached, 10 output → 5:1
+    data = _audit_min_export(totals={
+        **_audit_min_export()["totals"],
+        "total_input": 1000, "cache_read": 950, "output": 10,
+        "cost": 1.0, "cache_hit_pct": 95.0,
+    })
+    base = ae.compute_baseline(data)
+    assert base["input_output_ratio"] == 5
+    assert base["cache_hit_pct"] == 95.0
+
+
+def test_audit_extract_cache_break_fires_with_impact():
+    ae = _load_audit_extract()
+    data = _audit_min_export(
+        cache_breaks=[{"turn_index": 5, "uncached": 200_000, "cache_break_pct": 100,
+                       "session_id": "s", "timestamp": "", "timestamp_fmt": "",
+                       "total_tokens": 200_000, "prompt_snippet": "...",
+                       "slash_command": "", "model": "claude-opus-4-7", "context": []}],
+    )
+    digest = ae.build_digest(data, "/p/session_test1234_20260101T000000Z.json", "quick")
+    fired_metrics = [t["metric"] for t in digest["fired_triggers"]]
+    assert "cache_break" in fired_metrics
+    cb = next(t for t in digest["fired_triggers"] if t["metric"] == "cache_break")
+    # 200k tokens × $5/M = $1.00
+    assert cb["estimated_impact_usd"] == pytest.approx(1.0, abs=0.01)
+    assert cb["impact_basis"].startswith("200,000 uncached tokens")
+
+
+def test_audit_extract_cache_break_severity_downgrades_when_rare():
+    ae = _load_audit_extract()
+    # 1 break in 200 turns (0.5%) — below 2% threshold → severity "low"
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 200, "cost": 50.0},
+        cache_breaks=[{"turn_index": 5, "uncached": 100_000,
+                       "cache_break_pct": 50, "session_id": "s",
+                       "timestamp": "", "timestamp_fmt": "",
+                       "total_tokens": 100_000, "prompt_snippet": "",
+                       "slash_command": "", "model": "claude-opus-4-7",
+                       "context": []}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    cb = next(t for t in digest["fired_triggers"] if t["metric"] == "cache_break")
+    assert cb["default_severity"] == "medium"
+    assert cb["suggested_severity"] == "low"
+    assert cb["downgrade_reason"] is not None
+    assert "0.5%" in cb["downgrade_reason"]
+
+
+def test_audit_extract_top_turn_share_fires_above_30pct():
+    ae = _load_audit_extract()
+    turns = [
+        _audit_min_turn(index=1, cost_usd=10.0),  # 50% of total
+        _audit_min_turn(index=2, cost_usd=5.0),
+        _audit_min_turn(index=3, cost_usd=5.0),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "cost": 20.0, "turns": 3,
+                "output": 1000, "total_input": 1000},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    top = next((t for t in digest["fired_triggers"] if t["metric"] == "top_turn_share"), None)
+    assert top is not None, "top_turn_share should fire when one turn is >30% of cost"
+    assert top["evidence"]["pct_of_total"] == pytest.approx(50.0)
+
+
+def test_audit_extract_top_turn_share_does_not_fire_below_30pct():
+    ae = _load_audit_extract()
+    # Even spread — no single turn dominates
+    turns = [_audit_min_turn(index=i, cost_usd=1.0) for i in range(1, 11)]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "cost": 10.0, "turns": 10},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    fired = [t["metric"] for t in digest["fired_triggers"]]
+    assert "top_turn_share" not in fired
+
+
+def test_audit_extract_advisor_share_uses_realised_cost():
+    ae = _load_audit_extract()
+    data = _audit_min_export(totals={
+        **_audit_min_export()["totals"],
+        "cost": 10.0, "advisor_call_count": 3, "advisor_cost_usd": 1.50,
+    })
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    adv = next(t for t in digest["fired_triggers"] if t["metric"] == "advisor_share")
+    # estimated_impact_usd is the already-realised advisor cost itself.
+    assert adv["estimated_impact_usd"] == pytest.approx(1.50)
+    assert adv["evidence"]["pct_of_total"] == pytest.approx(15.0)
+
+
+def test_audit_extract_thinking_high_fires_above_30pct():
+    ae = _load_audit_extract()
+    data = _audit_min_export(totals={
+        **_audit_min_export()["totals"],
+        "thinking_turn_pct": 35.0, "thinking_turn_count": 35, "turns": 100,
+    })
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    fired = [t["metric"] for t in digest["fired_triggers"]]
+    assert "thinking_engagement_high" in fired
+
+
+def test_audit_extract_truncated_outputs_fires_when_present():
+    ae = _load_audit_extract()
+    turns = [
+        _audit_min_turn(index=1),
+        _audit_min_turn(index=2, stop_reason="max_tokens"),
+        _audit_min_turn(index=3, stop_reason="max_tokens"),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 3},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    trunc = next((t for t in digest["fired_triggers"] if t["metric"] == "truncated_outputs"), None)
+    assert trunc is not None
+    assert trunc["evidence"]["truncated_count"] == 2
+    assert trunc["evidence"]["turn_indices"] == [2, 3]
+
+
+def test_audit_extract_session_warmup_fires_for_short_costly_first_turn():
+    ae = _load_audit_extract()
+    turns = [
+        _audit_min_turn(index=1, cost_usd=0.50),  # 50% of total cost
+        _audit_min_turn(index=2, cost_usd=0.30),
+        _audit_min_turn(index=3, cost_usd=0.20),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "cost": 1.0, "turns": 3,
+                "output": 100, "total_input": 100},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    warm = next((t for t in digest["fired_triggers"]
+                 if t["metric"] == "session_warmup_overhead"), None)
+    assert warm is not None
+    assert warm["evidence"]["pct_of_total"] == pytest.approx(50.0)
+
+
+def test_audit_extract_tool_result_bloat_fires_after_bash():
+    ae = _load_audit_extract()
+    turns = [
+        _audit_min_turn(index=1, tool_use_names=["Bash"]),
+        _audit_min_turn(index=2, cache_write_tokens=80_000),  # bloated
+        _audit_min_turn(index=3),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 3},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    bloat = next((t for t in digest["fired_triggers"]
+                  if t["metric"] == "tool_result_bloat"), None)
+    assert bloat is not None
+    assert bloat["evidence"]["turn_index"] == 2
+    assert bloat["evidence"]["prior_tool"] == "Bash"
+
+
+def test_audit_extract_top_turns_flag_cache_break_correlation():
+    ae = _load_audit_extract()
+    turns = [
+        _audit_min_turn(index=1, cost_usd=5.0, cache_write_tokens=300_000),
+        _audit_min_turn(index=2, cost_usd=1.0),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "cost": 6.0, "turns": 2,
+                "output": 100, "total_input": 100},
+        sessions=[{"subtotal": {}, "turns": turns}],
+        cache_breaks=[{"turn_index": 1, "uncached": 300_000, "cache_break_pct": 100,
+                       "session_id": "s", "timestamp": "", "timestamp_fmt": "",
+                       "total_tokens": 300_000, "prompt_snippet": "",
+                       "slash_command": "", "model": "claude-opus-4-7", "context": []}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    top = digest["top_expensive_turns"][0]
+    assert top["turn_index"] == 1
+    assert top["is_cache_break"] is True, (
+        "top expensive turn that is also the cache_break must surface the cross-finding flag"
+    )
+
+
+def test_audit_extract_top_turns_hypothesis_classification():
+    ae = _load_audit_extract()
+    # Cache-write-heavy turn
+    turns = [_audit_min_turn(index=1, cost_usd=5.0,
+                             cache_write_tokens=200_000, output_tokens=100)]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "cost": 5.0, "turns": 1,
+                "output": 100, "total_input": 100},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    h = digest["top_expensive_turns"][0]["hypothesis"]
+    assert "cache-write heavy" in h
+
+
+def test_audit_extract_detailed_mode_includes_candidates():
+    ae = _load_audit_extract()
+    # File re-read fixture: 3 reads of same file
+    turns = []
+    for i in range(1, 4):
+        turns.append(_audit_min_turn(
+            index=i, tool_use_names=["Read"],
+            tool_use_detail=[{"name": "Read", "input": {"file_path": "/x/y.py"}}],
+        ))
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 3},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "detailed")
+    assert "detailed_candidates" in digest
+    re_reads = digest["detailed_candidates"]["file_re_reads"]
+    assert any(r["file_path"] == "/x/y.py" and r["read_count"] == 3 for r in re_reads)
+
+
+def test_audit_extract_quick_mode_omits_detailed_candidates():
+    ae = _load_audit_extract()
+    digest = ae.build_digest(_audit_min_export(),
+                             "/p/session_t_20260101T000000Z.json", "quick")
+    assert "detailed_candidates" not in digest
+
+
+def test_audit_extract_verbose_response_uses_total_input():
+    """Cache-heavy sessions must NOT all flag as verbose. Denominator is
+    input_tokens + cache_read_tokens, not just input_tokens."""
+    ae = _load_audit_extract()
+    # 10 input + 990 cache_read = 1000 billable input vs 100 output → ratio 0.1
+    # Without the fix, ratio = 100/10 = 10 → would falsely fire
+    turns = [_audit_min_turn(index=i, input_tokens=10, cache_read_tokens=990,
+                              output_tokens=100) for i in range(1, 16)]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 15},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "detailed")
+    vr = digest["detailed_candidates"]["verbose_response"]
+    assert vr["pct_of_turns"] == 0.0, (
+        "cache-heavy session must not register as verbose — denominator is "
+        "input_tokens + cache_read_tokens"
+    )
+
+
+def test_audit_extract_weekly_rollup_suppressed_when_first_week():
+    ae = _load_audit_extract()
+    data = _audit_min_export(weekly_rollup={
+        "has_data": True,
+        "trailing_7d": {"cost": 50.0, "cache_hit_pct": 90.0},
+        "prior_7d": {"cost": 0.0, "cache_hit_pct": 0.0},
+    })
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "detailed")
+    assert digest["detailed_candidates"]["weekly_rollup"] is None

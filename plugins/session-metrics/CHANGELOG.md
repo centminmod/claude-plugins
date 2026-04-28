@@ -5,6 +5,89 @@ Versions match the `plugin.json` / `marketplace.json` version field.
 
 ---
 
+## v1.28.0 — 2026-04-29
+
+### Added — `audit-extract.py` helper script
+
+The audit-session-metrics skill now ships a Python helper script at
+`scripts/audit-extract.py` that pre-computes every audit trigger,
+suggested severity, estimated impact USD, top-3 expensive turns
+(with cross-finding correlation flags), and — in detailed mode —
+all session-log scans (file re-reads, paste-bombs, wrong-model turns,
+verbose responses, weekly delta, subagent orphans). The Haiku audit
+turn now consumes a single JSON digest from stdout instead of
+incrementally `Read`-ing the (often >256 KB) session JSON export.
+
+Practical impact:
+
+- **Fewer tool roundtrips.** A typical quick audit drops from ~7 Bash
+  exploration calls to 1.
+- **Real `estimated_impact_usd` figures.** Where a formula exists
+  (`cache_break: uncached × $5/M`, `advisor_share: realised cost`,
+  etc.) the helper computes the dollar figure; Haiku no longer guesses
+  or leaves `null`.
+- **Severity downgrades.** When data is milder than the trigger
+  threshold (e.g. 1 cache break in 200 turns), the script emits
+  `suggested_severity: "low"` with a `downgrade_reason` Haiku can
+  quote in the fix paragraph.
+- **Cross-finding correlation.** `top_expensive_turns[i].is_cache_break`
+  flag lets the audit link the same turn across findings.
+
+### Changed — finding cap is now soft
+
+Both playbooks relaxed the cap: quick mode is "list every fired
+trigger, capped at 7 for scannability" (was "exactly 7 findings");
+detailed mode is "up to 16" (no floor). Padding with `"other"` rows
+to reach a target count is now explicitly forbidden — 3 fired triggers
+means 3 findings, not 7 with two filler rows.
+
+### Changed — verbose_response trigger uses cache-aware denominator
+
+The detailed-mode verbose-response scan now uses
+`output_tokens / (input_tokens + cache_read_tokens)` as the ratio,
+not `output_tokens / input_tokens`. Cache-heavy sessions previously
+had this trigger fire on 100% of turns because uncached `input_tokens`
+alone drove the ratio to absurd values once cache hit > 50%.
+
+### Changed — `weekly_rollup_regression` suppressed on first week
+
+The detailed-mode weekly delta is now suppressed (rendered as `null`
+in `detailed_candidates.weekly_rollup`) when the prior 7-day window
+has zero usage. The previous behaviour reported a meaningless
+`+98.2pp cache delta` because prior cache-hit was 0 by absence, not
+by regression.
+
+### Changed — playbook now spells out the helper / Haiku division of labour
+
+Both `quick-audit.md` and `detailed-audit.md` gained an "LLM division
+of labor" section so future-you doesn't drift back to recomputing
+metrics Haiku already received from the digest.
+
+### Removed — unverified `~$0.01 / ~$0.03` cost claims
+
+session-metrics' SKILL.md previously advertised the audit suggestion
+as costing "~$0.01 on Haiku" / "~$0.03 on Haiku". Those numbers were
+estimates that never got measured against the helper-script-driven
+workflow. Replaced with "Haiku — ~10× cheaper than Sonnet" which
+follows from public pricing without claiming a specific dollar figure.
+
+### Tests
+
+20 new unit tests in `tests/test_session_metrics.py` exercise the
+helper script with synthetic JSON fixtures per trigger:
+filename-parser variants, baseline ratio computation, cache_break
+fires + impact, severity-downgrade reason, top_turn_share threshold,
+advisor share realised-cost, thinking_engagement, truncated_outputs,
+session_warmup_overhead, tool_result_bloat (after Bash), top-turn
+cache-break correlation flag, hypothesis classification, detailed
+mode populates candidates, quick mode omits them, verbose_response
+cache-aware denominator, weekly_rollup first-week suppression. The
+existing playbook-anchor tests were updated to assert the new
+"capped at 7", "no floor", "audit-extract.py", "Impact formula", and
+"LLM division of labor" anchors.
+
+---
+
 ## v1.27.0 — 2026-04-29
 
 ### Added — Self-cost meta-metric

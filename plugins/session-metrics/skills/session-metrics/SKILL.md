@@ -355,8 +355,8 @@ line lands, append a two-line suggestion telling the user how to
 audit the run:
 
 > Want a token-usage audit of this session?
->   `/audit-session-metrics quick   <json-path>`   (~$0.01 on Haiku)
->   `/audit-session-metrics detailed <json-path>`  (~$0.03 on Haiku, reads CLAUDE.md + settings)
+>   `/audit-session-metrics quick   <json-path>`   (Haiku — ~10× cheaper than Sonnet)
+>   `/audit-session-metrics detailed <json-path>`  (Haiku, also reads CLAUDE.md + settings)
 
 Substitute `<json-path>` with the actual path printed by the
 `[export] JSON` line.

@@ -2,33 +2,53 @@
 
 This is the playbook for the `detailed` mode of `audit-session-metrics`.
 It builds on the quick-audit findings by also reading the user's
-configuration files and scanning the JSON export for re-read /
-paste-bomb / wrong-model patterns. Aim: a 12-finding prioritised
-report plus quick-wins / structural-fixes / estimated-savings
-sections, all serialised through the same JSON schema as the quick
-audit (with detailed-only fields added).
+configuration files and consuming the helper script's `detailed_candidates`
+section (re-reads, paste-bombs, wrong-model turns, verbose responses,
+weekly rollup deltas, subagent orphans). Aim: a prioritised report up
+to 16 findings plus quick-wins / structural-fixes / estimated-savings
+sections, all serialised through the same JSON schema spine as the
+quick audit (with detailed-only fields added).
+
+## Workflow — one Bash call to the extract helper
+
+Same script as quick mode, with `--mode detailed`:
+
+```
+scripts/audit-extract.py <input-json-path> --mode detailed
+```
+
+The digest gains a `detailed_candidates` block that pre-computes:
+
+- `file_re_reads` — paths read more than twice.
+- `paste_bombs` — turns whose `prompt_text` exceeds 5000 characters.
+- `wrong_model_turns` — Opus turns with `cost_usd < 0.05`.
+- `subagent_dominant_parents` — turns whose attributed subagent cost
+  exceeds parent cost by 5×.
+- `verbose_response` — fraction of turns where output / (input + cache_read) > 5.
+- `weekly_rollup` — trailing-7d vs prior-7d cost / cache deltas (null if
+  prior week has no data).
+- `subagent_orphan` — orphan-turn counts when the attribution graph
+  could not link a subagent to a parent.
+
+You still **must** read the user's CLAUDE.md and settings files (Phase 2
+below) — that is the part the helper cannot do.
 
 ## Context-budget rules — non-negotiable
 
 These rules exist so the audit fits comfortably in Haiku's context
 even on long sessions:
 
-1. **Do not read the raw `.jsonl`.** Operate from the JSON export
-   alone — `turns[]` already carries `input_tokens`, `output_tokens`,
-   `cache_read_tokens`, `cache_write_tokens`, `cost_usd`, `model`,
-   `slash_command`, `tools`, `prompt_text` (truncated), and
-   `attributed_subagent_*`. Re-parsing the raw JSONL is what would
-   blow context — and it would not give you anything you cannot
-   already see in the export.
+1. **Do not read the raw `.jsonl`.** The helper script already walked
+   the export and extracted every metric you need. Re-parsing the
+   raw JSONL is what would blow context.
 2. **Cap CLAUDE.md / settings reads at 500 lines each.** If the file
-   is larger, that itself is a finding ("CLAUDE.md is X lines,
-   roughly Y tokens — every turn pays this") — read only the first
-   500 lines for content patterns and stop.
+   is larger, that itself is a finding (`claudemd_oversize`) — read
+   only the first 500 lines for content patterns and stop.
 3. **Cap quoted snippets in findings at 5 lines.** Quote the worst
    offender; do not paste an entire section.
 4. **No motivational language. No LLM theory.** Cite the exact
-   number, file, or turn index. If a phase has nothing to say, write
-   "Nothing material" and move on.
+   number, file, or turn index from the digest. If a phase has
+   nothing to say, write "Nothing material" and move on.
 
 ## Output contract — three artefacts per audit
 
@@ -38,15 +58,14 @@ Every detailed audit produces:
 2. **Markdown copy** at `<project>/exports/session-metrics/audit_<id8>_<ts>_detailed.md` — the same content rendered for humans.
 3. **Inline chat output** — the markdown content printed in the assistant's reply.
 
-Same write order as `quick-audit.md`: populate JSON → write JSON →
-render markdown → write markdown → print inline → emit two
+Same write order as `quick-audit.md`: run helper → build JSON → write
+JSON → render markdown → write markdown → print inline → emit two
 `[audit] saved → <path>` lines.
 
-## Phase 1 — Re-run the quick audit signals
+## Phase 1 — Re-use the quick audit's fired triggers
 
-Mentally execute the quick-audit metric triggers in
-[`quick-audit.md`](quick-audit.md). Their findings carry into the
-detailed report — they are appended to the same `findings` array, not
+`digest.fired_triggers` already lists every quick-mode trigger that
+fired. Append them to the same `findings` array — they are not
 duplicated into a separate section.
 
 ## Phase 2 — Config audit (read these files)
@@ -66,40 +85,46 @@ and move on. Apply the line cap (≤ 500).
    `node_modules`, `dist`, `build`, `.next`, `vendor`, lockfiles, or
    large data directories, that is a finding.
 
-## Phase 3 — Session-log scan (from the JSON export only)
+## Phase 3 — Consume helper's detailed_candidates
 
-From the export's `turns[]`:
+The digest's `detailed_candidates` section already pre-computed every
+session-log scan you used to do by hand. For each populated subsection,
+emit one finding with the matching metric:
 
-- **Re-reads.** Group `turns[].tools[]` entries where `name == "Read"`
-  by their `input.file_path`. Flag any path read more than twice.
-- **Paste bombs.** Flag user prompts where
-  `len(prompt_text) > 5000` characters (or
-  `input_tokens > 8000` if `prompt_text` is truncated).
-- **Wrong-model turns.** Turns where `model` contains "opus" and
-  total `cost_usd < 0.05` (Opus on a trivial task). List up to three.
-- **Subagent waste.** Turns where `attributed_subagent_cost`
-  exceeds the parent turn's own cost by 5×. List up to two.
+- `file_re_reads` → one `file_re_read` finding (or merge similar paths
+  into one finding's `evidence.examples`).
+- `paste_bombs` → one `paste_bomb` finding per turn (cap at 3).
+- `wrong_model_turns` → one `wrong_model_turn` finding consolidating
+  up to 3 examples.
+- `subagent_dominant_parents` → one `subagent_dominant_parent` finding
+  per turn (cap at 2).
+- `verbose_response.pct_of_turns > 30` → one `verbose_response` finding.
+- `weekly_rollup` non-null AND `cost_delta_pct > 50` OR
+  `cache_hit_delta_pp < -10` → one `weekly_rollup_regression` finding.
+- `subagent_orphan` non-null → one `subagent_attribution_orphan` finding.
+
+Do not invent additional triggers from raw turn data — if the helper
+did not surface a pattern, it did not pass the threshold.
 
 ## JSON schema (v1.0)
 
 Same spine as `quick-audit.md`'s schema, with `mode: "detailed"`,
-**up to 16 findings** (instead of exactly 7), and three additional
-top-level fields: `quick_wins`, `structural_fixes`,
-`estimated_savings`.
+**up to 16 findings**, and three additional top-level fields:
+`quick_wins`, `structural_fixes`, `estimated_savings`.
 
 ```jsonc
 {
   "audit_schema_version": "1.0",
   "mode": "detailed",
-  "session_id_short": "<8-char id>",
+  "session_id_short": "<8-char id, copy from digest.session_id_short>",
   "generated_at": "<ISO8601 UTC>",
-  "input_json": "<absolute path>",
+  "input_json": "<absolute path, copy from digest.input_json>",
 
-  "baseline": { /* same shape as quick */ },
+  "baseline": { /* copy from digest.baseline */ },
 
-  "findings": [ <up to 16 finding objects, sorted high → low severity, then by descending estimated_impact_usd> ],
+  "findings": [ <list every fired trigger + every detailed-only finding, capped at 16, sorted high → low severity, then by descending estimated_impact_usd> ],
 
-  "top_expensive_turns": [ <exactly 3 turn objects> ],
+  "top_expensive_turns": [ <exactly 3 turn objects, copy from digest.top_expensive_turns> ],
 
   // Detailed-only sections:
   "quick_wins": [ <3-6 strings, ≤10-min fixes, each starting with a verb> ],
@@ -134,37 +159,60 @@ session_warmup_overhead / tool_result_bloat / heavy_reader_tools /
 cache_savings_low / thinking_engagement_high / truncated_outputs /
 advisor_share / other) carries forward unchanged. Detailed mode adds:
 
-| `metric` | Trigger | Default severity | `evidence` fields |
-|----------|---------|------------------|--------------------|
-| `claudemd_oversize` | `~/.claude/CLAUDE.md` or `./CLAUDE.md` > 2000 tokens (chars/4) | high | `path` (string), `line_count` (int), `token_estimate` (int), `worst_section_excerpt` (string, ≤5 lines) |
-| `claudemd_duplication` | Same rule appears in both global and project CLAUDE.md | medium | `paths` (array of 2), `duplicated_rule` (string, ≤3 lines) |
-| `missing_claudeignore` | `./.claudeignore` absent AND heavy paths present (`node_modules`, `dist`, etc.) | medium | `present_paths` (array of strings), `suggested_block` (string with newline-separated entries) |
-| `mcp_unused` | MCP server in `settings.json` with no matching `tools[].name` in any turn this session | medium | `server_name` (string), `tool_descriptors_estimated` (int\|null) |
-| `default_model_overkill` | Default model in settings is Opus AND > 70% of turns did formatting/lookup/single-file edits | medium | `default_model` (string), `routine_turn_pct` (number), `total_turns` (int) |
-| `file_re_read` | Same `input.file_path` Read more than twice | low | `file_path` (string), `read_count` (int), `turn_indices` (array of int) |
-| `paste_bomb` | User prompt with `len(prompt_text) > 5000` chars | low | `turn_index` (int), `chars` (int), `excerpt` (string, ≤80 chars) |
-| `subagent_dominant_parent` | `attributed_subagent_cost` > 5× parent `cost_usd` | medium | `turn_index` (int), `parent_cost_usd` (number), `subagent_cost_usd` (number), `ratio` (number) |
-| `wrong_model_turn` | `model` contains "opus" AND turn `cost_usd` < 0.05 | low | `turn_indices` (array of int), `examples` (array of `{turn_index, cost_usd, prompt_excerpt}` objects, ≤3) |
-| `verbose_response` | In > 30% of turns where `input_tokens > 0`, `output_tokens / input_tokens > 5` (the model dumps rather than replies). Skip if `total_turns < 10` (too few samples) | medium | `pct_of_turns` (number), `total_turns_sampled` (int), `output_input_ratio_p90` (number), `sample_turn_indices` (array of int, ≤3) |
-| `weekly_rollup_regression` | `report.weekly_rollup.cost_delta_pct > 50` (trailing-7d cost up > 50% vs prior 7d) OR `cache_hit_delta_pp < -10` (cache hit dropped > 10pp). Skip if `weekly_rollup` is missing or only one week of data exists | high | `cost_delta_pct` (number\|null), `trailing_7d_cost_usd` (number), `prior_7d_cost_usd` (number), `cache_hit_delta_pp` (number\|null), `trailing_7d_cache_hit_pct` (number), `prior_7d_cache_hit_pct` (number) |
-| `peak_hour_concentration` | `report.peak` is configured AND > 70% of total cost lands inside the peak-hours band. Skip if `peak` is null | medium | `peak_band` (string, e.g. `"5-11 America/Los_Angeles"`), `peak_cost_usd` (number), `total_cost_usd` (number), `pct_of_total` (number) |
-| `subagent_attribution_orphan` | `report.subagent_attribution_summary.orphan_turns > 0` (cost can't be traced back to a parent prompt; masks where to optimize) | low | `orphan_turns` (int), `attributed_turns` (int), `nested_levels_seen` (int), `cycles_detected` (int) |
+| `metric` | Trigger (digest source) | Default severity | Impact formula |
+|----------|-------------------------|------------------|----------------|
+| `claudemd_oversize` | Phase 2 read of `~/.claude/CLAUDE.md` or `./CLAUDE.md` > 2000 tokens (chars/4) | high | `null` — repeated context cost is hard to estimate without recomputing per-turn |
+| `claudemd_duplication` | Same rule appears in both global and project CLAUDE.md | medium | `null` |
+| `missing_claudeignore` | `./.claudeignore` absent AND heavy paths present (`node_modules`, `dist`, etc.) | medium | `null` |
+| `mcp_unused` | MCP server in `settings.json` with no matching tool name in any turn | medium | `null` |
+| `default_model_overkill` | Default model in settings is Opus AND > 70% of turns did formatting/lookup/single-file edits | medium | `null` |
+| `file_re_read` | `digest.detailed_candidates.file_re_reads` non-empty | low | `null` (small per-turn delta, hard to quantify cleanly) |
+| `paste_bomb` | `digest.detailed_candidates.paste_bombs` non-empty | low | `null` |
+| `subagent_dominant_parent` | `digest.detailed_candidates.subagent_dominant_parents` non-empty | medium | `null` (subagent cost is already in parent's `attributed_subagent_cost`; not double-counted) |
+| `wrong_model_turn` | `digest.detailed_candidates.wrong_model_turns` non-empty | low | `null` |
+| `verbose_response` | `digest.detailed_candidates.verbose_response.pct_of_turns > 30` AND `total_turns_sampled ≥ 10`. The digest's denominator is `input_tokens + cache_read_tokens` (cache-aware), so cache-heavy sessions don't false-fire | medium | `null` |
+| `weekly_rollup_regression` | `digest.detailed_candidates.weekly_rollup.cost_delta_pct > 50` OR `cache_hit_delta_pp < -10`. Helper suppresses when prior week has no data | high | `null` (delta is descriptive, not a recoverable saving) |
+| `peak_hour_concentration` | `report.peak` configured AND > 70% of cost lands inside the peak band. Skip if `peak` is null | medium | `null` |
+| `subagent_attribution_orphan` | `digest.detailed_candidates.subagent_orphan.orphan_turns > 0` | low | `null` |
 
-Severity may be **upgraded** when extreme (e.g. CLAUDE.md at 8000
-tokens is still `high` but flag the magnitude in `evidence.note`).
-Never downgrade below the default.
+Severity may be **upgraded** when the data is more extreme (e.g.
+CLAUDE.md at 8000 tokens is still `high` but flag the magnitude in
+`evidence.note`). For `cache_break` etc. that the helper already
+downgrades, copy `digest.fired_triggers[i].suggested_severity` into the
+finding's `severity` and quote `downgrade_reason` in the `fix`
+paragraph.
 
-### Sixteen-finding contract
+### Sixteen-finding cap
 
-Up to 16 findings — fewer if the data does not support 16. **Merge
-similar findings** rather than padding (e.g. three separate
-`file_re_read` findings on different paths roll into one with
-`evidence.examples[]`). The 7-finding contract from quick-audit does
-NOT apply here; 5 high-quality findings beats 16 padded ones.
+Up to 16 findings. There is no floor — emit only the findings that the
+helper + Phase 2 produced. **Merge similar findings** rather than
+padding (three separate `file_re_read` paths roll into one finding
+with `evidence.examples[]`).
 
-If the detailed audit produces fewer than the quick audit's 7 enum
-triggers (extremely rare), match the quick-mode contract and fall
-back to `"other"` rows.
+If more than 16 fire (rare), keep the 16 with the highest
+`estimated_impact_usd` (or, where impact is null, those with `high`
+then `medium` severity). Drop the rest silently.
+
+5 high-quality findings beat 16 padded ones.
+
+## LLM division of labor
+
+To keep the detailed audit deterministic, the split mirrors the quick
+playbook:
+
+**Helper script does:**
+- Everything the quick mode helper does.
+- Plus all session-log scans (re-reads, paste-bombs, wrong-model,
+  verbose, weekly delta, subagent orphans).
+
+**Audit skill (this playbook on Haiku) does:**
+- Read CLAUDE.md / settings / `.claudeignore` (Phase 2 — script can't
+  see filesystem outside the export).
+- Decide which fired triggers + detailed_candidates make the cut (cap
+  at 16 by impact).
+- Write concrete `fix` prose tied to the actual evidence numbers.
+- Synthesise `quick_wins` + `structural_fixes` + `estimated_savings`.
+- Render the markdown, write both artefacts, print inline.
 
 ## Markdown render template
 
@@ -178,10 +226,10 @@ three new sections instead of `## 4. What to fix first`:
 {same as quick-audit}
 
 ## 2. Findings
-{same table; up to 12 rows; merge similar findings}
+{same table; up to 16 rows; merge similar findings}
 
 ## 3. Top 3 expensive turns
-{same as quick-audit}
+{same as quick-audit, including the (also flagged as cache_break) suffix when applicable}
 
 ## 4. Quick wins (≤10 min each)
 
@@ -208,14 +256,14 @@ quick wins to measure delta.*
 ```
 
 Render rules from the quick-audit template (severity emojis,
-evidence inline, model-split clause, cache-savings clause) carry over
-unchanged.
+evidence inline, model-split clause, cache-savings clause,
+cache-break suffix on top turns) carry over unchanged.
 
 ## Tone
 
 - **Direct and specific.** Cite exact line numbers from CLAUDE.md
-  reads, exact turn indices from the JSON, exact dollar figures from
-  `cost_usd`. No motivational language.
+  reads, exact turn indices from the digest, exact dollar figures from
+  evidence.
 - **Quote sparingly.** ≤5 lines per `evidence.worst_section_excerpt`
   / `evidence.duplicated_rule`.
 - **Be honest about confidence.** If the data is thin (short
@@ -226,15 +274,17 @@ unchanged.
 
 ## Final step (write order)
 
-1. Populate the full JSON object in memory (with up to 12 findings,
+1. Run `scripts/audit-extract.py <input-json> --mode detailed` once.
+2. Read the Phase 2 config files (CLAUDE.md / settings / `.claudeignore`).
+3. Populate the full JSON object in memory (up to 16 findings,
    `quick_wins`, `structural_fixes`, `estimated_savings`).
-2. Write the JSON sidecar to
+4. Write the JSON sidecar to
    `<project>/exports/session-metrics/audit_<id8>_<ts>_detailed.json`.
-3. Render to markdown using the template.
-4. Write the markdown copy to
+5. Render to markdown using the template.
+6. Write the markdown copy to
    `<project>/exports/session-metrics/audit_<id8>_<ts>_detailed.md`.
-5. Print the same markdown content inline (without the H1 heading).
-6. Print two stderr-style lines:
+7. Print the same markdown content inline (without the H1 heading).
+8. Print two stderr-style lines:
    `[audit] saved → <json-path>`
    `[audit] saved → <md-path>`
 

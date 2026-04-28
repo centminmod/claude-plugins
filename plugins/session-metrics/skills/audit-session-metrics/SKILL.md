@@ -44,11 +44,19 @@ If it is missing, empty, or the file does not exist, print:
 
 ## Steps
 
-1. Read the JSON export at `$ARGUMENTS[1]` (single Read call). It already
-   carries every metric you need: per-turn token records, by-skill
-   aggregations, cache breaks, content-block counts, model rates,
-   self-cost. **Do not** read the raw JSONL — that's what would balloon
-   the audit's own context.
+1. Run the extract helper once with the input path:
+
+   ```
+   python3 scripts/audit-extract.py $ARGUMENTS[1] --mode $ARGUMENTS[0]
+   ```
+
+   The helper emits a single JSON digest to stdout: baseline metrics,
+   fired triggers (with suggested severity + estimated impact USD
+   pre-computed), top-3 expensive turns (with cross-finding correlation
+   flags), and — in `detailed` mode — pre-computed scans (re-reads,
+   paste-bombs, wrong-model turns, verbose responses, weekly delta,
+   subagent orphans). **Do not** read the raw `.jsonl`, and **do not**
+   re-derive numbers the digest already carries.
 2. Read the matching reference file (`quick-audit.md` for `quick`,
    `detailed-audit.md` for `detailed`). Follow the playbook there
    step-by-step. Do not improvise additional phases.
@@ -56,21 +64,23 @@ If it is missing, empty, or the file does not exist, print:
    config files (`~/.claude/CLAUDE.md`, `./CLAUDE.md`, `~/.claude/settings.json`,
    `./.claude/settings.json`, `./.claudeignore`). Each is capped at
    ≤500 lines — if a file is bigger, that itself is a finding.
+   This is the one part the helper script cannot do (no filesystem
+   access outside the export).
 4. **Output contract — three artefacts.** Both playbooks specify the
    same three-artefact contract:
    - **JSON sidecar** at `<project>/exports/session-metrics/audit_<id8>_<ts>_<mode>.json` — structured findings (versioned schema, enum'd metrics).
    - **Markdown copy** at `<project>/exports/session-metrics/audit_<id8>_<ts>_<mode>.md` — same content rendered for humans.
    - **Inline chat output** — the markdown content printed in your reply.
 
-   `<id8>` and `<ts>` are extracted from the input JSON's filename
-   (pattern: `session_<id8>_<YYYYMMDD>T<HHMMSS>Z.json` or the legacy
-   `session_<id8>_<YYYYMMDD_HHMMSS>.json`). Fall back to the input
-   file's stem if it matches neither.
-5. **Write order.** Populate the JSON object first, write the JSON
-   sidecar, render the markdown using the template in the playbook,
-   write the markdown copy, then print the markdown inline (without
-   the H1 heading — the chat client already shows context above the
-   audit). Finish with two stderr-style lines on their own:
+   `<id8>` and `<ts>` come from `digest.session_id_short` and
+   `digest.ts_str` (the helper parses the input filename and
+   normalises both legacy and current naming patterns).
+5. **Write order.** Populate the JSON object first using the digest
+   values, write the JSON sidecar, render the markdown using the
+   template in the playbook, write the markdown copy, then print the
+   markdown inline (without the H1 heading — the chat client already
+   shows context above the audit). Finish with two stderr-style lines
+   on their own:
    `[audit] saved → <json-path>`
    `[audit] saved → <md-path>`
 
