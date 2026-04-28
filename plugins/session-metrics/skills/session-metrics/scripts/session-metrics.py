@@ -214,7 +214,7 @@ def _cost(u: dict, model: str) -> float:
     # with no prompt caching, and are NOT reflected in the top-level usage
     # fields — so we must accumulate them separately here.
     advisor = 0.0
-    for it in u.get("iterations", []):
+    for it in u.get("iterations") or []:
         if it.get("type") == "advisor_message":
             adv_rates = _pricing_for(it.get("model", model))
             advisor += (
@@ -236,7 +236,7 @@ def _advisor_info(u: dict) -> tuple[int, float, str | None, int, int]:
     model: str | None = None
     inp = 0
     out = 0
-    for it in u.get("iterations", []):
+    for it in u.get("iterations") or []:
         if it.get("type") == "advisor_message":
             calls += 1
             adv_model = it.get("model") or ""

@@ -5,6 +5,21 @@ Versions match the `plugin.json` / `marketplace.json` version field.
 
 ---
 
+## v1.25.1 — 2026-04-28
+
+### Bug fix — `iterations:null` crash when advisor is not enabled
+
+`<synthetic>` resume-marker turns written by environments where the advisor feature
+is not active (e.g. the desktop app) emit `"iterations": null` in the usage dict
+rather than omitting the key. `u.get("iterations", [])` returns `None` when the key
+exists with a null value, causing `TypeError: 'NoneType' object is not iterable` in
+`_cost` and `_advisor_info` whenever a project-scope run included those sessions.
+
+- Replace `u.get("iterations", [])` with `u.get("iterations") or []` in both
+  `_cost` and `_advisor_info`. Handles absent, null, and valid-list cases identically.
+
+---
+
 ## v1.25.0 — 2026-04-28
 
 ### Advisor turn support — cost correction + surface
