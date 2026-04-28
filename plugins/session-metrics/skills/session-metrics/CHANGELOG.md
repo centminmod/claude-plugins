@@ -5,6 +5,69 @@ Versions match the `plugin.json` / `marketplace.json` version field.
 
 ---
 
+## v1.30.0 — 2026-04-29
+
+### Feature — session archetype classifier (Tier-2 batch 2: detect-only) + first-turn cost share
+
+The audit-session-metrics skill gains a top-level `session_archetype` classifier and adds `first_turn_cost_usd` / `first_turn_cost_share_pct` to the baseline. Both are forward-looking digest fields that v1.31.0's archetype-conditional severity overrides will consume; v1.30.0 ships the classifier as **detect-only** so it can be calibrated against real audit sidecars before the override matrix lands.
+
+### Schema
+
+`digest_schema_version` and `audit_schema_version` bump to **1.2** (additive — no breaking changes; v1.1 readers continue to work):
+
+- New top-level field `session_archetype` (string enum): `agent_workflow` | `short_test` | `long_debug` | `code_writing` | `exploratory_chat` | `unknown`. The default `unknown` is intentional — biased toward not labelling at low confidence (same lesson as v1.29.0's forbidden `"other"` enum).
+- New top-level field `archetype_signals` (debugging dict): `turns`, `subagent_share_pct`, `cache_hit_pct`, `cache_break_count`, `cache_break_pct`, `thinking_turn_pct`, `tool_call_total`, `edit_write_pct_of_tools`, `read_pct_of_tools`, `bash_pct_of_tools`, `tools_per_turn`. Non-negotiable for the v1.31.0 override matrix to read; also a debugging surface when archetype labels feel wrong.
+- New baseline fields `first_turn_cost_usd` and `first_turn_cost_share_pct`. The "first turn" skips `<synthetic>` and `is_resume_marker` turns so resumed sessions don't mis-attribute warmup cost to a placeholder.
+
+### Classifier priority chain (first match wins)
+
+1. `agent_workflow` — `subagent_share_pct >= 30`
+2. `short_test` — `0 < turns <= 5`
+3. `long_debug` — `turns > 30` AND (`cache_break_pct > 2%` OR `cache_hit_pct < 70`)
+4. `code_writing` — `turns > 5` AND `Edit + Write >= 25%` of tool calls
+5. `exploratory_chat` — `turns > 5` AND `tool_call_total / turns < 1.0`
+6. `unknown` — default
+
+The 2% cache-break threshold mirrors the existing `cache_break` trigger's downgrade rule: a single break in 200 turns is below typical concern, so the existing trigger downgrades to low — and the archetype must not pin the same session as `long_debug` while the trigger is calling it routine.
+
+### Calibration corpus (N=2)
+
+The classifier was calibrated against the two unique session JSON exports in `exports/session-metrics/`:
+
+- **session 1bf0a383** (168 turns, $8.44, 75% thinking, Edit/Write 15%, tools/turn 1.18) → `unknown` (no rule fires; honest fallback).
+- **session 8461c187** (173 turns, $41.49, 32% thinking, Edit/Write 36%, cache_break_pct 0.58%) → `code_writing` (Edit/Write ≥ 25%; cache_break_pct below 2% so long_debug correctly skipped).
+
+With N=2 the thresholds are working hypotheses, not measured baselines. Treat the override matrix slated for v1.31.0 as gated on at least ~10 audit sidecars existing across multiple session archetypes.
+
+### Why detect-only first
+
+The original Tier-2 plan bundled the archetype classifier and severity-override matrix into one ship. Splitting them means v1.30.0's archetype labels can be observed against real audit runs before the matrix locks in any decisions on guessed thresholds. If a label feels wrong on a real session, fix the threshold; only then ship the override matrix.
+
+### Playbook contract
+
+Both quick-audit.md and detailed-audit.md updated:
+
+- Schema reference bumped to v1.2 with a v1.1 → v1.2 additive migration note.
+- New "Session archetype" subsection in quick-audit.md (priority order + thresholds, no narrative in render).
+- New "Session archetype + first-turn warmup" subsection in detailed-audit.md (one-sentence narrative in Baseline section when archetype != unknown; first_turn_cost_share narrative gated on `turns > 30 AND share > 5%`).
+- Detailed-audit.md explicitly states first_turn_cost_share is **not** a `finding` and never enters `quick_wins` or `structural_fixes` — first-turn setup is unavoidable, so it's framing context, not actionable advice.
+
+### Tests
+
+15 new unit tests in `tests/test_session_metrics.py` (576 total, +15 since v1.29.0):
+
+- `test_audit_extract_digest_schema_version_is_1_2` — schema bump + presence of new fields.
+- 6 archetype trigger tests (one per enum value plus `unknown`).
+- `test_audit_extract_archetype_long_debug_skips_low_density_breaks` — guards the 0.5% case from v1.29.0's calibration session.
+- `test_audit_extract_archetype_priority_subagent_wins_over_short_test` — confirms the priority chain.
+- `test_audit_extract_archetype_unknown_on_zero_turns` — short_test must require `turns > 0`.
+- `test_audit_extract_archetype_signals_present_and_typed` — guards the v1.31.0 contract.
+- 4 first_turn_cost_share tests covering computed share, synthetic-skip, resume-marker-skip, and zero-turn case.
+
+**No `_SCRIPT_VERSION` bump.** This is an audit-skill change; the session-metrics parse cache is untouched.
+
+---
+
 ## v1.29.0 — 2026-04-29
 
 ### Feature — cache-aware audit pass (Tier-2 batch 1: positive findings + idle-gap cache decay)

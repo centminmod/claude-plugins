@@ -8723,12 +8723,18 @@ def test_audit_extract_weekly_rollup_suppressed_when_first_week():
 # ---------------------------------------------------------------------------
 
 
-def test_audit_extract_digest_schema_version_is_1_1():
+def test_audit_extract_digest_schema_version_is_1_2():
     ae = _load_audit_extract()
     digest = ae.build_digest(_audit_min_export(),
                              "/p/session_t_20260101T000000Z.json", "quick")
-    assert digest["digest_schema_version"] == "1.1"
+    assert digest["digest_schema_version"] == "1.2"
+    # v1.1 additions remain (additive evolution)
     assert "positive_triggers" in digest
+    # v1.2 additions
+    assert "session_archetype" in digest
+    assert "archetype_signals" in digest
+    assert "first_turn_cost_usd" in digest["baseline"]
+    assert "first_turn_cost_share_pct" in digest["baseline"]
 
 
 def test_audit_extract_positive_cache_savings_high_fires_on_ratio():
@@ -8873,3 +8879,226 @@ def test_audit_extract_idle_gap_cache_decay_skips_when_no_cache_rebuild():
     digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
     metrics = [t["metric"] for t in digest["fired_triggers"]]
     assert "idle_gap_cache_decay" not in metrics
+
+
+# v1.30.0 — session_archetype classifier (detect-only) + first_turn_cost_share
+
+def test_audit_extract_archetype_agent_workflow_fires_on_subagent_share():
+    ae = _load_audit_extract()
+    base = _audit_min_export()
+    data = _audit_min_export(
+        totals={**base["totals"], "turns": 12, "cost": 5.0},
+        subagent_share_stats={**base["subagent_share_stats"],
+                              "share_pct": 45.0, "attributed_cost": 2.25,
+                              "has_attribution": True},
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["session_archetype"] == "agent_workflow"
+    assert digest["archetype_signals"]["subagent_share_pct"] == 45.0
+
+
+def test_audit_extract_archetype_short_test_fires_at_low_turn_count():
+    ae = _load_audit_extract()
+    turns = [_audit_min_turn(index=i + 1) for i in range(3)]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 3, "cost": 0.20},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["session_archetype"] == "short_test"
+
+
+def test_audit_extract_archetype_long_debug_fires_on_cache_break_density():
+    ae = _load_audit_extract()
+    # 50 turns, 3 cache_breaks → 6% break rate (above 2% threshold)
+    turns = [_audit_min_turn(index=i + 1) for i in range(50)]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 50, "cost": 5.0},
+        sessions=[{"subtotal": {}, "turns": turns}],
+        cache_breaks=[
+            {"turn_index": i, "uncached": 100_000, "cache_break_pct": 50,
+             "session_id": "s", "timestamp": "", "timestamp_fmt": "",
+             "total_tokens": 100_000, "prompt_snippet": "",
+             "slash_command": "", "model": "claude-opus-4-7", "context": []}
+            for i in (10, 20, 30)
+        ],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["session_archetype"] == "long_debug"
+    assert digest["archetype_signals"]["cache_break_pct"] == pytest.approx(6.0)
+
+
+def test_audit_extract_archetype_long_debug_skips_low_density_breaks():
+    ae = _load_audit_extract()
+    # 200 turns, 1 cache_break → 0.5% break rate (below 2% threshold) AND
+    # cache_hit OK → must NOT classify as long_debug.
+    turns = [_audit_min_turn(index=i + 1, tool_use_detail=[{"name": "Read"}])
+             for i in range(200)]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 200, "cost": 10.0,
+                "cache_hit_pct": 95.0, "tool_call_total": 200},
+        sessions=[{"subtotal": {}, "turns": turns}],
+        cache_breaks=[{"turn_index": 100, "uncached": 100_000, "cache_break_pct": 50,
+                       "session_id": "s", "timestamp": "", "timestamp_fmt": "",
+                       "total_tokens": 100_000, "prompt_snippet": "",
+                       "slash_command": "", "model": "claude-opus-4-7", "context": []}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["session_archetype"] != "long_debug", (
+        "1 break in 200 turns (0.5%) is below the 2% threshold and must not "
+        "force-classify the session as long_debug"
+    )
+
+
+def test_audit_extract_archetype_code_writing_fires_on_edit_write_share():
+    ae = _load_audit_extract()
+    # 20 turns, 50 tool calls, 15 Edit + 5 Write = 40% Edit/Write
+    turns = []
+    for i in range(20):
+        details = []
+        if i < 15:
+            details.append({"name": "Edit"})
+        elif i < 20:
+            details.append({"name": "Write"})
+        # Bash filler so tool_call_total > 0 even at low Edit count
+        details.extend([{"name": "Bash"}] * 2 if i < 15 else [])
+        turns.append(_audit_min_turn(index=i + 1, tool_use_detail=details))
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 20, "cost": 2.0,
+                "tool_call_total": 50},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["session_archetype"] == "code_writing"
+    assert digest["archetype_signals"]["edit_write_pct_of_tools"] >= 25
+
+
+def test_audit_extract_archetype_exploratory_chat_fires_on_low_tool_density():
+    ae = _load_audit_extract()
+    # 20 turns, 5 tool calls → 0.25 tools/turn (below 1.0 threshold), no Edit
+    turns = [_audit_min_turn(index=i + 1) for i in range(20)]
+    for i in range(5):
+        turns[i]["tool_use_detail"] = [{"name": "Read"}]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 20, "cost": 1.0,
+                "tool_call_total": 5},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["session_archetype"] == "exploratory_chat"
+
+
+def test_audit_extract_archetype_unknown_when_no_pattern_matches():
+    ae = _load_audit_extract()
+    # 50 turns, balanced tool mix, no cache breaks, no subagent share
+    # → no archetype clearly fires → unknown (must not force-label)
+    turns = []
+    for i in range(50):
+        turns.append(_audit_min_turn(
+            index=i + 1,
+            tool_use_detail=[{"name": "Bash"}, {"name": "Read"}],
+        ))
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 50, "cost": 5.0,
+                "cache_hit_pct": 95.0, "tool_call_total": 100},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["session_archetype"] == "unknown"
+
+
+def test_audit_extract_archetype_priority_subagent_wins_over_short_test():
+    ae = _load_audit_extract()
+    # turns=3 would normally match short_test, but subagent_share=80 must win.
+    base = _audit_min_export()
+    data = _audit_min_export(
+        totals={**base["totals"], "turns": 3, "cost": 5.0},
+        subagent_share_stats={**base["subagent_share_stats"],
+                              "share_pct": 80.0, "attributed_cost": 4.0,
+                              "has_attribution": True},
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["session_archetype"] == "agent_workflow"
+
+
+def test_audit_extract_archetype_unknown_on_zero_turns():
+    ae = _load_audit_extract()
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 0, "cost": 0.0},
+        sessions=[{"subtotal": {}, "turns": []}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    # Zero turns must NOT match short_test — short_test requires turns > 0
+    assert digest["session_archetype"] == "unknown"
+
+
+def test_audit_extract_archetype_signals_present_and_typed():
+    ae = _load_audit_extract()
+    digest = ae.build_digest(_audit_min_export(),
+                             "/p/session_t_20260101T000000Z.json", "quick")
+    sig = digest["archetype_signals"]
+    # Required keys for the v1.31.0 override matrix to consume.
+    expected = {
+        "turns", "subagent_share_pct", "cache_hit_pct", "cache_break_count",
+        "thinking_turn_pct", "tool_call_total", "edit_write_pct_of_tools",
+        "read_pct_of_tools", "bash_pct_of_tools", "tools_per_turn",
+        "cache_break_pct",
+    }
+    assert expected.issubset(sig.keys())
+
+
+def test_audit_extract_first_turn_cost_share_pct_computed():
+    ae = _load_audit_extract()
+    turns = [_audit_min_turn(index=1, cost_usd=0.50),
+             _audit_min_turn(index=2, cost_usd=0.50)]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 2, "cost": 1.00},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["baseline"]["first_turn_cost_usd"] == pytest.approx(0.50)
+    assert digest["baseline"]["first_turn_cost_share_pct"] == pytest.approx(50.0)
+
+
+def test_audit_extract_first_turn_cost_share_skips_synthetic_turn():
+    ae = _load_audit_extract()
+    # Synthetic turn at index 1 must be skipped; idx 2 is the first user turn.
+    turns = [
+        _audit_min_turn(index=1, model="<synthetic>", cost_usd=0.0),
+        _audit_min_turn(index=2, model="claude-opus-4-7", cost_usd=0.20),
+        _audit_min_turn(index=3, model="claude-opus-4-7", cost_usd=0.80),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 3, "cost": 1.00},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["baseline"]["first_turn_cost_usd"] == pytest.approx(0.20)
+    assert digest["baseline"]["first_turn_cost_share_pct"] == pytest.approx(20.0)
+
+
+def test_audit_extract_first_turn_cost_share_skips_resume_marker():
+    ae = _load_audit_extract()
+    turns = [
+        _audit_min_turn(index=1, is_resume_marker=True, cost_usd=0.0),
+        _audit_min_turn(index=2, cost_usd=0.30),
+        _audit_min_turn(index=3, cost_usd=0.70),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 3, "cost": 1.00},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["baseline"]["first_turn_cost_usd"] == pytest.approx(0.30)
+    assert digest["baseline"]["first_turn_cost_share_pct"] == pytest.approx(30.0)
+
+
+def test_audit_extract_first_turn_cost_share_zero_when_no_turns():
+    ae = _load_audit_extract()
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 0, "cost": 0.0},
+        sessions=[{"subtotal": {}, "turns": []}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["baseline"]["first_turn_cost_usd"] == 0
+    assert digest["baseline"]["first_turn_cost_share_pct"] == 0.0

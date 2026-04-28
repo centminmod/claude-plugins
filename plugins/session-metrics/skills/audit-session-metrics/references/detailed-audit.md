@@ -106,7 +106,7 @@ emit one finding with the matching metric:
 Do not invent additional triggers from raw turn data — if the helper
 did not surface a pattern, it did not pass the threshold.
 
-## JSON schema (v1.1)
+## JSON schema (v1.2)
 
 Same spine as `quick-audit.md`'s schema, with `mode: "detailed"`,
 **up to 16 findings**, the `positive_findings` array (capped at 3,
@@ -115,13 +115,15 @@ same shape as quick-audit), and three additional top-level fields:
 
 ```jsonc
 {
-  "audit_schema_version": "1.1",
+  "audit_schema_version": "1.2",
   "mode": "detailed",
   "session_id_short": "<8-char id, copy from digest.session_id_short>",
   "generated_at": "<ISO8601 UTC>",
   "input_json": "<absolute path, copy from digest.input_json>",
 
-  "baseline": { /* copy from digest.baseline */ },
+  "session_archetype": "<one of: agent_workflow|short_test|long_debug|code_writing|exploratory_chat|unknown — copy from digest.session_archetype>",
+
+  "baseline": { /* copy from digest.baseline — now includes first_turn_cost_usd and first_turn_cost_share_pct (v1.2) */ },
 
   "findings": [ <list every fired trigger + every detailed-only finding, capped at 16, sorted high → low severity, then by descending estimated_impact_usd> ],
 
@@ -188,6 +190,31 @@ CLAUDE.md at 8000 tokens is still `high` but flag the magnitude in
 downgrades, copy `digest.fired_triggers[i].suggested_severity` into the
 finding's `severity` and quote `downgrade_reason` in the `fix`
 paragraph.
+
+### Session archetype + first-turn warmup (v1.2 — detect-only)
+
+The helper emits a top-level `session_archetype` and an
+`archetype_signals` debugging dict. See [`quick-audit.md`](quick-audit.md)
+for the priority order and trigger thresholds — the same enum applies
+to detailed mode.
+
+Detailed mode **does** narrate the archetype (one short sentence in
+the Baseline section, e.g. *"Archetype: code_writing — Edit/Write
+36% of tool calls."*). Use the `archetype_signals` to ground the
+sentence; do not narrate when archetype is `unknown` (silently skip
+the sentence rather than guess at why).
+
+`baseline.first_turn_cost_share_pct` is informational. Mention it
+in the Baseline section narrative **only when both** of these hold:
+
+- `baseline.turns > 30` (long-session archetypes only — the share is
+  meaningless on a 5-turn session because every turn is a large share)
+- `baseline.first_turn_cost_share_pct > 5`
+
+When mentioning, frame it as context for the per-turn average rather
+than as actionable advice — first-turn setup cost is unavoidable, so
+this is **not** a separate `finding` and never appears in
+`quick_wins` or `structural_fixes`.
 
 ### Sixteen-finding cap (negative) + three-finding cap (positive)
 
@@ -310,11 +337,17 @@ cache-break suffix on top turns) carry over unchanged.
 
 ## Schema versioning
 
-Same versioning rules as quick-audit. Quick and detailed share
-`audit_schema_version`; bump them together. The detailed-only fields
-(`quick_wins`, `structural_fixes`, `estimated_savings`) are
-optional from a quick-audit consumer's perspective — tooling should
-gate on `mode: "detailed"` before reading them.
+Same versioning rules as quick-audit (currently `1.2`). Quick and
+detailed share `audit_schema_version`; bump them together. The
+detailed-only fields (`quick_wins`, `structural_fixes`,
+`estimated_savings`) are optional from a quick-audit consumer's
+perspective — tooling should gate on `mode: "detailed"` before
+reading them.
+
+**v1.1 → v1.2** (additive): added top-level `session_archetype` and
+`baseline.first_turn_cost_usd` / `baseline.first_turn_cost_share_pct`.
+v1.2 ships archetype as **detect-only**; severity overrides
+conditional on archetype come in v1.31.0.
 
 Phases 4 (interactive Q&A) and 5 (CLAUDE.md rewrite) from earlier
 audit drafts remain **out of scope for v1**.

@@ -41,7 +41,20 @@ OPUS_INPUT_RATE_PER_M = 5.00
 # would have hit. Independent of the HTML --idle-gap-minutes UI threshold.
 CACHE_TTL_5M_SECONDS = 300
 
-DIGEST_SCHEMA_VERSION = "1.1"
+DIGEST_SCHEMA_VERSION = "1.2"
+
+# Session archetype enum — emitted as a top-level digest field. The classifier
+# is intentionally biased toward `unknown` at low confidence (lesson learned
+# from v1.29.0's `"other"`-row padding antipattern). Severity overrides
+# conditional on archetype come in v1.31.0; v1.30.0 ships *detect-only*.
+SESSION_ARCHETYPES = (
+    "agent_workflow",    # subagent_share_pct >= 30
+    "short_test",        # turns <= 5
+    "long_debug",        # turns > 30 AND (cache_breaks OR cache_hit_pct < 70)
+    "code_writing",      # turns > 5 AND Edit+Write >= 25% of tool calls
+    "exploratory_chat",  # turns > 5 AND tool_call_total / turns < 1.0
+    "unknown",           # default — no clear pattern
+)
 
 
 def session_filename_parts(path: str) -> tuple[str, str]:
@@ -69,11 +82,31 @@ def flatten_turns(data: dict) -> list[dict]:
     return [t for s in data.get("sessions", []) for t in s.get("turns", [])]
 
 
+def _first_user_turn(data: dict) -> dict | None:
+    """Return the first non-synthetic, non-resume-marker turn across all
+    sessions, or None if no such turn exists. Used to anchor the
+    first_turn_cost_share metric so resumed/synthetic-fronted exports do
+    not mis-attribute the warmup cost."""
+    for s in data.get("sessions", []):
+        for t in s.get("turns", []):
+            if t.get("is_resume_marker"):
+                continue
+            model = (t.get("model") or "")
+            if model.startswith("<synthetic>"):
+                continue
+            return t
+    return None
+
+
 def compute_baseline(data: dict) -> dict:
     totals = data.get("totals", {})
     output = totals.get("output", 0)
     uncached_input = totals.get("total_input", 0) - totals.get("cache_read", 0)
     ratio = int(round(uncached_input / output)) if output else 0
+    cost = totals.get("cost", 0) or 0
+    first = _first_user_turn(data)
+    first_cost = (first.get("cost_usd", 0) or 0) if first else 0
+    first_share_pct = round(_safe_div_pct(first_cost, cost), 1) if cost > 0 else 0.0
     return {
         "total_cost_usd": round(totals.get("cost", 0), 2),
         "turns": totals.get("turns", 0),
@@ -82,6 +115,8 @@ def compute_baseline(data: dict) -> dict:
         "cache_hit_pct": round(totals.get("cache_hit_pct", 0), 1),
         "cache_savings_usd": round(totals.get("cache_savings", 0), 2),
         "no_cache_cost_usd": round(totals.get("no_cache_cost", 0), 2),
+        "first_turn_cost_usd": round(first_cost, 4),
+        "first_turn_cost_share_pct": first_share_pct,
     }
 
 
@@ -481,6 +516,91 @@ def evaluate_positive_triggers(data: dict) -> list[dict]:
     return fired
 
 
+def _aggregate_tool_counts(turns: list[dict]) -> Counter[str]:
+    """Aggregate per-tool invocation counts across all turns. Used by the
+    archetype classifier to compute Edit/Write share and Read share."""
+    counts: Counter[str] = Counter()
+    for t in turns:
+        for d in t.get("tool_use_detail", []) or []:
+            name = d.get("name")
+            if name:
+                counts[name] += 1
+    return counts
+
+
+def classify_session_archetype(data: dict, turns: list[dict]) -> tuple[str, dict]:
+    """Detect-only classifier (v1.30.0). Returns (archetype, signals).
+
+    Priority order (first match wins):
+      1. agent_workflow   — subagent_share_pct >= 30
+      2. short_test       — 0 < turns <= 5
+      3. long_debug       — turns > 30 AND (cache_break_pct > 2% OR cache_hit_pct < 70).
+                            The 2% threshold mirrors the cache_break trigger's
+                            downgrade rule — a single break in 200 turns is
+                            below typical concern, so it should not pin the
+                            session as "debug".
+      4. code_writing     — turns > 5 AND (Edit + Write) >= 25% of tool calls
+      5. exploratory_chat — turns > 5 AND tool_call_total / turns < 1.0
+      6. unknown          — default; no clear pattern (do NOT force-label)
+
+    The classifier is intentionally biased toward `unknown` at low confidence
+    — same lesson as v1.29.0's forbidden `"other"` enum: forcing labels to
+    appear thorough is the antipattern. Severity overrides conditional on
+    archetype come in v1.31.0; v1.30.0 is detect-only.
+
+    Signals are emitted alongside the label so future overrides + debugging
+    can see what the classifier saw.
+    """
+    totals = data.get("totals", {}) or {}
+    sub = data.get("subagent_share_stats", {}) or {}
+    cache_breaks = data.get("cache_breaks", []) or []
+
+    n_turns = totals.get("turns", 0) or 0
+    sub_share = sub.get("share_pct", 0) or 0
+    cache_hit = totals.get("cache_hit_pct", 0) or 0
+    thinking_pct = totals.get("thinking_turn_pct", 0) or 0
+    tool_call_total = totals.get("tool_call_total", 0) or 0
+
+    tool_counts = _aggregate_tool_counts(turns)
+    edit_write = tool_counts.get("Edit", 0) + tool_counts.get("Write", 0)
+    read_count = tool_counts.get("Read", 0)
+    bash_count = tool_counts.get("Bash", 0)
+    edit_write_pct = (edit_write / tool_call_total * 100) if tool_call_total else 0.0
+    read_pct = (read_count / tool_call_total * 100) if tool_call_total else 0.0
+    bash_pct = (bash_count / tool_call_total * 100) if tool_call_total else 0.0
+    tools_per_turn = (tool_call_total / n_turns) if n_turns else 0.0
+
+    signals = {
+        "turns": n_turns,
+        "subagent_share_pct": round(sub_share, 1),
+        "cache_hit_pct": round(cache_hit, 1),
+        "cache_break_count": len(cache_breaks),
+        "thinking_turn_pct": round(thinking_pct, 1),
+        "tool_call_total": tool_call_total,
+        "edit_write_pct_of_tools": round(edit_write_pct, 1),
+        "read_pct_of_tools": round(read_pct, 1),
+        "bash_pct_of_tools": round(bash_pct, 1),
+        "tools_per_turn": round(tools_per_turn, 2),
+    }
+
+    # Priority chain — first match wins. Document the order in the docstring
+    # rather than rely on Haiku to reverse-engineer it.
+    cache_break_pct = (len(cache_breaks) / n_turns * 100) if n_turns else 0.0
+    signals["cache_break_pct"] = round(cache_break_pct, 2)
+
+    if sub_share >= 30:
+        return "agent_workflow", signals
+    if 0 < n_turns <= 5:
+        return "short_test", signals
+    if n_turns > 30 and (cache_break_pct > 2 or cache_hit < 70):
+        return "long_debug", signals
+    if n_turns > 5 and edit_write_pct >= 25:
+        return "code_writing", signals
+    if n_turns > 5 and tool_call_total > 0 and tools_per_turn < 1.0:
+        return "exploratory_chat", signals
+    return "unknown", signals
+
+
 def top_expensive_turns(turns: list[dict], cache_breaks: list[dict]) -> list[dict]:
     """Return the 3 most expensive turns with hypothesis + cross-finding flags."""
     cb_indices = {cb.get("turn_index") for cb in cache_breaks}
@@ -662,12 +782,15 @@ def build_digest(data: dict, json_path: str, mode: str) -> dict:
     turns = flatten_turns(data)
     cache_breaks = data.get("cache_breaks", []) or []
     id8, ts = session_filename_parts(json_path)
+    archetype, archetype_signals = classify_session_archetype(data, turns)
     digest: dict[str, Any] = {
         "digest_schema_version": DIGEST_SCHEMA_VERSION,
         "session_id_short": id8,
         "ts_str": ts,
         "input_json": os.path.abspath(json_path),
         "mode_hint": mode,
+        "session_archetype": archetype,
+        "archetype_signals": archetype_signals,
         "baseline": compute_baseline(data),
         "fired_triggers": evaluate_triggers(data, turns),
         "positive_triggers": evaluate_positive_triggers(data),

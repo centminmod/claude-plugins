@@ -44,17 +44,19 @@ per file.
 `session_id_short` and `ts_str` fields (the helper parses the input
 filename).
 
-## JSON schema (v1.1)
+## JSON schema (v1.2)
 
 ```jsonc
 {
-  "audit_schema_version": "1.1",
+  "audit_schema_version": "1.2",
   "mode": "quick",
   "session_id_short": "<8-char id, copy from digest.session_id_short>",
   "generated_at": "<ISO8601 UTC, e.g. 2026-04-29T01:23:45Z>",
   "input_json": "<absolute path, copy from digest.input_json>",
 
-  "baseline": { /* copy from digest.baseline verbatim */ },
+  "session_archetype": "<one of: agent_workflow|short_test|long_debug|code_writing|exploratory_chat|unknown — copy from digest.session_archetype>",
+
+  "baseline": { /* copy from digest.baseline verbatim — now includes first_turn_cost_usd and first_turn_cost_share_pct (v1.2) */ },
 
   "findings": [ <list every fired trigger from digest.fired_triggers as a finding object; cap at 7 for scannability — see "Finding cap" below> ],
 
@@ -130,6 +132,32 @@ Positive findings come from `digest.positive_triggers` and represent
 |---------------------|---------|---------------|
 | `cache_savings_high` | `cache_savings > 3× cost` OR `cache_savings > $5` | `totals.cache_savings` (already realised) |
 | `cache_health_excellent` | `cache_hit_pct > 90` AND zero `cache_breaks` | `null` — informational |
+
+### Session archetype (v1.2 — detect-only)
+
+The helper emits a top-level `session_archetype` string and an
+`archetype_signals` debugging dict. Quick mode does **not** narrate the
+archetype — it stays in the JSON sidecar only, keeping the markdown tight.
+Detailed mode does narrate it; see [`detailed-audit.md`](detailed-audit.md).
+
+Priority order (first match wins; biased toward `unknown`):
+
+| Archetype | Trigger |
+|-----------|---------|
+| `agent_workflow` | `subagent_share_pct >= 30` |
+| `short_test` | `0 < turns <= 5` |
+| `long_debug` | `turns > 30` AND (`cache_break_pct > 2%` OR `cache_hit_pct < 70`) |
+| `code_writing` | `turns > 5` AND `Edit + Write >= 25%` of tool calls |
+| `exploratory_chat` | `turns > 5` AND `tool_call_total / turns < 1.0` |
+| `unknown` | default — no clear pattern (do **not** force-label) |
+
+The 2% cache-break threshold mirrors the `cache_break` trigger's
+downgrade rule so a single break in 200 turns doesn't pin the session
+as "debug" while the trigger itself downgrades to low.
+
+Severity overrides conditional on archetype come in v1.31.0 once we
+have ~10 audit sidecars to validate the override matrix against.
+v1.30.0 ships **detect-only**.
 
 ### Top expensive turn object
 
@@ -291,14 +319,24 @@ already shows context above the audit).
 
 ## Schema versioning
 
-Bumping `audit_schema_version` (currently `1.1`) is breaking — any
-tooling that consumes the JSON sidecar will need to handle the new
-shape. Bump the major number for breaking changes (renamed fields,
-removed enum values), the minor number for additive changes (new
-optional fields, new enum values).
+Bumping the major number of `audit_schema_version` (currently `1.2`)
+is breaking — any tooling that consumes the JSON sidecar will need to
+handle the new shape. Bump the major number for breaking changes
+(renamed fields, removed enum values), the minor number for additive
+changes (new optional fields, new enum values).
 
 **v1.0 → v1.1** (additive): added `positive_findings` array (parallel
 to `findings`), added `idle_gap_cache_decay` to the negative metric
 enum, added `cache_savings_high` and `cache_health_excellent` positive
-metric enum. The `other` enum is **forbidden** in v1.1 outputs (was
+metric enum. The `other` enum is **forbidden** in v1.1+ outputs (was
 "use sparingly" in v1.0).
+
+**v1.1 → v1.2** (additive): added top-level `session_archetype` string
+(enum: `agent_workflow`, `short_test`, `long_debug`, `code_writing`,
+`exploratory_chat`, `unknown`); added `baseline.first_turn_cost_usd`
+and `baseline.first_turn_cost_share_pct` (synthetic + resume-marker
+turns are skipped when picking the first turn). v1.1 outputs continue
+to validate against v1.2 readers — both new fields are optional. v1.2
+ships archetype as **detect-only**; severity overrides conditional on
+archetype are queued for v1.31.0 once ~10 sidecars exist for
+calibration.
