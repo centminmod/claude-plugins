@@ -2384,6 +2384,55 @@ def _build_by_skill(sessions: list[dict], total_cost: float) -> list[dict]:
     return _finalise_skill_rows(rows, total_cost)
 
 
+# Skill-name aliases that all attribute back to "session-metrics" for the
+# self-cost meta-metric. The user's slash-command name and the marketplace
+# plugin namespace both surface in the by_skill aggregation; map them here
+# so the meta-metric stays correct regardless of how the skill was invoked.
+_SELF_COST_SKILL_NAMES = frozenset({
+    "session-metrics",
+    "session-metrics:session-metrics",
+})
+
+
+def _summarize_self_cost(by_skill: list[dict]) -> dict:
+    """Return the running-total cost of session-metrics' own prior turns.
+
+    The current invocation's tokens are not yet written to the JSONL when
+    the script reads it, so this metric is intentionally a "prior turns
+    in this session" figure — first-ever invocation correctly reports
+    zero. Surfaces as a stderr line, an HTML KPI card, and a top-level
+    JSON key so users can audit the cost of their own observability
+    tooling alongside their session work.
+    """
+    out = {
+        "turns":          0,
+        "input":          0,
+        "output":         0,
+        "cache_read":     0,
+        "cache_write":    0,
+        "total_tokens":   0,
+        "cost_usd":       0.0,
+        "matched_skill_names": [],
+        "note": "Running total of prior session-metrics turns in this "
+                "session; the current invocation is not yet written to "
+                "the JSONL when the script reads it.",
+    }
+    for row in by_skill or []:
+        name = row.get("name") or ""
+        if name not in _SELF_COST_SKILL_NAMES:
+            continue
+        out["turns"]        += int(row.get("turns_attributed", 0) or 0)
+        out["input"]        += int(row.get("input", 0) or 0)
+        out["output"]       += int(row.get("output", 0) or 0)
+        out["cache_read"]   += int(row.get("cache_read", 0) or 0)
+        out["cache_write"]  += int(row.get("cache_write", 0) or 0)
+        out["total_tokens"] += int(row.get("total_tokens", 0) or 0)
+        out["cost_usd"]     += float(row.get("cost_usd", 0.0) or 0.0)
+        out["matched_skill_names"].append(name)
+    out["cost_usd"] = round(out["cost_usd"], 6)
+    return out
+
+
 def _empty_subagent_row(name: str) -> dict:
     return {
         "name":             name,
@@ -3547,6 +3596,10 @@ def _build_report(
         # it before returning the list.
         "_suppress_model_compare_insight": suppress_model_compare_insight,
     }
+    # Self-cost meta-metric (v1.27.0): how much has session-metrics itself
+    # cost in this session's JSONL? Always computed; renderers / dispatcher
+    # honour --no-self-cost by stripping the field before display.
+    report["self_cost"] = _summarize_self_cost(report["by_skill"])
     # Sort global cache_breaks by uncached desc to keep "worst-first" order.
     report["cache_breaks"].sort(key=lambda b: -int(b.get("uncached", 0)))
     # v1.26.0: precompute the headline subagent share + within-session
@@ -8145,6 +8198,29 @@ def render_html(report: dict, variant: str = "single",
         # stays visible.
         _sa_stats = _compute_subagent_share(report)
         subagent_share_card = "\n  " + _build_subagent_share_card_html(_sa_stats)
+        # v1.27.0: self-cost meta-metric KPI card — surfaces session-metrics'
+        # own running token cost in this session. Hidden when --no-self-cost
+        # stripped the field; also hidden when the session has zero
+        # session-metrics turns (first-ever invocation), since a $0 / 0-turn
+        # card adds no information on the dashboard.
+        self_cost_card = ""
+        _self_cost = report.get("self_cost") or {}
+        if _self_cost and (int(_self_cost.get("turns", 0) or 0) > 0):
+            _sc_turns  = int(_self_cost.get("turns", 0) or 0)
+            _sc_cost   = float(_self_cost.get("cost_usd", 0.0) or 0.0)
+            _sc_tokens = int(_self_cost.get("total_tokens", 0) or 0)
+            self_cost_card = (
+                f'\n  <div class="kpi" '
+                f'title="Running total of prior session-metrics turns in '
+                f'this session. The current invocation is not yet written '
+                f'to the JSONL when the script reads it, so this number '
+                f'always lags by one run.">'
+                f'<div class="kpi-label">Skill self-cost &middot; prior runs '
+                f'this session</div>'
+                f'<div class="kpi-val">${_sc_cost:.4f} &middot; '
+                f'{_sc_turns} turn{"s" if _sc_turns != 1 else ""} &middot; '
+                f'{_sc_tokens:,} tokens</div></div>'
+            )
         summary_cards_html = f'''\
 <div class="kpi-grid">
   <div class="kpi featured cat-tokens"><div class="kpi-label">Total cost (USD)</div><div class="kpi-val">${totals['cost']:.4f}</div></div>
@@ -8154,7 +8230,7 @@ def render_html(report: dict, variant: str = "single",
   <div class="kpi cat-tokens"><div class="kpi-label">Input tokens (new)</div><div class="kpi-val">{totals['input']:,}</div></div>
   <div class="kpi cat-tokens"><div class="kpi-label">Output tokens</div><div class="kpi-val">{totals['output']:,}</div></div>
   <div class="kpi cat-tokens"><div class="kpi-label">Cache read tokens</div><div class="kpi-val">{totals['cache_read']:,}</div></div>
-  <div class="kpi cat-tokens"><div class="kpi-label">Cache write tokens</div><div class="kpi-val">{totals['cache_write']:,}</div></div>{ttl_mix_card}{thinking_card}{tool_calls_card}{advisor_card}{resumes_card}{truncated_card}
+  <div class="kpi cat-tokens"><div class="kpi-label">Cache write tokens</div><div class="kpi-val">{totals['cache_write']:,}</div></div>{ttl_mix_card}{thinking_card}{tool_calls_card}{advisor_card}{resumes_card}{truncated_card}{self_cost_card}
 </div>'''
 
     # Usage Insights panel — sits between the summary cards and the
@@ -9015,7 +9091,8 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
                          suppress_model_compare_insight: bool = False,
                          cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
                          subagent_attribution: bool = True,
-                         sort_prompts_by: str | None = None) -> None:
+                         sort_prompts_by: str | None = None,
+                         no_self_cost: bool = False) -> None:
     print(f"Session : {jsonl_path.stem}", file=sys.stderr)
     print(f"File    : {jsonl_path}", file=sys.stderr)
     print(file=sys.stderr)
@@ -9039,8 +9116,11 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
         sort_prompts_by=sort_prompts_by,
         include_subagents=include_subagents,
     )
+    self_cost = report.pop("self_cost", None) if no_self_cost else report.get("self_cost")
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib,
               idle_gap_minutes=idle_gap_minutes)
+    if not no_self_cost and self_cost:
+        _print_self_cost_summary(self_cost)
 
 
 def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
@@ -9053,7 +9133,8 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
                       suppress_model_compare_insight: bool = False,
                       cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
                       subagent_attribution: bool = True,
-                      sort_prompts_by: str | None = None) -> None:
+                      sort_prompts_by: str | None = None,
+                      no_self_cost: bool = False) -> None:
     files = _find_jsonl_files(slug)
     if not files:
         print(f"[error] No sessions found for slug: {slug}", file=sys.stderr)
@@ -9084,8 +9165,11 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
         sort_prompts_by=sort_prompts_by,
         include_subagents=include_subagents,
     )
+    self_cost = report.pop("self_cost", None) if no_self_cost else report.get("self_cost")
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib,
               idle_gap_minutes=idle_gap_minutes)
+    if not no_self_cost and self_cost:
+        _print_self_cost_summary(self_cost)
 
 
 # === instance mode: begin ===================================================
@@ -10240,6 +10324,28 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
 # === instance mode: end =====================================================
 
 
+def _print_self_cost_summary(self_cost: dict | None) -> None:
+    """Print a one-line `[self-cost]` stderr summary for the current run.
+
+    Always rendered after the `[export]` lines so users see how much the
+    skill itself has cost in this session before seeing any audit
+    suggestion. The number reflects **prior** session-metrics turns in
+    this session — the current run is not yet written to the JSONL when
+    we read it.
+    """
+    if not self_cost or not isinstance(self_cost, dict):
+        return
+    turns  = int(self_cost.get("turns", 0) or 0)
+    cost   = float(self_cost.get("cost_usd", 0.0) or 0.0)
+    tokens = int(self_cost.get("total_tokens", 0) or 0)
+    print(
+        f"[self-cost] session-metrics consumed {turns} prior "
+        f"turn{'s' if turns != 1 else ''} this session, ${cost:.4f}, "
+        f"{tokens:,} tokens (current run not yet logged).",
+        file=sys.stderr,
+    )
+
+
 def _dispatch(report: dict, formats: list[str],
                single_page: bool = False,
                chart_lib: str = "highcharts",
@@ -10397,6 +10503,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-cache", action="store_true",
                    help="Skip the parse cache at ~/.cache/session-metrics/parse/ "
                         "and always re-parse JSONL from scratch.")
+    p.add_argument("--no-self-cost", action="store_true",
+                   help="Suppress the self-cost meta-metric (skill's own "
+                        "running-total cost in this session). Drops the "
+                        "stderr [self-cost] summary line, the HTML KPI "
+                        "card, and the JSON `self_cost` top-level key. "
+                        "Only meaningful at session and project scope; "
+                        "instance scope (--all-projects) does not compute "
+                        "self-cost.")
     p.add_argument("--chart-lib", metavar="LIB",
                    choices=sorted(CHART_RENDERERS.keys()),
                    default="highcharts",
@@ -10922,6 +11036,7 @@ def main() -> None:
             cache_break_threshold=args.cache_break_threshold,
             subagent_attribution=not args.no_subagent_attribution,
             sort_prompts_by=args.sort_prompts_by,
+            no_self_cost=args.no_self_cost,
         )
         return
 
@@ -10937,6 +11052,7 @@ def main() -> None:
         cache_break_threshold=args.cache_break_threshold,
         subagent_attribution=not args.no_subagent_attribution,
         sort_prompts_by=args.sort_prompts_by,
+        no_self_cost=args.no_self_cost,
     )
 
 

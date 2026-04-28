@@ -8,8 +8,8 @@
     {
       "name": "session-metrics",
       "source": "./plugins/session-metrics",
-      "description": "Per-turn token, cost, and cache metrics for Claude Code sessions. Multi-format export (text/JSON/CSV/MD/HTML) with 5-hour session blocks, weekly roll-up, hour-of-day punchcard, subagent attribution, pluggable chart libraries, and 9-category turn waste classification (stacked bar + drill-down cards: retry chains, file re-accesses, verbose edits, stop-reason). HTML timeline: idle-gap dividers, model-switch dividers, truncated-response badges, cache-break badges, Turn Character column, per-turn drawer with data-driven classification explanation. Advisor turn cost correction (usage.iterations) + Advisor calls dashboard card. One-command --compare-run for A/B model benchmark; --compare renders IFEval pass-rate + shareable HTML.",
-      "version": "1.26.2",
+      "description": "Per-turn token, cost, and cache metrics for Claude Code sessions. Multi-format export (text/JSON/CSV/MD/HTML) with 5-hour session blocks, weekly roll-up, hour-of-day punchcard, subagent attribution, pluggable chart libraries, and 9-category turn waste classification (stacked bar + drill-down cards: retry chains, file re-accesses, verbose edits, stop-reason). HTML timeline: idle-gap dividers, model-switch dividers, truncated-response badges, cache-break badges, Turn Character column, per-turn drawer with data-driven classification explanation. Advisor turn cost correction (usage.iterations) + Advisor calls dashboard card. v1.27.0 adds self-cost meta-metric ([self-cost] stderr + HTML KPI card + JSON `self_cost` key, --no-self-cost suppresses) and sibling audit-session-metrics skill (Haiku-pinned for ~10× cost savings) producing a versioned, schema-driven plain-English audit. One-command --compare-run for A/B model benchmark; --compare renders IFEval pass-rate + shareable HTML.",
+      "version": "1.27.0",
       "homepage": "https://github.com/centminmod/claude-plugins/tree/master/plugins/session-metrics",
       "author": {
         "name": "George Liu"

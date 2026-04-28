@@ -7418,6 +7418,238 @@ def test_phase_a_html_sections_auto_hide_when_empty():
     assert ">Skills &amp; slash commands<" not in html
 
 
+# ---------------------------------------------------------------------------
+# Self-cost meta-metric (v1.27.0). Filters by_skill rows for session-metrics'
+# own attribution and exposes them as a top-level report key, an HTML KPI
+# card, and a `[self-cost]` stderr line. The current invocation is *not*
+# yet in the JSONL when the script reads it — the figure intentionally
+# reflects only prior session-metrics turns this session.
+# ---------------------------------------------------------------------------
+
+def test_self_cost_summarizer_picks_session_metrics_rows():
+    by_skill = [
+        {"name": "session-metrics", "turns_attributed": 2,
+         "input": 100, "output": 50, "cache_read": 1000,
+         "cache_write": 200, "total_tokens": 1350, "cost_usd": 0.0123},
+        {"name": "compact", "turns_attributed": 1,
+         "input": 10, "output": 5, "cache_read": 0, "cache_write": 0,
+         "total_tokens": 15, "cost_usd": 0.0001},
+    ]
+    sc = sm._summarize_self_cost(by_skill)
+    assert sc["turns"] == 2
+    assert sc["cost_usd"] == 0.0123
+    assert sc["total_tokens"] == 1350
+    assert sc["input"] == 100
+    assert sc["output"] == 50
+    assert sc["cache_read"] == 1000
+    assert sc["cache_write"] == 200
+    assert sc["matched_skill_names"] == ["session-metrics"]
+    assert "current invocation" in sc["note"]
+
+
+def test_self_cost_summarizer_handles_namespaced_alias():
+    """Plugin marketplace surfaces ``session-metrics:session-metrics``;
+    the summary must aggregate it alongside the bare slash-command name."""
+    by_skill = [
+        {"name": "session-metrics", "turns_attributed": 1,
+         "input": 10, "output": 5, "cache_read": 0, "cache_write": 0,
+         "total_tokens": 15, "cost_usd": 0.0010},
+        {"name": "session-metrics:session-metrics", "turns_attributed": 1,
+         "input": 20, "output": 10, "cache_read": 0, "cache_write": 0,
+         "total_tokens": 30, "cost_usd": 0.0020},
+    ]
+    sc = sm._summarize_self_cost(by_skill)
+    assert sc["turns"] == 2
+    assert sc["cost_usd"] == 0.003
+    assert sorted(sc["matched_skill_names"]) == [
+        "session-metrics", "session-metrics:session-metrics",
+    ]
+
+
+def test_self_cost_summarizer_zero_when_no_session_metrics_rows():
+    """First-ever invocation in a session: by_skill has no session-metrics
+    row yet (current run not logged), so the meta-metric correctly
+    reports $0 / 0 turns."""
+    sc = sm._summarize_self_cost([
+        {"name": "compact", "turns_attributed": 1, "input": 1, "output": 1,
+         "cache_read": 0, "cache_write": 0, "total_tokens": 2,
+         "cost_usd": 0.0001},
+    ])
+    assert sc["turns"] == 0
+    assert sc["cost_usd"] == 0.0
+    assert sc["total_tokens"] == 0
+    assert sc["matched_skill_names"] == []
+
+
+def test_self_cost_attached_to_phase_a_report():
+    r = _build_phase_a_report()
+    sc = r.get("self_cost")
+    assert isinstance(sc, dict)
+    rows = {row["name"]: row for row in (r.get("by_skill") or [])}
+    sm_row = rows.get("session-metrics") or {}
+    assert sc["turns"] == sm_row.get("turns_attributed", 0)
+    assert sc["cost_usd"] == round(sm_row.get("cost_usd", 0.0), 6)
+    assert "session-metrics" in sc["matched_skill_names"]
+
+
+def test_self_cost_html_card_renders_when_nonzero():
+    r = _build_phase_a_report()
+    html = sm.render_html(r, variant="single", chart_lib="none")
+    # Card has the labelled header and the tooltip caveat.
+    assert "Skill self-cost" in html
+    assert "prior runs" in html
+
+
+def test_self_cost_html_card_hidden_when_zero():
+    """mini fixture has no session-metrics turns; the card must not render."""
+    entries = sm._parse_jsonl(_FIXTURE)
+    turns = sm._extract_turns(entries)
+    user_ts = sm._extract_user_timestamps(entries)
+    r = sm._build_report("session", "mini", [("mini", turns, user_ts)])
+    html = sm.render_html(r, variant="single", chart_lib="none")
+    assert "Skill self-cost" not in html
+
+
+def test_self_cost_json_export_carries_field():
+    r = _build_phase_a_report()
+    payload = sm._RENDERERS["json"](r)
+    import json as _json
+    parsed = _json.loads(payload)
+    assert "self_cost" in parsed
+    assert parsed["self_cost"]["turns"] >= 1
+    assert "current invocation" in parsed["self_cost"]["note"]
+
+
+def test_self_cost_print_summary(capsys):
+    sm._print_self_cost_summary({
+        "turns": 3, "cost_usd": 0.0250, "total_tokens": 12345,
+    })
+    captured = capsys.readouterr()
+    assert "[self-cost]" in captured.err
+    assert "3 prior turns" in captured.err
+    assert "$0.0250" in captured.err
+    assert "12,345 tokens" in captured.err
+
+
+def test_self_cost_print_summary_handles_none(capsys):
+    sm._print_self_cost_summary(None)
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+# ---------------------------------------------------------------------------
+# audit-session-metrics skill — playbook smoke tests. We can't golden-test
+# free-form Haiku output, but the reference files must exist with the
+# structural anchors the SKILL.md body relies on.
+# ---------------------------------------------------------------------------
+
+def test_audit_skill_files_present():
+    audit_dir = _HERE.parent.parent / "audit-session-metrics"
+    assert (audit_dir / "SKILL.md").exists()
+    assert (audit_dir / "references" / "quick-audit.md").exists()
+    assert (audit_dir / "references" / "detailed-audit.md").exists()
+
+
+def test_audit_skill_frontmatter_pins_haiku():
+    audit_skill = (_HERE.parent.parent / "audit-session-metrics"
+                   / "SKILL.md").read_text(encoding="utf-8")
+    # Frontmatter must declare model: haiku, otherwise the cost-saving
+    # split is undermined (audit would inherit the parent session's model).
+    assert "name: audit-session-metrics" in audit_skill
+    assert "model: haiku" in audit_skill
+
+
+def test_audit_quick_playbook_anchors():
+    quick = (_HERE.parent.parent / "audit-session-metrics" / "references"
+             / "quick-audit.md").read_text(encoding="utf-8")
+    # Anchor strings the playbook contract relies on. Changing these
+    # without updating SKILL.md or downstream tooling is a regression.
+    # Three-artefact contract:
+    assert "Output contract" in quick
+    assert "JSON sidecar" in quick
+    assert "Markdown copy" in quick
+    assert "Inline chat output" in quick
+    # Schema and render contract:
+    assert "JSON schema" in quick
+    assert "audit_schema_version" in quick
+    assert "Metric enum" in quick
+    assert "Finding object" in quick
+    assert "Top expensive turn object" in quick
+    assert "Markdown render template" in quick
+    # Markdown sections the render template emits:
+    assert "Findings" in quick
+    assert "Top 3 expensive turns" in quick
+    assert "What to fix first" in quick
+    # Sample of metric enum names — these are part of the public schema:
+    assert "cache_break" in quick
+    assert "top_turn_share" in quick
+    assert "advisor_share" in quick
+    # Tier-1 additions (v1.27.0):
+    assert "session_warmup_overhead" in quick
+    assert "tool_result_bloat" in quick
+    # Optional-impact contract: estimated_impact_usd must explicitly
+    # allow null so the model is told never to guess.
+    assert "estimated_impact_usd" in quick
+    assert "null" in quick
+    # Cap was bumped from 5 → 7 with Tier-1 additions:
+    assert "exactly 7 finding" in quick or "exactly 7 findings" in quick
+    assert "Seven-finding contract" in quick
+
+
+def test_audit_detailed_playbook_anchors():
+    detailed = (_HERE.parent.parent / "audit-session-metrics" / "references"
+                / "detailed-audit.md").read_text(encoding="utf-8")
+    assert "Context-budget rules" in detailed
+    assert "Phase 2" in detailed
+    assert "Phase 3" in detailed
+    # Three-artefact contract carries forward:
+    assert "Output contract" in detailed
+    assert "JSON sidecar" in detailed
+    assert "audit_schema_version" in detailed
+    # Detailed-only schema fields:
+    assert "quick_wins" in detailed
+    assert "structural_fixes" in detailed
+    assert "estimated_savings" in detailed
+    # Detailed-only metric enum entries:
+    assert "claudemd_oversize" in detailed
+    assert "missing_claudeignore" in detailed
+    assert "mcp_unused" in detailed
+    assert "file_re_read" in detailed
+    assert "paste_bomb" in detailed
+    # Tier-1 detailed additions (v1.27.0):
+    assert "verbose_response" in detailed
+    assert "weekly_rollup_regression" in detailed
+    assert "peak_hour_concentration" in detailed
+    assert "subagent_attribution_orphan" in detailed
+    # Cap was bumped from 12 → 16 with Tier-1 additions:
+    assert "up to 16 finding" in detailed or "up to 16 findings" in detailed
+    assert "Sixteen-finding contract" in detailed
+    # Markdown render template section names:
+    assert "Quick wins" in detailed
+    assert "Structural fixes" in detailed
+    # The playbook MUST tell Haiku not to read the source JSONL, only the
+    # structured JSON export — guards the context-budget invariant.
+    assert "Do not read the raw" in detailed
+
+
+def test_audit_playbooks_share_schema_version():
+    """quick-audit and detailed-audit must use the same audit_schema_version
+    so downstream tooling sees a consistent schema across modes."""
+    import re
+    quick = (_HERE.parent.parent / "audit-session-metrics" / "references"
+             / "quick-audit.md").read_text(encoding="utf-8")
+    detailed = (_HERE.parent.parent / "audit-session-metrics" / "references"
+                / "detailed-audit.md").read_text(encoding="utf-8")
+    # Pull the version string from the JSON-schema header in each file.
+    quick_ver = re.search(r"JSON schema \(v([\d.]+)\)", quick)
+    detailed_ver = re.search(r"JSON schema \(v([\d.]+)\)", detailed)
+    assert quick_ver is not None, "quick-audit.md missing 'JSON schema (vX.Y)' header"
+    assert detailed_ver is not None, "detailed-audit.md missing 'JSON schema (vX.Y)' header"
+    assert quick_ver.group(1) == detailed_ver.group(1), (
+        f"schema version drift: quick=v{quick_ver.group(1)}, "
+        f"detailed=v{detailed_ver.group(1)}")
+
+
 def test_phase_a_html_sections_render_when_present():
     r = _build_phase_a_report()
     html = sm.render_html(r, variant="single", chart_lib="none")

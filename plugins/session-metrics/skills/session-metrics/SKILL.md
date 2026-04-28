@@ -116,6 +116,7 @@ project root, named `session_<id8>_<YYYYMMDD_HHMMSS>.<ext>` (single) or
 | `--tz <IANA>`                | IANA timezone for time-of-day bucketing **and timeline/export timestamps**. Defaults to the system local tz (auto-detected via `TZ` env var or the OS setting). |
 | `--utc-offset <H>`           | Fixed UTC offset, DST-naive. Use `--tz` for DST-aware. |
 | `--no-cache`                 | Skip `~/.cache/session-metrics/parse/` and always re-parse from scratch. |
+| `--no-self-cost`             | Suppress the self-cost meta-metric (stderr `[self-cost]` line, HTML KPI card, and JSON `self_cost` key). |
 | `--no-include-subagents`     | Skip spawned subagent JSONL files. Subagents are included by default; use this for faster runs when subagent detail is not needed. |
 | `--cache-break-threshold <N>` | Turns whose `input + cache_creation` exceed N are flagged as **cache-break events** (default 100 000). Matches Anthropic's `session-report` convention. |
 | `--no-subagent-attribution`  | Disable Phase-B subagent → parent-prompt token attribution. Default behaviour rolls every subagent's tokens up onto the user prompt that spawned the chain (additional `attributed_subagent_*` fields, no double-counting). |
@@ -344,6 +345,44 @@ matrix, IFEval predicates, advisory semantics, and troubleshooting.
 The eager content in this file deliberately stays minimal so
 single-session reports don't pay for compare-mode context they don't
 use.
+
+## Optional post-export audit
+
+When a `json` format was included in `--output`, the script writes a
+`session_<id8>_<ts>.json` file alongside the other exports. After all
+`[export] FMT → path` lines are printed and the optional `[self-cost]`
+line lands, append a two-line suggestion telling the user how to
+audit the run:
+
+> Want a token-usage audit of this session?
+>   `/audit-session-metrics quick   <json-path>`   (~$0.01 on Haiku)
+>   `/audit-session-metrics detailed <json-path>`  (~$0.03 on Haiku, reads CLAUDE.md + settings)
+
+Substitute `<json-path>` with the actual path printed by the
+`[export] JSON` line.
+
+**Do not invoke `audit-session-metrics` programmatically from this
+turn.** Its frontmatter pins `model: haiku` and the model override
+only takes effect when the audit skill is the entry point of its own
+turn — invoking via the Skill tool inside a session-metrics turn
+keeps the parent's Sonnet model and erases the cost win. The user
+runs the slash command at their own discretion.
+
+If `--output` did not include `json` (e.g. `--output html` only),
+**skip the audit suggestion entirely** — the audit playbook reads
+the JSON export and has nothing to work from without it.
+
+## Self-cost meta-metric
+
+session-metrics tracks its own running cost in the current session.
+After the `[export]` lines a `[self-cost]` stderr summary prints the
+prior turns' tokens / dollars (the *current* run is not yet written
+to the JSONL when the script reads it). The HTML dashboard surfaces
+the same number as a "Skill self-cost" KPI card. The JSON export
+carries it as the top-level `self_cost` key.
+
+Pass `--no-self-cost` to suppress all three surfaces — useful for
+clean test snapshots or for users who find the meta-metric noisy.
 
 ## Reference files
 

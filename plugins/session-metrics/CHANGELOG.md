@@ -5,6 +5,96 @@ Versions match the `plugin.json` / `marketplace.json` version field.
 
 ---
 
+## v1.27.0 — 2026-04-29
+
+### Added — Self-cost meta-metric
+
+session-metrics now reports its own running cost in the current session
+alongside the regular report. Built from the existing `by_skill`
+aggregation (filtered for `session-metrics` plus the namespaced
+`session-metrics:session-metrics` plugin alias) and surfaced three ways:
+
+- **stderr summary line.** After the `[export] FMT → path` lines a new
+  `[self-cost] session-metrics consumed N prior turns this session,
+  $X.XXXX, K tokens (current run not yet logged).` line prints. The
+  caveat is intentional: the current invocation's tokens aren't written
+  to the JSONL when the script reads it, so the figure reflects only
+  prior session-metrics turns this session.
+- **HTML dashboard KPI card.** The summary cards gain a
+  *Skill self-cost · prior runs this session* card with `$ · turns ·
+  tokens` and a tooltip explaining the chicken-and-egg lag. Auto-hides
+  on first-ever invocation (zero prior turns).
+- **JSON export top-level key.** New `self_cost: {turns, input,
+  output, cache_read, cache_write, total_tokens, cost_usd,
+  matched_skill_names, note}` block.
+
+### Added — `--no-self-cost` flag
+
+Suppresses all three self-cost surfaces. Only meaningful at session
+and project scope; instance scope (`--all-projects`) does not compute
+self-cost.
+
+### Added — `audit-session-metrics` companion skill
+
+A new sibling skill ships alongside `session-metrics` in the same
+plugin. Pinned to `model: haiku` in frontmatter so a `quick` audit
+costs ~$0.01 and a `detailed` audit costs ~$0.03 (vs ~$0.10 / ~$0.30
+on Sonnet). After session-metrics writes a JSON export, its SKILL.md
+prints a two-line suggestion telling the user how to invoke the audit:
+
+```
+/audit-session-metrics quick   <json-path>
+/audit-session-metrics detailed <json-path>
+```
+
+The split into a separate skill is what unlocks the Haiku cost win:
+the `model:` frontmatter override only takes effect when the audit
+skill is the entry point of its own turn, not when called via the
+Skill tool inside session-metrics' Sonnet turn. session-metrics
+therefore *suggests* the slash command rather than invoking it.
+
+### Standardised audit format (JSON sidecar + markdown)
+
+Every audit run produces three artefacts:
+
+- **JSON sidecar** at `exports/session-metrics/audit_<id8>_<ts>_<mode>.json` —
+  versioned schema (`audit_schema_version: 1.0`) with structured
+  findings, evidence objects, and an enum'd `metric` field.
+- **Markdown copy** at `exports/session-metrics/audit_<id8>_<ts>_<mode>.md` —
+  human-readable rendering of the same data.
+- **Inline chat output** — the markdown content printed in the
+  assistant's reply.
+
+Quick mode emits exactly 7 findings; detailed mode emits up to 16.
+Both modes share the same `audit_schema_version`. `estimated_impact_usd`
+on each finding is optional (nullable) — the playbook explicitly tells
+the model never to guess.
+
+### Tier-1 audit insights (additional metrics)
+
+Six new metric enum entries surface workload-shape and trend signals
+the original metric set didn't catch:
+
+- **Quick mode** (cap raised from 5 → 7 findings):
+  - `session_warmup_overhead` — first turn > 20% of total cost on a
+    short session (≤ 15 turns).
+  - `tool_result_bloat` — `cache_write_tokens > 50K` immediately
+    following a Bash/Read/WebFetch tool call.
+- **Detailed mode** (cap raised from 12 → 16 findings):
+  - `verbose_response` — model produces > 5× output:input tokens on
+    > 30% of turns.
+  - `weekly_rollup_regression` — trailing-7d cost up > 50% vs prior
+    7d, or cache hit dropped > 10pp week-over-week.
+  - `peak_hour_concentration` — > 70% of cost lands in the
+    `--peak-hours` band when configured.
+  - `subagent_attribution_orphan` — `orphan_turns > 0` in
+    `subagent_attribution_summary`.
+
+`fix_first` stays at exactly 3 bullets — picks the highest-impact
+subset of findings regardless of total findings count.
+
+---
+
 ## v1.26.2 — 2026-04-28
 
 ### Bug fix — accumulate user content blocks across the gap (parallel-spawn sibling fix)
