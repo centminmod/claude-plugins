@@ -2362,6 +2362,12 @@ def _empty_subagent_row(name: str) -> dict:
         "pct_total_cost":   0.0,
         "cache_hit_pct":    0.0,
         "avg_tokens_per_call": 0.0,
+        # v1.26.0: per-invocation fixed-cost signals. Aggregated across
+        # invocations of this subagent type (one invocation = all turns
+        # sharing a ``subagent_agent_id``).
+        "invocation_count":         0,    # distinct subagent_agent_id values seen
+        "first_turn_share_pct":     0.0,  # median(first_turn.cost / invocation total)
+        "sp_amortisation_pct":      0.0,  # % of invocations whose turn ≥2 had cache_read
         "_sessions":        set(),
     }
 
@@ -2401,6 +2407,11 @@ def _build_by_subagent_type(sessions: list[dict], total_cost: float) -> list[dic
     subagent JSONL wasn't loaded.
     """
     rows: dict[str, dict] = {}
+    # v1.26.0: per-invocation grouping for fixed-cost signals. Each
+    # ``subagent_agent_id`` is one invocation; we collect its turns
+    # (in transcript order) so we can compute first-turn-share and
+    # cache-read amortisation downstream.
+    invocations: dict[str, dict] = {}
     for session in sessions:
         sid = session.get("session_id", "")
         for t in session.get("turns", []) or []:
@@ -2413,11 +2424,248 @@ def _build_by_subagent_type(sessions: list[dict], total_cost: float) -> list[dic
                 row["_sessions"].add(sid)
             # Token contribution from subagent-tagged turns.
             stype = t.get("subagent_type") or ""
+            agent_id = t.get("subagent_agent_id") or ""
             if stype:
                 row = rows.setdefault(stype, _empty_subagent_row(stype))
                 _accumulate_bucket(row, t)
                 row["_sessions"].add(sid)
+            if agent_id:
+                inv = invocations.setdefault(
+                    agent_id, {"type": stype, "turns": []})
+                inv["turns"].append(t)
+                # Belt-and-braces: a subagent turn might have empty stype
+                # if tagging was incomplete; later overwrites win.
+                if stype and not inv["type"]:
+                    inv["type"] = stype
+    # Roll per-invocation metrics up to the type-level rows.
+    type_invocations: dict[str, list[dict]] = {}
+    for inv in invocations.values():
+        stype = inv["type"]
+        if not stype:
+            continue
+        turns_sorted = sorted(inv["turns"], key=lambda x: x.get("index", 0))
+        if not turns_sorted:
+            continue
+        first_cost = float(turns_sorted[0].get("cost_usd", 0.0))
+        total_inv_cost = sum(float(t.get("cost_usd", 0.0)) for t in turns_sorted)
+        first_share = (first_cost / total_inv_cost) if total_inv_cost > 0 else 0.0
+        # SP amortisation: any turn beyond the first read from cache.
+        # Single-turn invocations cannot amortise (denominator-only).
+        sp_amortised = any(
+            int(t.get("cache_read_tokens", 0)) > 0 for t in turns_sorted[1:]
+        )
+        type_invocations.setdefault(stype, []).append({
+            "first_share":   first_share,
+            "sp_amortised":  sp_amortised,
+            "turn_count":    len(turns_sorted),
+        })
+    for stype, inv_list in type_invocations.items():
+        row = rows.get(stype)
+        if not row or not inv_list:
+            continue
+        shares_sorted = sorted(i["first_share"] for i in inv_list)
+        n = len(shares_sorted)
+        if n % 2 == 1:
+            median_share = shares_sorted[n // 2]
+        else:
+            median_share = 0.5 * (shares_sorted[n // 2 - 1] + shares_sorted[n // 2])
+        amort_count = sum(1 for i in inv_list if i["sp_amortised"])
+        row["invocation_count"]     = n
+        row["first_turn_share_pct"] = round(100.0 * median_share, 1)
+        row["sp_amortisation_pct"]  = round(100.0 * amort_count / n, 1)
     return _finalise_subagent_rows(rows, total_cost)
+
+
+# ---------------------------------------------------------------------------
+# v1.26.0: subagent share + within-session split + attribution coverage
+# ---------------------------------------------------------------------------
+#
+# These helpers all derive from data the parser already records on each turn
+# (``attributed_subagent_*`` fields, ``cost_usd``, ``tool_use_ids``,
+# ``spawned_subagents``, ``subagent_agent_id``) plus ``subagent_attribution_summary``
+# already attached to the report. No new per-turn fields, no parser changes,
+# no ``_SCRIPT_VERSION`` bump.
+
+def _compute_subagent_share(report: dict) -> dict:
+    """Compute the headline 'subagent share' stat + attribution coverage.
+
+    Returns a dict with the keys consumed by the renderers:
+
+      - ``include_subagents`` — was the loader run with ``--include-subagents``?
+      - ``has_attribution``   — at least one subagent turn was attributed
+      - ``total_cost``        — totals[cost] (parent + subagent direct cost,
+                                  same as the report's headline total)
+      - ``attributed_cost``   — sum of ``attributed_subagent_cost`` across
+                                  every main turn (lower bound; orphans
+                                  are excluded)
+      - ``share_pct``         — ``100 * attributed_cost / total_cost`` (0
+                                  when total_cost is 0)
+      - ``spawn_count``       — sum of len(t['spawned_subagents']) across
+                                  main turns
+      - ``attributed_count``  — sum of ``attributed_subagent_count`` across
+                                  main turns (= rolled-up subagent turns)
+      - ``orphan_turns``      — from ``subagent_attribution_summary``
+      - ``cycles_detected``   — from ``subagent_attribution_summary``
+      - ``nested_levels_seen``— max nesting depth observed (1 = direct
+                                  child only; ≥2 = chains)
+    """
+    sessions = report.get("sessions") or []
+    totals   = report.get("totals") or {}
+    summary  = report.get("subagent_attribution_summary") or {}
+    total_cost  = float(totals.get("cost", 0.0))
+    attributed_cost  = 0.0
+    attributed_count = 0
+    spawn_count      = 0
+    for s in sessions:
+        for t in s.get("turns", []) or []:
+            # Main turns only — subagent turns have non-empty
+            # ``subagent_agent_id``. Their cost is part of total_cost
+            # already; rolling them into attributed_cost from the parent
+            # is what the headline measures.
+            if t.get("subagent_agent_id"):
+                continue
+            if t.get("is_resume_marker"):
+                continue
+            attributed_cost  += float(t.get("attributed_subagent_cost", 0.0))
+            attributed_count += int(t.get("attributed_subagent_count", 0))
+            spawn_count      += len(t.get("spawned_subagents") or [])
+    share_pct = (100.0 * attributed_cost / total_cost) if total_cost > 0 else 0.0
+    return {
+        "include_subagents":  bool(report.get("include_subagents", False)),
+        "has_attribution":    attributed_count > 0,
+        "total_cost":         total_cost,
+        "attributed_cost":    attributed_cost,
+        "share_pct":          share_pct,
+        "spawn_count":        spawn_count,
+        "attributed_count":   attributed_count,
+        "orphan_turns":       int(summary.get("orphan_subagent_turns", 0)),
+        "cycles_detected":    int(summary.get("cycles_detected", 0)),
+        "nested_levels_seen": int(summary.get("nested_levels_seen", 0)),
+    }
+
+
+def _compute_within_session_split(sessions: list[dict],
+                                    min_per_bucket: int = 3) -> list[dict]:
+    """Compute per-session median combined-cost on spawning vs non-spawning turns.
+
+    Returns one dict per session with at least ``min_per_bucket`` (default 3)
+    spawning turns AND at least ``min_per_bucket`` non-spawning turns. Sessions
+    with fewer turns in either bucket are skipped — three is the minimum where
+    a median is meaningful.
+
+    "Combined cost" is ``cost_usd + attributed_subagent_cost`` so that a
+    spawning turn's cost reflects the work done both by the parent and by
+    the subagent rolled up to it. (See section helper text in the renderer
+    for the within-session selection-bias caveat.)
+
+    A turn is "spawning" if it issued at least one Agent/Task tool call,
+    detected via ``len(spawned_subagents) > 0`` OR ``len(tool_use_ids) > 0``.
+    Subagent turns themselves (``subagent_agent_id`` non-empty) and resume
+    markers are excluded from both buckets.
+
+    Each output dict has::
+
+        session_id, spawn_n, no_spawn_n,
+        median_spawn, median_no_spawn,
+        delta            (median_spawn - median_no_spawn, positive = spawning costs more)
+        spawn_share_pct  (100 * sum(combined_cost on spawn turns) / session total cost)
+    """
+    out: list[dict] = []
+    for s in sessions:
+        spawn_costs: list[float] = []
+        no_spawn_costs: list[float] = []
+        spawn_total = 0.0
+        for t in s.get("turns", []) or []:
+            if t.get("subagent_agent_id"):
+                continue
+            if t.get("is_resume_marker"):
+                continue
+            combined = (
+                float(t.get("cost_usd", 0.0))
+                + float(t.get("attributed_subagent_cost", 0.0))
+            )
+            is_spawning = bool(t.get("spawned_subagents")) or bool(t.get("tool_use_ids"))
+            if is_spawning:
+                spawn_costs.append(combined)
+                spawn_total += combined
+            else:
+                no_spawn_costs.append(combined)
+        if (len(spawn_costs) < min_per_bucket
+                or len(no_spawn_costs) < min_per_bucket):
+            continue
+        median_spawn    = _median(spawn_costs)
+        median_no_spawn = _median(no_spawn_costs)
+        session_total = float(s.get("subtotal", {}).get("cost", 0.0))
+        spawn_share_pct = (100.0 * spawn_total / session_total) if session_total > 0 else 0.0
+        out.append({
+            "session_id":       s.get("session_id", ""),
+            "spawn_n":          len(spawn_costs),
+            "no_spawn_n":       len(no_spawn_costs),
+            "median_spawn":     median_spawn,
+            "median_no_spawn":  median_no_spawn,
+            "delta":            median_spawn - median_no_spawn,
+            "spawn_share_pct":  spawn_share_pct,
+        })
+    return out
+
+
+def _compute_instance_subagent_share(project_reports: list[dict],
+                                       instance_totals: dict,
+                                       include_subagents: bool) -> dict:
+    """Instance-scope variant of ``_compute_subagent_share``.
+
+    The instance report deliberately keeps ``sessions = []`` to bound
+    JSON/CSV size, so we can't iterate per-turn fields here. Instead we
+    sum each project's headline stats. ``subagent_attribution_summary``
+    is already aggregated by ``_aggregate_attribution_summary`` so the
+    same orphan/cycle counts surface.
+    """
+    total_cost = float(instance_totals.get("cost", 0.0))
+    attributed_cost = 0.0
+    attributed_count = 0
+    spawn_count = 0
+    orphan_turns = 0
+    cycles_detected = 0
+    nested_levels_seen = 0
+    has_attribution = False
+    for pr in project_reports:
+        share = _compute_subagent_share(pr)
+        attributed_cost  += share["attributed_cost"]
+        attributed_count += share["attributed_count"]
+        spawn_count      += share["spawn_count"]
+        orphan_turns     += share["orphan_turns"]
+        cycles_detected  += share["cycles_detected"]
+        nested_levels_seen = max(nested_levels_seen, share["nested_levels_seen"])
+        has_attribution = has_attribution or share["has_attribution"]
+    share_pct = (100.0 * attributed_cost / total_cost) if total_cost > 0 else 0.0
+    return {
+        "include_subagents":  include_subagents,
+        "has_attribution":    has_attribution,
+        "total_cost":         total_cost,
+        "attributed_cost":    attributed_cost,
+        "share_pct":          share_pct,
+        "spawn_count":        spawn_count,
+        "attributed_count":   attributed_count,
+        "orphan_turns":       orphan_turns,
+        "cycles_detected":    cycles_detected,
+        "nested_levels_seen": nested_levels_seen,
+    }
+
+
+def _median(values: list[float]) -> float:
+    """Plain median for small lists (no numpy dependency).
+
+    Used by the within-session split: outlier-resistant compared to mean,
+    which matters because a single $0.20 turn distorts a session of
+    $0.001-cost turns.
+    """
+    if not values:
+        return 0.0
+    s = sorted(values)
+    n = len(s)
+    if n % 2 == 1:
+        return s[n // 2]
+    return 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
 # ---------------------------------------------------------------------------
@@ -3265,6 +3513,12 @@ def _build_report(
     }
     # Sort global cache_breaks by uncached desc to keep "worst-first" order.
     report["cache_breaks"].sort(key=lambda b: -int(b.get("uncached", 0)))
+    # v1.26.0: precompute the headline subagent share + within-session
+    # split. Stashing here means all renderers (HTML / MD / JSON / CSV)
+    # read consistent values, and the JSON export carries them out of
+    # the box without per-renderer wiring.
+    report["subagent_share_stats"] = _compute_subagent_share(report)
+    report["subagent_within_session_split"] = _compute_within_session_split(sessions_out)
     report["usage_insights"] = _compute_usage_insights(report)
     # v1.8.0: token-waste classification — runs after attribution + cache-break
     # detection (both mutate turn dicts in place); annotates turns with
@@ -3917,7 +4171,10 @@ def render_csv(report: dict) -> str:
         w.writerow(["name", "spawn_count", "turns", "input", "output",
                     "cache_read", "cache_write", "total_tokens",
                     "avg_tokens_per_call", "cost_usd",
-                    "cache_hit_pct", "pct_total_cost"])
+                    "cache_hit_pct", "pct_total_cost",
+                    # v1.26.0: per-invocation warm-up signals.
+                    "invocation_count", "first_turn_share_pct",
+                    "sp_amortisation_pct"])
         for r in by_subagent:
             w.writerow([
                 r.get("name", ""), r.get("spawn_count", 0),
@@ -3928,6 +4185,9 @@ def render_csv(report: dict) -> str:
                 f"{float(r.get('cost_usd', 0.0)):.6f}",
                 f"{float(r.get('cache_hit_pct', 0.0)):.1f}",
                 f"{float(r.get('pct_total_cost', 0.0)):.2f}",
+                int(r.get("invocation_count", 0)),
+                f"{float(r.get('first_turn_share_pct', 0.0)):.1f}",
+                f"{float(r.get('sp_amortisation_pct', 0.0)):.1f}",
             ])
 
     cache_breaks = report.get("cache_breaks") or []
@@ -4029,6 +4289,9 @@ def render_md(report: dict) -> str:
         _mean_lat = sum(_turn_lats) / len(_turn_lats)
         p(f"| Mean turn latency | {_mean_lat:.2f}s ({len(_turn_lats)} turns) |")
     p(f"| Total cost | ${totals['cost']:.4f} |")
+    _share_line = _build_subagent_share_md(_compute_subagent_share(report))
+    if _share_line:
+        p(_share_line)
     p(f"| Cache savings | ${totals['cache_savings']:.4f} |")
     p(f"| Cache hit ratio | {totals['cache_hit_pct']:.1f}% |")
     p(f"| Total input tokens | {totals['total_input']:,} |")
@@ -4165,18 +4428,52 @@ def render_md(report: dict) -> str:
     if by_subagent_rows:
         p("## Subagent types")
         p()
-        p("| Subagent | Spawns | Turns | Input | Output | % cached | Avg/call | Cost $ | % of total |")
-        p("|----------|-------:|------:|------:|------:|--------:|--------:|------:|-----------:|")
+        # v1.26.0: extra warm-up columns visible only when per-invocation
+        # data was actually observed (i.e. ``--include-subagents`` was on
+        # AND the loader saw subagent JSONL turns).
+        _show_warm = bool(report.get("include_subagents")) and any(
+            int(r.get("invocation_count", 0)) > 0 for r in by_subagent_rows
+        )
+        if _show_warm:
+            p("| Subagent | Spawns | Turns | Input | Output | % cached "
+              "| Avg/call | Cost $ | % of total | First-turn % | SP amortised % |")
+            p("|----------|-------:|------:|------:|------:|--------:|"
+              "--------:|------:|-----------:|-------------:|---------------:|")
+        else:
+            p("| Subagent | Spawns | Turns | Input | Output | % cached | Avg/call | Cost $ | % of total |")
+            p("|----------|-------:|------:|------:|------:|--------:|--------:|------:|-----------:|")
         for r in by_subagent_rows:
-            p(f"| `{r.get('name', '')}` | {int(r.get('spawn_count', 0)):,} "
-              f"| {int(r.get('turns_attributed', 0)):,} "
-              f"| {int(r.get('input', 0)):,} "
-              f"| {int(r.get('output', 0)):,} "
-              f"| {float(r.get('cache_hit_pct', 0.0)):.1f}% "
-              f"| {float(r.get('avg_tokens_per_call', 0.0)):,.0f} "
-              f"| ${float(r.get('cost_usd', 0.0)):.4f} "
-              f"| {float(r.get('pct_total_cost', 0.0)):.2f}% |")
+            base = (
+                f"| `{r.get('name', '')}` | {int(r.get('spawn_count', 0)):,} "
+                f"| {int(r.get('turns_attributed', 0)):,} "
+                f"| {int(r.get('input', 0)):,} "
+                f"| {int(r.get('output', 0)):,} "
+                f"| {float(r.get('cache_hit_pct', 0.0)):.1f}% "
+                f"| {float(r.get('avg_tokens_per_call', 0.0)):,.0f} "
+                f"| ${float(r.get('cost_usd', 0.0)):.4f} "
+                f"| {float(r.get('pct_total_cost', 0.0)):.2f}% "
+            )
+            if _show_warm:
+                inv_n = int(r.get("invocation_count", 0))
+                if inv_n > 0:
+                    base += (
+                        f"| {float(r.get('first_turn_share_pct', 0.0)):.1f}% "
+                        f"| {float(r.get('sp_amortisation_pct', 0.0)):.1f}% |"
+                    )
+                else:
+                    base += "| — | — |"
+            else:
+                base += "|"
+            p(base)
         p()
+
+    # Within-session spawning split — descriptive contrast that holds
+    # task / model / context constant. Only renders for sessions with
+    # ≥3 spawning AND ≥3 non-spawning turns (median needs a floor).
+    _ws_split = _compute_within_session_split(report.get("sessions") or [])
+    _ws_split_md = _build_within_session_split_md(_ws_split)
+    if _ws_split_md:
+        p(_ws_split_md)
 
     cache_breaks_rows = report.get("cache_breaks") or []
     if cache_breaks_rows:
@@ -5544,9 +5841,36 @@ def _build_by_subagent_type_html(rows: list[dict],
     """
     if not rows:
         return ""
+    # v1.26.0: only render the warm-up columns when the loader actually
+    # observed per-invocation data. With ``--no-include-subagents`` every
+    # row's ``invocation_count`` is 0 and the columns would be a wall of
+    # zeros; hiding them keeps the table readable.
+    show_warmup = subagents_included and any(
+        int(r.get("invocation_count", 0)) > 0 for r in rows
+    )
     body_rows: list[str] = []
     for r in rows:
         name = html_mod.escape(r.get("name") or "")
+        warmup_cells = ""
+        if show_warmup:
+            inv_n = int(r.get("invocation_count", 0))
+            if inv_n > 0:
+                warmup_cells = (
+                    f'<td class="num" title="Median first-turn cost / total '
+                    f'invocation cost across {inv_n} invocation'
+                    f'{"s" if inv_n != 1 else ""} of this type. '
+                    f'High = short-lived agents pay setup tax without amortising.">'
+                    f'{float(r.get("first_turn_share_pct", 0.0)):.1f}%</td>'
+                    f'<td class="num" title="Fraction of invocations where '
+                    f'turn ≥2 read from cache (system-prompt cache write paid '
+                    f'back at least once).">'
+                    f'{float(r.get("sp_amortisation_pct", 0.0)):.1f}%</td>'
+                )
+            else:
+                warmup_cells = (
+                    '<td class="num muted">&ndash;</td>'
+                    '<td class="num muted">&ndash;</td>'
+                )
         body_rows.append(
             f'<tr>'
             f'<td><code>{name}</code></td>'
@@ -5559,11 +5883,18 @@ def _build_by_subagent_type_html(rows: list[dict],
             f'<td class="num">{float(r.get("avg_tokens_per_call", 0.0)):,.0f}</td>'
             f'<td class="cost">{_fmt_cost(r.get("cost_usd", 0.0))}</td>'
             f'<td class="num">{float(r.get("pct_total_cost", 0.0)):.2f}%</td>'
+            f'{warmup_cells}'
             f'</tr>'
         )
     hint = ("aggregated across this report scope"
             if subagents_included else
             "spawn-count only · pass --include-subagents for full cost rollup")
+    warmup_headers = (
+        '<th class="num" title="Median fraction of an invocation\'s cost spent '
+        'on its first turn (system-prompt warm-up).">First-turn %</th>'
+        '<th class="num" title="Fraction of invocations whose turn ≥2 read '
+        'from cache (system-prompt cache write paid back).">SP amortised %</th>'
+    ) if show_warmup else ""
     return (
         f'<section class="section">\n'
         f'<div class="section-title"><h2>{heading}</h2>'
@@ -5580,11 +5911,270 @@ def _build_by_subagent_type_html(rows: list[dict],
         f'<th class="num">Avg / call</th>'
         f'<th class="num">Cost $</th>'
         f'<th class="num">% of total</th>'
+        f'{warmup_headers}'
         f'</tr></thead>\n'
         f'<tbody>{"".join(body_rows)}</tbody>\n'
         f'</table>\n'
         f'</section>'
     )
+
+
+def _build_subagent_share_card_html(stats: dict) -> str:
+    """One-line headline 'Subagent share of cost' KPI card.
+
+    Branches on ``include_subagents`` so users running without the flag
+    see "attribution disabled" rather than a deceptive 0% reading.
+    Returns the bare ``<div class="kpi">…</div>`` for inclusion in
+    ``kpi-grid`` blocks. Always returns a card — the headline framing
+    deserves to be visible even when the answer is "we didn't measure".
+    """
+    # v1.26.0: structure mirrors the other KPI cards — bold headline
+    # value (matches Total Cost / Cache Hit Ratio rhythm) plus a small
+    # ``.kpi-sub`` line for the supporting numbers, plus a tooltip that
+    # carries the full prose explanation. Avoids the multi-line wall of
+    # text the previous all-in-``kpi-val`` rendering produced on real
+    # sessions where the lower-bound disclosure was non-trivial.
+    if not stats.get("include_subagents"):
+        return (
+            '<div class="kpi" title="Run with --include-subagents to roll up '
+            'child subagent JSONL costs onto the parent prompt that spawned them.">'
+            '<div class="kpi-label">Subagent share of cost</div>'
+            '<div class="kpi-val">&mdash;</div>'
+            '<div class="kpi-sub">attribution disabled '
+            '&middot; pass <code>--include-subagents</code></div></div>'
+        )
+    if not stats.get("has_attribution"):
+        return (
+            '<div class="kpi" title="No subagent turns were attributed to '
+            'parent prompts in this report.">'
+            '<div class="kpi-label">Subagent share of cost</div>'
+            '<div class="kpi-val">0%</div>'
+            '<div class="kpi-sub">no subagent activity</div></div>'
+        )
+    pct = float(stats.get("share_pct", 0.0))
+    cost = float(stats.get("attributed_cost", 0.0))
+    total = float(stats.get("total_cost", 0.0))
+    spawns = int(stats.get("spawn_count", 0))
+    orphans = int(stats.get("orphan_turns", 0))
+    sub_main = (
+        f'${cost:.4f} of ${total:.4f} '
+        f'&middot; {spawns} spawn{"s" if spawns != 1 else ""}'
+    )
+    lower_bound_line = (
+        f'<div class="kpi-sub">lower bound &mdash; {orphans} orphan turn'
+        f'{"s" if orphans != 1 else ""} excluded</div>'
+    ) if orphans else ""
+    title = (
+        "Cost rolled up from child subagent JSONLs onto the parent "
+        "prompts that spawned them."
+    )
+    if orphans:
+        title += (
+            f" Lower bound — {orphans} orphan turn"
+            f"{'s' if orphans != 1 else ''} excluded because their parent "
+            "linkage couldn't be resolved."
+        )
+    return (
+        f'<div class="kpi" title="{html_mod.escape(title)}">'
+        f'<div class="kpi-label">Subagent share of cost</div>'
+        f'<div class="kpi-val">{pct:.1f}%</div>'
+        f'<div class="kpi-sub">{sub_main}</div>'
+        f'{lower_bound_line}'
+        f'</div>'
+    )
+
+
+def _build_attribution_coverage_html(stats: dict) -> str:
+    """Trust gauge for the headline. Renders a small section with
+    orphan-turn count, cycles detected, max nesting depth, and the
+    spawn → attributed-turn fanout. Returns "" when there's nothing
+    interesting to disclose (no spawns, no orphans, no cycles)."""
+    spawns = int(stats.get("spawn_count", 0))
+    orphans = int(stats.get("orphan_turns", 0))
+    cycles  = int(stats.get("cycles_detected", 0))
+    nested  = int(stats.get("nested_levels_seen", 0))
+    attributed_count = int(stats.get("attributed_count", 0))
+    if not stats.get("include_subagents"):
+        return ""
+    if spawns == 0 and orphans == 0 and cycles == 0 and attributed_count == 0:
+        return ""
+    fanout = (attributed_count / spawns) if spawns else 0.0
+    # v1.26.0: render as a 2-column `models-table` so the section
+    # picks up theme-aware styling (console / lattice / light / dark)
+    # along with the by_subagent_type and models tables. A bare `<ul>`
+    # rendered unstyled in three of the four themes.
+    rows: list[str] = []
+    rows.append(
+        f'<tr>'
+        f'<td><strong>Spawn → work fanout</strong></td>'
+        f'<td>{spawns} spawn{"s" if spawns != 1 else ""} from main turns '
+        f'generated {attributed_count} attributed subagent turn'
+        f'{"s" if attributed_count != 1 else ""} '
+        f'<span class="muted">(avg {fanout:.2f} turns/spawn)</span>'
+        f'</td>'
+        f'</tr>'
+    )
+    if orphans > 0:
+        rows.append(
+            '<tr>'
+            f'<td><strong>Orphan subagent turns</strong></td>'
+            f'<td>{orphans} — subagent JSONL turns whose parent linkage '
+            f'could not be resolved. Excluded from the headline share; '
+            f'the headline is therefore a <em>lower bound</em>.</td>'
+            '</tr>'
+        )
+    if cycles > 0:
+        rows.append(
+            '<tr>'
+            f'<td><strong>Cycles detected</strong></td>'
+            f'<td>{cycles} — chains truncated during attribution to '
+            f'prevent infinite recursion.</td>'
+            '</tr>'
+        )
+    if nested >= 2:
+        rows.append(
+            '<tr>'
+            f'<td><strong>Nesting depth</strong></td>'
+            f'<td>{nested} levels observed (subagent spawning subagent…). '
+            f'Tokens still roll up to the original root prompt.</td>'
+            '</tr>'
+        )
+    return (
+        '<section class="section">\n'
+        '<div class="section-title"><h2>Subagent attribution coverage</h2>'
+        '<span class="hint">trust gauge for the headline share — '
+        'observational signal only</span></div>\n'
+        '<table class="models-table attribution-coverage-table">\n'
+        '<thead><tr><th>Signal</th><th>Detail</th></tr></thead>\n'
+        f'<tbody>{"".join(rows)}</tbody>\n'
+        '</table>\n'
+        '</section>'
+    )
+
+
+def _build_within_session_split_html(rows: list[dict]) -> str:
+    """Per-session within-session split: median combined cost on
+    spawning vs. non-spawning turns. Returns "" when no session
+    qualifies (each needs ≥3 turns in each bucket).
+    """
+    if not rows:
+        return ""
+    body: list[str] = []
+    for r in rows:
+        sid = (r.get("session_id") or "")[:8]
+        ms  = float(r.get("median_spawn", 0.0))
+        mns = float(r.get("median_no_spawn", 0.0))
+        delta = float(r.get("delta", 0.0))
+        delta_cls = "cost" if delta >= 0 else "muted"
+        delta_sign = "+" if delta >= 0 else ""
+        body.append(
+            f'<tr>'
+            f'<td><code>{html_mod.escape(sid)}…</code></td>'
+            f'<td class="num">{int(r.get("spawn_n", 0)):,}</td>'
+            f'<td class="num">{int(r.get("no_spawn_n", 0)):,}</td>'
+            f'<td class="cost">${ms:.4f}</td>'
+            f'<td class="cost">${mns:.4f}</td>'
+            f'<td class="{delta_cls}">{delta_sign}${delta:.4f}</td>'
+            f'<td class="num">{float(r.get("spawn_share_pct", 0.0)):.1f}%</td>'
+            f'</tr>'
+        )
+    return (
+        '<section class="section">\n'
+        '<div class="section-title"><h2>Within-session spawning split</h2>'
+        '<span class="hint">descriptive only · combined cost = parent + '
+        'attributed subagent</span></div>\n'
+        '<p class="muted" style="margin:0 0 8px 0;font-size:13px">'
+        'Per session, median <em>combined</em> turn cost (parent direct '
+        '+ attributed subagent) on turns that spawned a subagent vs. '
+        'turns that did not. Holds task / model / context constant — '
+        'but users tend to delegate the hardest sub-tasks, so this '
+        'still has within-session selection bias and is <strong>not</strong> '
+        'a counterfactual estimate of "what the same work would have '
+        'cost in the main context".</p>\n'
+        '<table class="models-table">\n'
+        '<thead><tr>'
+        '<th>Session</th>'
+        '<th class="num">Spawning turns</th>'
+        '<th class="num">Non-spawning turns</th>'
+        '<th class="num">Median (spawn)</th>'
+        '<th class="num">Median (no spawn)</th>'
+        '<th class="num">Δ (spawn − no spawn)</th>'
+        '<th class="num">Spawn-turn cost share</th>'
+        '</tr></thead>\n'
+        f'<tbody>{"".join(body)}</tbody>\n'
+        '</table>\n'
+        '</section>'
+    )
+
+
+def _build_subagent_share_md(stats: dict) -> str:
+    """Single line for the MD ``## Summary`` table.
+
+    Returns an empty string when the line should be omitted (i.e. when
+    ``include_subagents`` is False AND there are no spawns to disclose).
+    The HTML headline always renders for visibility; MD is a tabular
+    summary so we suppress the row in the no-data case to avoid
+    misleading readers with a 0% line they can't act on.
+    """
+    if not stats.get("include_subagents"):
+        # Show a one-liner only when spawns were detected so user knows
+        # the data is incomplete; otherwise stay quiet.
+        if int(stats.get("spawn_count", 0)) == 0:
+            return ""
+        return ("| Subagent share of cost | attribution disabled "
+                "(re-run with `--include-subagents`) |")
+    if not stats.get("has_attribution"):
+        return "| Subagent share of cost | 0% — no subagent activity |"
+    pct = float(stats.get("share_pct", 0.0))
+    cost = float(stats.get("attributed_cost", 0.0))
+    total = float(stats.get("total_cost", 0.0))
+    spawns = int(stats.get("spawn_count", 0))
+    orphans = int(stats.get("orphan_turns", 0))
+    lb = (f" — lower bound, {orphans} orphan turn"
+          f"{'s' if orphans != 1 else ''} excluded") if orphans else ""
+    return (
+        f"| Subagent share of cost | "
+        f"{pct:.1f}% (${cost:.4f} of ${total:.4f}, "
+        f"{spawns} spawn{'s' if spawns != 1 else ''}{lb}) |"
+    )
+
+
+def _build_within_session_split_md(rows: list[dict]) -> str:
+    """Markdown rendering of the within-session split table.
+
+    Returns "" when no session qualifies. Helper text mirrors the HTML
+    section: descriptive correlation only, NOT a counterfactual.
+    """
+    if not rows:
+        return ""
+    out: list[str] = []
+    out.append("## Within-session spawning split")
+    out.append("")
+    out.append("Per session, median *combined* turn cost (parent direct + "
+               "attributed subagent) on spawning vs. non-spawning turns. "
+               "Descriptive correlation — users delegate the hardest "
+               "sub-tasks, so this is **not** a counterfactual estimate "
+               "of what the same work would have cost in the main context.")
+    out.append("")
+    out.append("| Session | Spawn turns | No-spawn turns | "
+               "Median (spawn) | Median (no spawn) | Δ | Spawn-turn cost share |")
+    out.append("|---------|------------:|---------------:|"
+               "---------------:|------------------:|---:|----------------------:|")
+    for r in rows:
+        sid = (r.get("session_id") or "")[:8]
+        ms  = float(r.get("median_spawn", 0.0))
+        mns = float(r.get("median_no_spawn", 0.0))
+        delta = float(r.get("delta", 0.0))
+        sign = "+" if delta >= 0 else ""
+        out.append(
+            f"| `{sid}…` | {int(r.get('spawn_n', 0)):,} "
+            f"| {int(r.get('no_spawn_n', 0)):,} "
+            f"| ${ms:.4f} | ${mns:.4f} "
+            f"| {sign}${delta:.4f} "
+            f"| {float(r.get('spawn_share_pct', 0.0)):.1f}% |"
+        )
+    out.append("")
+    return "\n".join(out)
 
 
 def _build_cache_breaks_html(breaks: list[dict],
@@ -7514,11 +8104,16 @@ def render_html(report: dict, variant: str = "single",
             f'<div class="kpi-val">&#9986; {_n_trunc} turn{"s" if _n_trunc != 1 else ""}</div>'
             f'</div>'
         ) if _n_trunc > 0 else ""
+        # v1.26.0: subagent share KPI card. Always rendered (even in
+        # the "attribution disabled" branch) so the framing question
+        # stays visible.
+        _sa_stats = _compute_subagent_share(report)
+        subagent_share_card = "\n  " + _build_subagent_share_card_html(_sa_stats)
         summary_cards_html = f'''\
 <div class="kpi-grid">
   <div class="kpi featured cat-tokens"><div class="kpi-label">Total cost (USD)</div><div class="kpi-val">${totals['cost']:.4f}</div></div>
   <div class="kpi cat-save"><div class="kpi-label">Cache savings</div><div class="kpi-val">${totals['cache_savings']:.4f}</div></div>
-  <div class="kpi"><div class="kpi-label">Cache hit ratio</div><div class="kpi-val">{totals['cache_hit_pct']:.1f}%</div></div>
+  <div class="kpi"><div class="kpi-label">Cache hit ratio</div><div class="kpi-val">{totals['cache_hit_pct']:.1f}%</div></div>{subagent_share_card}
   <div class="kpi cat-tokens"><div class="kpi-label">Total input tokens</div><div class="kpi-val">{totals['total_input']:,}</div></div>
   <div class="kpi cat-tokens"><div class="kpi-label">Input tokens (new)</div><div class="kpi-val">{totals['input']:,}</div></div>
   <div class="kpi cat-tokens"><div class="kpi-label">Output tokens</div><div class="kpi-val">{totals['output']:,}</div></div>
@@ -7551,10 +8146,19 @@ def render_html(report: dict, variant: str = "single",
             report.get("cache_breaks", []) or [],
             int(report.get("cache_break_threshold", _CACHE_BREAK_DEFAULT_THRESHOLD)),
         )
+        # v1.26.0: trust gauge + within-session contrast. Both render
+        # as "" when their data is empty/below-threshold, so they're
+        # safe to interpolate unconditionally below.
+        attribution_coverage_html = _build_attribution_coverage_html(
+            _compute_subagent_share(report))
+        within_session_split_html = _build_within_session_split_html(
+            _compute_within_session_split(report.get("sessions") or []))
     else:
         by_skill_html = ""
         by_subagent_type_html = ""
         cache_breaks_html = ""
+        attribution_coverage_html = ""
+        within_session_split_html = ""
 
     toggle_script_html = ""
     if include_chart and mode == "project":
@@ -7802,14 +8406,25 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
                 # Subagent annotation appended to the prompt cell when
                 # the row has attributed cost — keeps the spawn signal
                 # visible even when the dedicated column is hidden.
+                # v1.26.0: append "(NN% of combined cost)" — "combined"
+                # not "of turn", because the visible Cost column shows
+                # the *direct* turn cost only; "% of turn" would imply
+                # the parent was 37% of itself.
                 sub_badge = ""
                 if r.get("att_count", 0) > 0:
+                    _direct = float(r.get("cost", 0.0))
+                    _att    = float(r.get("att_cost", 0.0))
+                    _denom  = _direct + _att
+                    _pct    = (100.0 * _att / _denom) if _denom > 0 else 0.0
                     sub_badge = (
                         f' <span class="prompts-subagent" title="'
                         f'Includes ${r["att_cost"]:.4f} from {r["att_count"]} '
-                        f'subagent turn(s) attributed to this prompt">'
+                        f'subagent turn(s) attributed to this prompt. '
+                        f'Subagents account for {_pct:.0f}% of the combined '
+                        f'(direct + attributed) cost on this turn.">'
                         f'+{r["att_count"]} subagent'
                         f'{"s" if r["att_count"] != 1 else ""}'
+                        f' ({_pct:.0f}% of combined cost)'
                         f'</span>'
                     )
                 att_cell = (
@@ -8185,6 +8800,8 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 {cache_breaks_html}
 {by_skill_html}
 {by_subagent_type_html}
+{attribution_coverage_html}
+{within_session_split_html}
 {tod_html}
 {chart_section_html}
 {chartrail_section_html}
@@ -8808,11 +9425,25 @@ def _build_instance_report(
         # via the project drilldown — no instance-level aggregation
         # needed beyond the summary footer.
         "subagent_attribution_summary": _aggregate_attribution_summary(project_reports),
+        # v1.26.0: precomputed instance-level subagent share + within-
+        # session split. ``sessions`` is intentionally an empty list at
+        # this scope (per-turn payloads are stripped to keep JSON/CSV
+        # exports bounded), so the renderers can't recompute these on
+        # demand. They're rolled up here once and cached on the report.
+        "subagent_share_stats": _compute_instance_subagent_share(
+            project_reports, totals,
+            include_subagents=any(pr.get("include_subagents") for pr in project_reports),
+        ),
+        "subagent_within_session_split": _compute_within_session_split(all_sessions_out),
         # Placeholders so the existing renderers don't KeyError if they
         # reach into the report looking for these.
         "sessions":         [],
         "resumes":          [],
         "usage_insights":   [],
+        # ``include_subagents`` propagated up so the by_subagent_type
+        # and headline renderers know whether to show "attribution
+        # disabled" framing in instance scope.
+        "include_subagents": any(pr.get("include_subagents") for pr in project_reports),
     }
     return report
 
@@ -9164,6 +9795,10 @@ def _render_instance_md(report: dict) -> str:
     p(f"| Sessions | {report.get('session_count', 0)} |")
     p(f"| Total turns | {totals.get('turns', 0):,} |")
     p(f"| Total cost | ${float(totals.get('cost', 0.0)):.4f} |")
+    _share_line = _build_subagent_share_md(
+        report.get("subagent_share_stats") or _compute_subagent_share(report))
+    if _share_line:
+        p(_share_line)
     p(f"| Input tokens (new) | {totals.get('input', 0):,} |")
     p(f"| Output tokens | {totals.get('output', 0):,} |")
     p(f"| Cache read tokens | {totals.get('cache_read', 0):,} |")
@@ -9180,6 +9815,14 @@ def _render_instance_md(report: dict) -> str:
                         key=lambda kv: float(kv[1].get("cost_usd", 0.0)))[0]
         p(f"| Top model by cost | `{top_model}` |")
     p()
+
+    # v1.26.0: within-session split table at instance scope. Sources
+    # the precomputed list from ``_build_instance_report``; renderer
+    # returns "" when no session qualifies.
+    _ws_split_md = _build_within_session_split_md(
+        report.get("subagent_within_session_split") or [])
+    if _ws_split_md:
+        p(_ws_split_md)
 
     # Projects breakdown — sorted by cost desc (already sorted by builder)
     p("## Projects breakdown")
@@ -9372,8 +10015,13 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
             f'<div class="{kpi_cls}"><div class="kpi-label">{safe_lbl}</div>'
             f'<div class="kpi-val">{safe_val}</div></div>'
         )
+    # v1.26.0: subagent share KPI card at instance scope. Read from
+    # the precomputed stats stashed by ``_build_instance_report``.
+    inst_share_card = _build_subagent_share_card_html(
+        report.get("subagent_share_stats")
+        or _compute_subagent_share(report))
     summary_cards_html = (
-        f'<div class="kpi-grid">{"".join(cards_html_parts)}</div>'
+        f'<div class="kpi-grid">{"".join(cards_html_parts)}{inst_share_card}</div>'
     )
 
     # ---- Reused insights helpers ------------------------------------------
@@ -9396,11 +10044,18 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
     # Phase-A instance-level sections (v1.6.0).
     inst_by_skill_html = _build_by_skill_html(report.get("by_skill", []) or [])
     inst_by_subagent_type_html = _build_by_subagent_type_html(
-        report.get("by_subagent_type", []) or [])
+        report.get("by_subagent_type", []) or [],
+        subagents_included=bool(report.get("include_subagents", False)))
     inst_cache_breaks_html = _build_cache_breaks_html(
         report.get("cache_breaks", []) or [],
         int(report.get("cache_break_threshold", _CACHE_BREAK_DEFAULT_THRESHOLD)),
     )
+    # v1.26.0: instance-scope coverage + within-session split.
+    inst_attribution_coverage_html = _build_attribution_coverage_html(
+        report.get("subagent_share_stats")
+        or _compute_subagent_share(report))
+    inst_within_session_split_html = _build_within_session_split_html(
+        report.get("subagent_within_session_split") or [])
 
     # ---- Projects breakdown table -----------------------------------------
     proj_rows_html_parts = []
@@ -9531,6 +10186,8 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
 {inst_cache_breaks_html}
 {inst_by_skill_html}
 {inst_by_subagent_type_html}
+{inst_attribution_coverage_html}
+{inst_within_session_split_html}
 {projects_table_html}
 {insights_html}
 {models_table_html}

@@ -7464,6 +7464,11 @@ def _build_phase_b_report(subagent_attribution=True, sort_prompts_by=None):
         "session", "pb", [(sid, turns, user_ts)],
         subagent_attribution=subagent_attribution,
         sort_prompts_by=sort_prompts_by,
+        # Propagate the loader flag so the report's ``include_subagents``
+        # field is True — needed by v1.26.0 renderers (warm-up columns,
+        # headline share branching) that otherwise treat the absence as
+        # "attribution disabled".
+        include_subagents=True,
     )
 
 
@@ -7613,6 +7618,154 @@ def test_phase_b_cli_flags_parsed():
     args_default = sm._build_parser().parse_args([])
     assert args_default.no_subagent_attribution is False
     assert args_default.sort_prompts_by is None
+
+
+# ---------------------------------------------------------------------------
+# v1.26.0: subagent share + within-session split + warm-up columns.
+# Built on the same Phase-B fixture; all derivations are render-time only.
+# ---------------------------------------------------------------------------
+
+def test_share_stats_match_attributed_sum_with_attribution():
+    """Headline ``share_pct`` matches sum(attributed_subagent_cost)/total."""
+    r = _build_phase_b_report()
+    stats = r["subagent_share_stats"]
+    turns = r["sessions"][0]["turns"]
+    expected_attributed = sum(
+        t.get("attributed_subagent_cost", 0.0) for t in turns
+        if not t.get("subagent_agent_id") and not t.get("is_resume_marker")
+    )
+    assert stats["has_attribution"] is True
+    assert stats["attributed_cost"] == expected_attributed
+    expected_pct = 100.0 * expected_attributed / r["totals"]["cost"]
+    assert abs(stats["share_pct"] - expected_pct) < 1e-9
+
+
+def test_share_stats_md_renders_share_line_with_attribution():
+    """``Subagent share of cost`` row appears in the MD summary table
+    when attribution found something to roll up."""
+    r = _build_phase_b_report()
+    md = sm.render_md(r)
+    assert "| Subagent share of cost |" in md
+    # The line uses the neutral "share" framing, never "overhead".
+    assert "overhead" not in md.lower() or "subagent overhead" not in md.lower()
+
+
+def test_share_card_disabled_label_when_subagents_not_loaded():
+    """When ``--include-subagents`` was not passed, the headline KPI
+    branches to the 'attribution disabled' message rather than a
+    deceptive 0% reading."""
+    stats_disabled = {
+        "include_subagents": False,
+        "has_attribution":   False,
+        "total_cost":        9.05,
+        "attributed_cost":   0.0,
+        "share_pct":         0.0,
+        "spawn_count":       3,
+        "attributed_count":  0,
+        "orphan_turns":      0,
+        "cycles_detected":   0,
+        "nested_levels_seen": 0,
+    }
+    card = sm._build_subagent_share_card_html(stats_disabled)
+    assert "attribution disabled" in card
+    # Important: the card must NOT render "0%" when subagents weren't
+    # loaded — that would falsely imply zero subagent activity.
+    assert ">0%<" not in card
+
+
+def test_within_session_split_renders_when_qualifies():
+    """A session with ≥3 spawning + ≥3 non-spawning turns produces a
+    qualifying row from ``_compute_within_session_split``."""
+    sessions = [{
+        "session_id": "abc123def",
+        "subtotal":   {"cost": 1.0},
+        "turns": [
+            # 4 spawning turns
+            {"index": 1, "cost_usd": 0.10, "tool_use_ids": ["t1"],
+             "spawned_subagents": ["Explore"], "attributed_subagent_cost": 0.30},
+            {"index": 2, "cost_usd": 0.05, "tool_use_ids": ["t2"],
+             "spawned_subagents": ["Explore"], "attributed_subagent_cost": 0.20},
+            {"index": 3, "cost_usd": 0.08, "tool_use_ids": ["t3"],
+             "spawned_subagents": ["Explore"], "attributed_subagent_cost": 0.25},
+            {"index": 4, "cost_usd": 0.06, "tool_use_ids": ["t4"],
+             "spawned_subagents": ["Explore"], "attributed_subagent_cost": 0.15},
+            # 4 non-spawning turns
+            {"index": 5, "cost_usd": 0.02},
+            {"index": 6, "cost_usd": 0.01},
+            {"index": 7, "cost_usd": 0.03},
+            {"index": 8, "cost_usd": 0.02},
+        ],
+    }]
+    rows = sm._compute_within_session_split(sessions)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["spawn_n"] == 4
+    assert row["no_spawn_n"] == 4
+    # Median of {0.40, 0.25, 0.33, 0.21} (combined) > median of
+    # {0.02, 0.01, 0.03, 0.02} (no-spawn).
+    assert row["median_spawn"] > row["median_no_spawn"]
+    assert row["delta"] > 0
+
+
+def test_within_session_split_omits_when_too_few_turns():
+    """Sessions with <3 spawning OR <3 non-spawning turns are filtered."""
+    sessions = [{
+        "session_id": "low_spawn",
+        "subtotal":   {"cost": 0.5},
+        "turns": [
+            {"index": 1, "cost_usd": 0.10, "tool_use_ids": ["t1"],
+             "spawned_subagents": ["Explore"], "attributed_subagent_cost": 0.30},
+            {"index": 2, "cost_usd": 0.05},
+            {"index": 3, "cost_usd": 0.05},
+            {"index": 4, "cost_usd": 0.05},
+        ],
+    }]
+    assert sm._compute_within_session_split(sessions) == []
+
+
+def test_per_turn_badge_uses_combined_cost_label_not_turn():
+    """Per-turn subagent badge in the prompts table uses the
+    confounder-resistant '(NN% of combined cost)' label, not the
+    misleading 'of turn' wording.
+    """
+    r = _build_phase_b_report()
+    html = sm.render_html(r, variant="single", chart_lib="none")
+    # The fixture parent prompt has both direct and attributed cost,
+    # so the badge must render the percentage variant.
+    assert "of combined cost" in html
+    # The misleading old wording must not appear in the badge.
+    assert "% of turn" not in html
+
+
+def test_warmup_columns_render_when_invocations_observed():
+    """First-turn % and SP amortised % columns render in the by-subagent
+    type HTML when at least one row has invocation_count > 0."""
+    r = _build_phase_b_report()
+    html = sm.render_html(r, variant="single", chart_lib="none")
+    # The Phase-B fixture has multi-turn subagent invocations
+    # (aphasebA1 has 2 turns) — column headers should appear.
+    assert "First-turn %" in html
+    assert "SP amortised %" in html
+
+
+def test_share_card_shows_lower_bound_when_orphans_exist():
+    """If ``orphan_turns`` is non-zero, the headline card explicitly
+    discloses the share is a lower bound."""
+    stats_with_orphans = {
+        "include_subagents": True,
+        "has_attribution":   True,
+        "total_cost":        10.0,
+        "attributed_cost":   4.0,
+        "share_pct":         40.0,
+        "spawn_count":       5,
+        "attributed_count":  8,
+        "orphan_turns":      2,
+        "cycles_detected":   0,
+        "nested_levels_seen": 1,
+    }
+    card = sm._build_subagent_share_card_html(stats_with_orphans)
+    assert "lower bound" in card
+    assert "2 orphan turns" in card
 
 
 # ---------------------------------------------------------------------------
