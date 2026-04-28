@@ -14,8 +14,9 @@ scripts/audit-extract.py <input-json-path> --mode quick
 
 Run it once with the input JSON path. It emits a single JSON digest to
 stdout containing baseline metrics, fired triggers (with suggested
-severity + estimated impact USD pre-computed), and the top-3 expensive
-turns (with cross-finding correlation flags).
+severity + estimated impact USD pre-computed), positive triggers
+(celebratory findings — cache health and savings), and the top-3
+expensive turns (with cross-finding correlation flags).
 
 **Why this matters.** A direct `Read` on the session-metrics JSON
 typically blows the 256KB Read cap on any session above ~50 turns. The
@@ -43,11 +44,11 @@ per file.
 `session_id_short` and `ts_str` fields (the helper parses the input
 filename).
 
-## JSON schema (v1.0)
+## JSON schema (v1.1)
 
 ```jsonc
 {
-  "audit_schema_version": "1.0",
+  "audit_schema_version": "1.1",
   "mode": "quick",
   "session_id_short": "<8-char id, copy from digest.session_id_short>",
   "generated_at": "<ISO8601 UTC, e.g. 2026-04-29T01:23:45Z>",
@@ -56,6 +57,8 @@ filename).
   "baseline": { /* copy from digest.baseline verbatim */ },
 
   "findings": [ <list every fired trigger from digest.fired_triggers as a finding object; cap at 7 for scannability — see "Finding cap" below> ],
+
+  "positive_findings": [ <list every positive trigger from digest.positive_triggers; cap at 3 — see "Positive findings" below; omit the array entirely (or emit []) if digest.positive_triggers is empty> ],
 
   "top_expensive_turns": [ <exactly 3 turn objects, copy from digest.top_expensive_turns; preserve is_cache_break flag> ],
 
@@ -102,7 +105,31 @@ Quote the number in your `fix` paragraph; do not re-derive it.
 | `thinking_engagement_high` | `thinking_turn_pct` > 30 | low | `null` — savings depend on tolerance for shallower reasoning |
 | `truncated_outputs` | any turn with `stop_reason="max_tokens"` | low | `null` — quality issue, not a cost issue |
 | `advisor_share` | `advisor_cost_usd` > 5% of `cost` | low | `totals.advisor_cost_usd` (already realised) |
-| `other` | Pattern not covered above (use sparingly) | low | `null` |
+| `idle_gap_cache_decay` | A turn with `cache_creation_input_tokens > 50%` of billable input following a >5min gap from the prior turn (cache TTL boundary; aggregates top-3 events) | medium (scales by total rebuild cost: low <$0.30, medium $0.30–$1, high >$1) | `sum(rebuild_tokens) × $5/M` |
+| `other` | Pattern not covered above (use sparingly; **forbidden in this version**, see "Finding cap" below) | low | `null` |
+
+### Positive finding object
+
+Positive findings come from `digest.positive_triggers` and represent
+**good** patterns worth surfacing. They use `estimated_savings_usd`
+(direction: money saved) rather than `estimated_impact_usd`
+(direction: money wasted).
+
+```jsonc
+{
+  "rank": <1..N, ordered by descending estimated_savings_usd; null savings ranked last>,
+  "metric": <"cache_savings_high" | "cache_health_excellent">,
+  "title": <≤80 chars; states what is good>,
+  "evidence": { <copy digest.positive_triggers[i].evidence verbatim> },
+  "note": <one short sentence; what made this work, no advice needed>,
+  "estimated_savings_usd": <copy from digest.positive_triggers[i].estimated_savings_usd; null is allowed>
+}
+```
+
+| `metric` (positive) | Trigger | Savings basis |
+|---------------------|---------|---------------|
+| `cache_savings_high` | `cache_savings > 3× cost` OR `cache_savings > $5` | `totals.cache_savings` (already realised) |
+| `cache_health_excellent` | `cache_hit_pct > 90` AND zero `cache_breaks` | `null` — informational |
 
 ### Top expensive turn object
 
@@ -125,16 +152,21 @@ connection).
 
 ### Finding cap
 
-**List every fired trigger as a finding, capped at 7 for scannability.**
-There is no floor — 3 fired triggers means 3 findings; 0 fired means
-the session has no material patterns to flag.
+**Per-array caps — independent.** The negative `findings` array is
+capped at **7**. The `positive_findings` array is capped at **3**. They
+do **not** compete for slots — emitting 7 negative findings does not
+displace positives, and vice versa. Each array has no floor.
 
-If more than 7 triggers fired (rare on a single session), keep the 7
-with the highest `estimated_impact_usd` (or, where impact is null,
-those with `high` then `medium` severity). Drop the rest silently.
+If more than 7 negative triggers fired (rare on a single session),
+keep the 7 with the highest `estimated_impact_usd` (or, where impact
+is null, those with `high` then `medium` severity). If more than 3
+positive triggers fired, keep the 3 with the highest
+`estimated_savings_usd`. Drop the rest silently.
 
-Do **not** pad with `"other"` rows to reach a target count. Padding
-dilutes the real signal.
+**No padding, ever.** Do **not** add `"other"` rows to either array to
+reach a target count. The `other` enum is forbidden in v1.1 outputs.
+Do not invent positives. Both arrays may be empty if no triggers fired —
+that is the correct outcome, not a defect to fix.
 
 ### `fix_first`
 
@@ -197,7 +229,13 @@ Total cost **${baseline.total_cost_usd:.2f}** across **{baseline.turns} turns**{
 {for each turn in top_expensive_turns:}
 - Turn #{turn_index} · ${cost_usd:.4f} · {label} — {hypothesis}{cache_break_suffix}
 
-## 4. What to fix first
+## 4. Positive findings
+
+{omit this entire section if positive_findings is empty.}
+{for each positive in positive_findings, in rank order:}
+- 🟢 {title} — {evidence_inline}{savings_suffix}
+
+## 5. What to fix first
 
 {for each bullet in fix_first:}
 - {bullet}
@@ -218,6 +256,8 @@ Render rules:
   `tool_names_top3`, render as `['Bash','Edit','Read']`.
 - `{cache_break_suffix}`: if `is_cache_break` is true, append
   ` (also flagged as cache_break)`.
+- `{savings_suffix}`: if `estimated_savings_usd` is non-null, append
+  ` — saved $<savings:.2f>`. Otherwise, append nothing.
 
 The markdown copy on disk is identical to what is printed inline,
 **except** it gains the `# Quick audit — session ...` H1 heading at
@@ -232,7 +272,8 @@ already shows context above the audit).
   paragraph each.
 - **Honour the cap, not a target.** If 3 triggers fired, emit 3 findings —
   don't pad.
-- **Stop after section 4.** Do not append "summary" or "next steps".
+- **Stop after section 5** (or section 4 if positive findings is empty
+  and that section was omitted). Do not append "summary" or "next steps".
 
 ## Final step (write order)
 
@@ -250,8 +291,14 @@ already shows context above the audit).
 
 ## Schema versioning
 
-Bumping `audit_schema_version` (currently `1.0`) is breaking — any
+Bumping `audit_schema_version` (currently `1.1`) is breaking — any
 tooling that consumes the JSON sidecar will need to handle the new
 shape. Bump the major number for breaking changes (renamed fields,
 removed enum values), the minor number for additive changes (new
 optional fields, new enum values).
+
+**v1.0 → v1.1** (additive): added `positive_findings` array (parallel
+to `findings`), added `idle_gap_cache_decay` to the negative metric
+enum, added `cache_savings_high` and `cache_health_excellent` positive
+metric enum. The `other` enum is **forbidden** in v1.1 outputs (was
+"use sparingly" in v1.0).

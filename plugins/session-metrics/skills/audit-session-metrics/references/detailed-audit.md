@@ -106,15 +106,16 @@ emit one finding with the matching metric:
 Do not invent additional triggers from raw turn data — if the helper
 did not surface a pattern, it did not pass the threshold.
 
-## JSON schema (v1.0)
+## JSON schema (v1.1)
 
 Same spine as `quick-audit.md`'s schema, with `mode: "detailed"`,
-**up to 16 findings**, and three additional top-level fields:
+**up to 16 findings**, the `positive_findings` array (capped at 3,
+same shape as quick-audit), and three additional top-level fields:
 `quick_wins`, `structural_fixes`, `estimated_savings`.
 
 ```jsonc
 {
-  "audit_schema_version": "1.0",
+  "audit_schema_version": "1.1",
   "mode": "detailed",
   "session_id_short": "<8-char id, copy from digest.session_id_short>",
   "generated_at": "<ISO8601 UTC>",
@@ -123,6 +124,8 @@ Same spine as `quick-audit.md`'s schema, with `mode: "detailed"`,
   "baseline": { /* copy from digest.baseline */ },
 
   "findings": [ <list every fired trigger + every detailed-only finding, capped at 16, sorted high → low severity, then by descending estimated_impact_usd> ],
+
+  "positive_findings": [ <list every positive trigger from digest.positive_triggers; cap at 3; same shape as quick-audit positive finding object; omit/[] when empty> ],
 
   "top_expensive_turns": [ <exactly 3 turn objects, copy from digest.top_expensive_turns> ],
 
@@ -157,7 +160,11 @@ The quick-mode metric enum (cache_break / top_turn_share /
 input_output_ratio_uncached / subagent_share / cache_ttl_1h_unused /
 session_warmup_overhead / tool_result_bloat / heavy_reader_tools /
 cache_savings_low / thinking_engagement_high / truncated_outputs /
-advisor_share / other) carries forward unchanged. Detailed mode adds:
+advisor_share / idle_gap_cache_decay / other — note `other` is forbidden
+in v1.1 outputs) carries forward unchanged. The positive enum
+(cache_savings_high / cache_health_excellent) also carries forward and
+populates `positive_findings` exactly as in quick-audit. Detailed mode
+adds:
 
 | `metric` | Trigger (digest source) | Default severity | Impact formula |
 |----------|-------------------------|------------------|----------------|
@@ -182,18 +189,23 @@ downgrades, copy `digest.fired_triggers[i].suggested_severity` into the
 finding's `severity` and quote `downgrade_reason` in the `fix`
 paragraph.
 
-### Sixteen-finding cap
+### Sixteen-finding cap (negative) + three-finding cap (positive)
 
-Up to 16 findings. There is no floor — emit only the findings that the
-helper + Phase 2 produced. **Merge similar findings** rather than
-padding (three separate `file_re_read` paths roll into one finding
-with `evidence.examples[]`).
+Two independent caps. Negative `findings` is capped at **16**; positive
+`positive_findings` is capped at **3**. The arrays do not compete for
+slots. Each has no floor — emit only the findings the helper + Phase 2
+produced. **Merge similar findings** rather than padding (three separate
+`file_re_read` paths roll into one finding with `evidence.examples[]`).
 
-If more than 16 fire (rare), keep the 16 with the highest
-`estimated_impact_usd` (or, where impact is null, those with `high`
-then `medium` severity). Drop the rest silently.
+If more than 16 negative triggers fire (rare), keep the 16 with the
+highest `estimated_impact_usd` (or, where impact is null, those with
+`high` then `medium` severity). If more than 3 positive triggers fire,
+keep the 3 with the highest `estimated_savings_usd`. Drop the rest
+silently.
 
-5 high-quality findings beat 16 padded ones.
+**No padding, ever.** The `other` enum is **forbidden** in v1.1
+outputs — do not add `"other"` rows to either array, and do not invent
+positives. 5 high-quality findings beat 16 padded ones.
 
 ## LLM division of labor
 
@@ -231,17 +243,23 @@ three new sections instead of `## 4. What to fix first`:
 ## 3. Top 3 expensive turns
 {same as quick-audit, including the (also flagged as cache_break) suffix when applicable}
 
-## 4. Quick wins (≤10 min each)
+## 4. Positive findings
+
+{omit this entire section if positive_findings is empty.}
+{for each positive in positive_findings, in rank order:}
+- 🟢 {title} — {evidence_inline}{savings_suffix}
+
+## 5. Quick wins (≤10 min each)
 
 {for each bullet in quick_wins:}
 - {bullet}
 
-## 5. Structural fixes (require habit shift)
+## 6. Structural fixes (require habit shift)
 
 {for each bullet in structural_fixes:}
 - {bullet}
 
-## 6. Estimated savings
+## 7. Estimated savings
 
 {rendered from estimated_savings:}
 
@@ -270,7 +288,9 @@ cache-break suffix on top turns) carry over unchanged.
   session, no config files present), set
   `estimated_savings.confidence` to `"low"` and the numeric fields
   to `null` rather than inventing percentages.
-- **Stop after section 6.** Do not append "summary" or "next steps".
+- **Stop after section 7** (or earlier if the positive findings section
+  is omitted because no positive triggers fired). Do not append
+  "summary" or "next steps".
 
 ## Final step (write order)
 

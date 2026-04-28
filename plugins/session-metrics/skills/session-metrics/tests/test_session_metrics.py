@@ -7591,9 +7591,8 @@ def test_audit_quick_playbook_anchors():
     # allow null so the model is told never to guess.
     assert "estimated_impact_usd" in quick
     assert "null" in quick
-    # v1.28.0: cap is "list every fired trigger, capped at 7" — no floor.
-    # Padding is explicitly forbidden.
-    assert "capped at 7" in quick
+    # v1.29.0: per-array caps — 7 negative, 3 positive — no floor, no padding.
+    assert "capped at **7**" in quick or "capped at 7" in quick
     assert "Finding cap" in quick
     assert "no floor" in quick.lower()
     # Helper-script workflow is now the entry path:
@@ -7602,6 +7601,12 @@ def test_audit_quick_playbook_anchors():
     assert "Impact formula" in quick
     # LLM division of labor section:
     assert "LLM division of labor" in quick
+    # v1.29.0 additions: positive findings + idle_gap_cache_decay:
+    assert "positive_findings" in quick
+    assert "cache_savings_high" in quick
+    assert "cache_health_excellent" in quick
+    assert "idle_gap_cache_decay" in quick
+    assert "schema_version" in quick and "1.1" in quick
 
 
 def test_audit_detailed_playbook_anchors():
@@ -7633,6 +7638,9 @@ def test_audit_detailed_playbook_anchors():
     assert "up to 16 finding" in detailed or "up to 16 findings" in detailed
     assert "Sixteen-finding cap" in detailed
     assert "no floor" in detailed.lower()
+    # v1.29.0 additions: positive_findings carries forward to detailed.
+    assert "positive_findings" in detailed
+    assert "idle_gap_cache_decay" in detailed
     # Helper-script workflow:
     assert "audit-extract.py" in detailed
     assert "detailed_candidates" in detailed
@@ -8708,3 +8716,160 @@ def test_audit_extract_weekly_rollup_suppressed_when_first_week():
     })
     digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "detailed")
     assert digest["detailed_candidates"]["weekly_rollup"] is None
+
+
+# ---------------------------------------------------------------------------
+# v1.1 schema additions: positive_findings + idle_gap_cache_decay.
+# ---------------------------------------------------------------------------
+
+
+def test_audit_extract_digest_schema_version_is_1_1():
+    ae = _load_audit_extract()
+    digest = ae.build_digest(_audit_min_export(),
+                             "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["digest_schema_version"] == "1.1"
+    assert "positive_triggers" in digest
+
+
+def test_audit_extract_positive_cache_savings_high_fires_on_ratio():
+    ae = _load_audit_extract()
+    # cost $0.50, cache_savings $2.00 → ratio 4× → fires (3× threshold)
+    data = _audit_min_export(totals={
+        **_audit_min_export()["totals"],
+        "cost": 0.50, "cache_savings": 2.00, "cache_hit_pct": 80.0,
+    })
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    metrics = [p["metric"] for p in digest["positive_triggers"]]
+    assert "cache_savings_high" in metrics
+    p = next(p for p in digest["positive_triggers"] if p["metric"] == "cache_savings_high")
+    assert p["estimated_savings_usd"] == pytest.approx(2.00)
+    assert p["evidence"]["ratio_savings_to_cost"] == pytest.approx(4.0)
+
+
+def test_audit_extract_positive_cache_savings_high_fires_on_absolute():
+    ae = _load_audit_extract()
+    # cost $20, cache_savings $6 → ratio 0.3× (below 3×) but $6 > $5 → fires
+    data = _audit_min_export(totals={
+        **_audit_min_export()["totals"],
+        "cost": 20.0, "cache_savings": 6.0,
+    })
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    metrics = [p["metric"] for p in digest["positive_triggers"]]
+    assert "cache_savings_high" in metrics
+
+
+def test_audit_extract_positive_cache_savings_high_does_not_fire_when_low():
+    ae = _load_audit_extract()
+    # cost $10, savings $1 → ratio 0.1× and < $5 → does not fire
+    data = _audit_min_export(totals={
+        **_audit_min_export()["totals"],
+        "cost": 10.0, "cache_savings": 1.0,
+    })
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    metrics = [p["metric"] for p in digest["positive_triggers"]]
+    assert "cache_savings_high" not in metrics
+
+
+def test_audit_extract_positive_cache_health_excellent_fires():
+    ae = _load_audit_extract()
+    data = _audit_min_export(totals={
+        **_audit_min_export()["totals"],
+        "cost": 1.0, "cache_hit_pct": 92.0,
+    })
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    metrics = [p["metric"] for p in digest["positive_triggers"]]
+    assert "cache_health_excellent" in metrics
+
+
+def test_audit_extract_positive_cache_health_suppressed_when_cache_break():
+    ae = _load_audit_extract()
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "cost": 1.0, "cache_hit_pct": 95.0},
+        cache_breaks=[{"turn_index": 1, "uncached": 100_000, "cache_break_pct": 50,
+                       "session_id": "s", "timestamp": "", "timestamp_fmt": "",
+                       "total_tokens": 100_000, "prompt_snippet": "",
+                       "slash_command": "", "model": "claude-opus-4-7", "context": []}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    metrics = [p["metric"] for p in digest["positive_triggers"]]
+    assert "cache_health_excellent" not in metrics, (
+        "cache_health_excellent must not fire when any cache_break event exists"
+    )
+
+
+def test_audit_extract_idle_gap_cache_decay_fires_after_5min_gap():
+    ae = _load_audit_extract()
+    # Two turns: second is 6 min after first AND has cache rebuild (>50% cw)
+    turns = [
+        _audit_min_turn(index=1, timestamp="2026-04-29T10:00:00Z",
+                        cache_write_tokens=10, input_tokens=100, cache_read_tokens=0),
+        _audit_min_turn(index=2, timestamp="2026-04-29T10:06:00Z",
+                        cache_write_tokens=200_000, input_tokens=100, cache_read_tokens=0),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 2, "cost": 1.0,
+                "output": 100, "total_input": 200},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    fired = next((t for t in digest["fired_triggers"]
+                  if t["metric"] == "idle_gap_cache_decay"), None)
+    assert fired is not None
+    assert fired["evidence"]["worst_turn_index"] == 2
+    assert fired["evidence"]["worst_gap_minutes"] == pytest.approx(6.0)
+    # 200k tokens × $5/M = $1.00
+    assert fired["estimated_impact_usd"] == pytest.approx(1.00, abs=0.01)
+
+
+def test_audit_extract_idle_gap_cache_decay_skips_short_gap():
+    ae = _load_audit_extract()
+    # Gap < 5min → cache TTL not crossed → does not fire
+    turns = [
+        _audit_min_turn(index=1, timestamp="2026-04-29T10:00:00Z"),
+        _audit_min_turn(index=2, timestamp="2026-04-29T10:03:00Z",
+                        cache_write_tokens=200_000),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 2, "cost": 1.0},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    metrics = [t["metric"] for t in digest["fired_triggers"]]
+    assert "idle_gap_cache_decay" not in metrics
+
+
+def test_audit_extract_idle_gap_cache_decay_severity_scales_with_cost():
+    ae = _load_audit_extract()
+    # 100k tokens × $5/M = $0.50 → medium severity ($0.30-$1.00 band)
+    turns = [
+        _audit_min_turn(index=1, timestamp="2026-04-29T10:00:00Z"),
+        _audit_min_turn(index=2, timestamp="2026-04-29T10:10:00Z",
+                        cache_write_tokens=100_000, input_tokens=100, cache_read_tokens=0),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 2, "cost": 1.0,
+                "output": 100, "total_input": 200},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    fired = next(t for t in digest["fired_triggers"]
+                 if t["metric"] == "idle_gap_cache_decay")
+    assert fired["suggested_severity"] == "medium"
+
+
+def test_audit_extract_idle_gap_cache_decay_skips_when_no_cache_rebuild():
+    ae = _load_audit_extract()
+    # Gap >5min but no cache rebuild (cache_write_tokens small) → does not fire
+    turns = [
+        _audit_min_turn(index=1, timestamp="2026-04-29T10:00:00Z"),
+        _audit_min_turn(index=2, timestamp="2026-04-29T10:10:00Z",
+                        cache_write_tokens=100, input_tokens=10,
+                        cache_read_tokens=50_000),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 2, "cost": 1.0},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    metrics = [t["metric"] for t in digest["fired_triggers"]]
+    assert "idle_gap_cache_decay" not in metrics

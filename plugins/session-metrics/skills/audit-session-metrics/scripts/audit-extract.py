@@ -28,6 +28,7 @@ import os
 import re
 import sys
 from collections import Counter
+from datetime import datetime
 from typing import Any
 
 # Opus 4.7 input rate per 1M tokens — used for cache_break impact estimates.
@@ -35,7 +36,12 @@ from typing import Any
 # script standalone.
 OPUS_INPUT_RATE_PER_M = 5.00
 
-DIGEST_SCHEMA_VERSION = "1.0"
+# Cache TTL boundary in seconds. A gap longer than this expires the 5-minute
+# ephemeral cache; the next turn pays full uncached input on whatever it
+# would have hit. Independent of the HTML --idle-gap-minutes UI threshold.
+CACHE_TTL_5M_SECONDS = 300
+
+DIGEST_SCHEMA_VERSION = "1.1"
 
 
 def session_filename_parts(path: str) -> tuple[str, str]:
@@ -81,6 +87,47 @@ def compute_baseline(data: dict) -> dict:
 
 def _safe_div_pct(num: float, denom: float) -> float:
     return (num / denom) * 100 if denom else 0.0
+
+
+def _parse_iso(ts: str) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _detect_idle_gap_cache_decay(turns: list[dict]) -> list[dict]:
+    """Find turns where a >5m gap from the prior turn was followed by a
+    cache rebuild (cache_creation_input_tokens > 50% of billable input).
+    Returns rebuild events sorted by descending cost."""
+    events: list[dict] = []
+    prev_ts: datetime | None = None
+    for t in turns:
+        if t.get("is_resume_marker"):
+            prev_ts = None
+            continue
+        cur_ts = _parse_iso(t.get("timestamp", ""))
+        if prev_ts and cur_ts:
+            gap_s = (cur_ts - prev_ts).total_seconds()
+            if gap_s >= CACHE_TTL_5M_SECONDS:
+                cw = t.get("cache_write_tokens", 0) or 0
+                ip = t.get("input_tokens", 0) or 0
+                cr = t.get("cache_read_tokens", 0) or 0
+                billable = cw + ip + cr
+                if billable > 0 and (cw / billable) > 0.5:
+                    rebuild_cost = round(cw * OPUS_INPUT_RATE_PER_M / 1_000_000, 4)
+                    events.append({
+                        "turn_index": t.get("index"),
+                        "gap_minutes": round(gap_s / 60, 1),
+                        "cache_write_tokens": cw,
+                        "rebuild_cost_usd": rebuild_cost,
+                    })
+        if cur_ts:
+            prev_ts = cur_ts
+    events.sort(key=lambda e: e["rebuild_cost_usd"], reverse=True)
+    return events
 
 
 def evaluate_triggers(data: dict, turns: list[dict]) -> list[dict]:
@@ -327,6 +374,40 @@ def evaluate_triggers(data: dict, turns: list[dict]) -> list[dict]:
             "impact_basis": "n/a — quality issue, not a cost issue",
         })
 
+    # idle_gap_cache_decay — long idle gap (>5m, cache TTL boundary) followed
+    # by a cache rebuild. Aggregates the top-3 most-expensive rebuilds into
+    # one finding; severity scales by total rebuild cost.
+    decays = _detect_idle_gap_cache_decay(turns)
+    if decays:
+        total_rebuild_cost = round(sum(d["rebuild_cost_usd"] for d in decays), 2)
+        top = decays[0]
+        if total_rebuild_cost >= 1.0:
+            severity = "high"
+        elif total_rebuild_cost >= 0.30:
+            severity = "medium"
+        else:
+            severity = "low"
+        fired.append({
+            "metric": "idle_gap_cache_decay",
+            "default_severity": "medium",
+            "suggested_severity": severity,
+            "downgrade_reason": None,
+            "evidence": {
+                "events": len(decays),
+                "total_rebuild_cost_usd": total_rebuild_cost,
+                "worst_turn_index": top["turn_index"],
+                "worst_gap_minutes": top["gap_minutes"],
+                "worst_rebuild_cost_usd": top["rebuild_cost_usd"],
+                "examples": decays[:3],
+            },
+            "estimated_impact_usd": total_rebuild_cost,
+            "impact_basis": (
+                "sum(cache_creation_tokens after >5m gap) × $5/M (Opus input rate); "
+                "5m is the ephemeral cache TTL boundary, independent of the HTML "
+                "--idle-gap-minutes UI threshold"
+            ),
+        })
+
     # advisor_share — advisor_cost_usd > 5% of cost
     advisor_cost = totals.get("advisor_cost_usd", 0) or 0
     advisor_pct = _safe_div_pct(advisor_cost, cost)
@@ -350,6 +431,51 @@ def evaluate_triggers(data: dict, turns: list[dict]) -> list[dict]:
             },
             "estimated_impact_usd": round(advisor_cost, 2),
             "impact_basis": "totals.advisor_cost_usd (already realised)",
+        })
+
+    return fired
+
+
+def evaluate_positive_triggers(data: dict) -> list[dict]:
+    """Evaluate positive (celebratory) triggers. These are first-class
+    structural findings that prevent Haiku from padding the audit with
+    'other'-row filler when no waste pattern fires. Two triggers ship in
+    schema 1.1: cache_savings_high and cache_health_excellent."""
+    fired: list[dict] = []
+    totals = data.get("totals", {})
+    cost = totals.get("cost", 0) or 0.0
+    cache_savings = totals.get("cache_savings", 0) or 0
+    cache_hit = totals.get("cache_hit_pct", 0) or 0
+    cache_breaks = data.get("cache_breaks", []) or []
+
+    # cache_savings_high — savings > 3× cost OR > $5 absolute
+    if cost > 0 and (cache_savings > 3 * cost or cache_savings > 5):
+        ratio = round(cache_savings / cost, 1) if cost else None
+        fired.append({
+            "metric": "cache_savings_high",
+            "default_severity": "positive",
+            "suggested_severity": "positive",
+            "evidence": {
+                "cache_savings_usd": round(cache_savings, 2),
+                "cost_usd": round(cost, 2),
+                "ratio_savings_to_cost": ratio,
+            },
+            "estimated_savings_usd": round(cache_savings, 2),
+            "impact_basis": "totals.cache_savings (already realised)",
+        })
+
+    # cache_health_excellent — hit_ratio > 90% AND no cache_break events
+    if cache_hit > 90 and not cache_breaks:
+        fired.append({
+            "metric": "cache_health_excellent",
+            "default_severity": "positive",
+            "suggested_severity": "positive",
+            "evidence": {
+                "cache_hit_pct": round(cache_hit, 1),
+                "cache_break_count": 0,
+            },
+            "estimated_savings_usd": None,
+            "impact_basis": "n/a — informational; hit ratio >90% with zero cache breaks indicates well-cached prompts",
         })
 
     return fired
@@ -544,6 +670,7 @@ def build_digest(data: dict, json_path: str, mode: str) -> dict:
         "mode_hint": mode,
         "baseline": compute_baseline(data),
         "fired_triggers": evaluate_triggers(data, turns),
+        "positive_triggers": evaluate_positive_triggers(data),
         "top_expensive_turns": top_expensive_turns(turns, cache_breaks),
     }
     if mode == "detailed":
