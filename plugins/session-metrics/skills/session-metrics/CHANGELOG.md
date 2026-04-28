@@ -5,6 +5,97 @@ Versions match the `plugin.json` / `marketplace.json` version field.
 
 ---
 
+## v1.26.2 — 2026-04-28
+
+### Bug fix — accumulate user content blocks across the gap (parallel-spawn sibling fix)
+
+Sibling fix to v1.26.1's `agent_links` accumulator. `_extract_turns` was overwriting `last_user_content` on every user JSONL entry, so when N parallel Task tool_results landed in N separate user entries between two assistant turns, only the last entry's content survived into `_preceding_user_content`. Downstream content-block counters under-counted `tool_result` (and `image`) blocks on the next assistant turn by N−1.
+
+Concrete example on the dev project's mini fixture: gap before `msg_C` contains both `u4` (tool_result) and `u5` (sidechain text). Pre-fix the parser kept only `u5`'s text block — `u4`'s tool_result was dropped from the count entirely. Post-fix both survive. Project-wide on the live dev repo, the totals `tool_result` count rises to reflect every parallel-spawn fan-in.
+
+### Fix
+
+`_extract_turns()` now accumulates blocks from every user entry in the inter-assistant gap into `gap_user_blocks`, falls back to `gap_user_str` when only a string-form content (compaction summary) appeared, and resets both on assistant first-occurrence. The per-iteration `last_user_content` is preserved for the inner-loop logic (compaction guard, slash-command detection, agent_link extraction) — only the SNAPSHOT shape changes.
+
+```python
+# in user branch (after agent_links extension):
+if isinstance(last_user_content, list):
+    gap_user_blocks.extend(last_user_content)
+elif isinstance(last_user_content, str):
+    gap_user_str = last_user_content
+
+# in assistant first-occurrence:
+if gap_user_blocks:
+    preceding_user[msg_id] = list(gap_user_blocks)
+elif gap_user_str is not None:
+    preceding_user[msg_id] = gap_user_str
+else:
+    preceding_user[msg_id] = last_user_content   # back-to-back-assistants fallback
+gap_user_blocks = []
+gap_user_str = None
+```
+
+No `_SCRIPT_VERSION` bump — `_extract_turns` runs after the parse cache, not before.
+
+### Tests
+
+- New: `test_extract_turns_accumulates_parallel_tool_result_blocks` — three parallel Task spawns + three user-entry tool_results between two assistant turns; asserts all three tool_result blocks survive into `_preceding_user_content`.
+- Updated: `test_fixture_content_block_counts_per_turn` and `test_fixture_totals_content_blocks_aggregate` — the existing mini fixture's gap before `msg_C` already had two user entries (line 8 tool_result + line 9 sidechain text). Pre-fix the line-8 tool_result was dropped from `msg_C`'s preceding-user content; post-fix it's counted. The tests previously asserted the buggy old count (0) and the buggy total (2); both are now corrected to reflect the accurate behaviour (1 and 3).
+
+517 tests pass (515 existing + 2 new since v1.26.1).
+
+### Severity
+
+Cost/token math was unaffected (those come from assistant `usage` fields, not user content). The fix corrects display-layer signals: `content_blocks.tool_result` and `content_blocks.image` per turn and project-wide, plus any downstream that reads them (turn-character classification, content-block waste analysis).
+
+---
+
+## v1.26.1 — 2026-04-28
+
+### Bug fix — recover subagent attribution lost on parallel Task spawns
+
+`_extract_turns` was overwriting `last_user_agent_links` on every user JSONL entry instead of accumulating, so when the assistant emitted N parallel Task tool_uses in one turn, only the LAST `(tool_use_id, agentId)` pair survived. The other N−1 spawns lost their linkage and every subagent turn from those spawns counted as an orphan.
+
+**Real impact on this dev project (35 session blocks, $1,041 total spend):**
+
+| Signal | Before fix | After fix |
+|---|---:|---:|
+| Orphan subagent turns | 477 | 8 |
+| Attributed subagent turns | 1,221 | 1,697 |
+| Spawns recognised | 92 | 93 |
+| Subagent share of cost | 3.5% | 4.62% |
+
+The headline 3.5% share was understated by ~30% because the parser was dropping a third of all `(tool_use_id, agentId)` pairs from the JSONL even though the data was present in every parent log.
+
+### Fix
+
+`scripts/session-metrics.py:_extract_turns()` — change overwrite to extend, and reset on assistant first-occurrence so pairs from one inter-assistant gap don't leak into the next:
+
+```python
+# was:  last_user_agent_links = agent_links
+last_user_agent_links.extend(agent_links)
+...
+# inside `if msg_id not in preceding_user:` block, after capture:
+last_user_agent_links = []
+```
+
+Render-time only — no parser-cache schema change, no `_SCRIPT_VERSION` bump, parse cache stays valid.
+
+### Tests
+
+Two regression tests added near the existing Phase-B suite:
+
+- `test_extract_turns_accumulates_parallel_task_agent_links` — synthesises an assistant turn with two parallel Task tool_uses + two separate user `tool_result` entries, asserts both `(tuid, agentId)` pairs survive into the next assistant's `_preceding_user_agent_links`.
+- `test_extract_turns_resets_agent_links_after_assistant_first_occurrence` — asserts that pairs do NOT leak from one assistant gap into a later assistant's `_preceding_user_agent_links`.
+
+516 tests pass (514 existing + 2 new).
+
+### Caveat
+
+8 turns remain orphaned in the dev project. These are genuine unrecoverable cases — two subagent JSONL files (`a51a9e01fd9c84bd2`, `af258417369f5ebc6`) lack any `toolUseResult.agentId` in their parent log, most likely because the subagent crashed/was killed before its tool_result could be written back. The headline keeps its `lower bound — N orphan turns excluded` caveat for the residual cases.
+
+---
+
 ## v1.26.0 — 2026-04-28
 
 ### Observational subagent-cost framing — share, coverage, within-session split, warm-up signals

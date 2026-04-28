@@ -638,9 +638,12 @@ def test_fixture_content_block_counts_per_turn():
         "thinking": 0, "tool_use": 0, "text": 1, "tool_result": 1, "image": 0,
         "server_tool_use": 0, "advisor_tool_result": 0,
     }
-    # msg_C: text only; preceded by u5 (sidechain text) — no attributable blocks
+    # msg_C: text only; gap before it contains both u4 (tool_result) and u5
+    # (sidechain text). Pre-v1.26.2 the parser overwrote last_user_content on
+    # each user entry so only u5's text block survived; the v1.26.2 fix
+    # accumulates blocks across the gap so u4's tool_result is also counted.
     assert turns[2]["content_blocks"] == {
-        "thinking": 0, "tool_use": 0, "text": 1, "tool_result": 0, "image": 0,
+        "thinking": 0, "tool_use": 0, "text": 1, "tool_result": 1, "image": 0,
         "server_tool_use": 0, "advisor_tool_result": 0,
     }
     # msg_D: tool_use WebFetch + text; preceded by u7 (tool_result)
@@ -694,8 +697,10 @@ def test_fixture_thinking_turn_pct():
 def test_fixture_totals_content_blocks_aggregate():
     r = _build_fixture_report()
     cb = r["totals"]["content_blocks"]
+    # tool_result=3 post-v1.26.2: msg_B picks up u3, msg_C picks up u4
+    # (previously dropped by overwrite), msg_D picks up u7.
     assert cb == {"thinking": 2, "tool_use": 4, "text": 6,
-                  "tool_result": 2, "image": 1,
+                  "tool_result": 3, "image": 1,
                   "server_tool_use": 0, "advisor_tool_result": 0}
     assert r["totals"]["tool_call_total"] == 4
     assert r["totals"]["tool_call_avg_per_turn"] == pytest.approx(4 / 6, abs=1e-6)
@@ -7480,6 +7485,122 @@ def test_phase_b_extract_turns_captures_agent_links():
     a2 = next(t for t in turns if t["message"]["id"] == "pb_msg_2")
     links = a2.get("_preceding_user_agent_links") or []
     assert ("tu-explore", "aphasebA1") in links
+
+
+def test_extract_turns_accumulates_parallel_task_agent_links():
+    # When the assistant emits multiple Task tool_uses in parallel, Anthropic's
+    # wire format returns each tool_result in its own user JSONL entry, each
+    # carrying its own toolUseResult.agentId. The next assistant turn's
+    # _preceding_user_agent_links must contain ALL pairs, not just the last one.
+    # Pre-fix: last_user_agent_links was overwritten on each user entry, so
+    # only the final (tuid, agentId) pair survived → N-1 of N spawns orphaned.
+    base_usage = {"input_tokens": 5, "output_tokens": 10,
+                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    entries = [
+        {"type": "user", "timestamp": "2026-04-28T10:00:00Z",
+         "message": {"role": "user", "content": "spawn two tasks"}},
+        {"type": "assistant", "timestamp": "2026-04-28T10:00:01Z",
+         "message": {"id": "spawn_msg", "role": "assistant", "model": "claude-opus-4-7",
+                     "usage": base_usage,
+                     "content": [
+                         {"type": "tool_use", "id": "tu_alpha", "name": "Task", "input": {}},
+                         {"type": "tool_use", "id": "tu_beta",  "name": "Task", "input": {}},
+                     ]}},
+        {"type": "user", "timestamp": "2026-04-28T10:00:10Z",
+         "toolUseResult": {"agentId": "aid_alpha"},
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "tu_alpha", "content": "alpha done"}]}},
+        {"type": "user", "timestamp": "2026-04-28T10:00:11Z",
+         "toolUseResult": {"agentId": "aid_beta"},
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "tu_beta", "content": "beta done"}]}},
+        {"type": "assistant", "timestamp": "2026-04-28T10:00:12Z",
+         "message": {"id": "next_msg", "role": "assistant", "model": "claude-opus-4-7",
+                     "usage": base_usage,
+                     "content": [{"type": "text", "text": "got both"}]}},
+    ]
+    turns = sm._extract_turns(entries)
+    next_turn = next(t for t in turns if t["message"]["id"] == "next_msg")
+    links = next_turn.get("_preceding_user_agent_links") or []
+    assert ("tu_alpha", "aid_alpha") in links, f"alpha pair missing: {links}"
+    assert ("tu_beta", "aid_beta") in links, f"beta pair missing: {links}"
+
+
+def test_extract_turns_accumulates_parallel_tool_result_blocks():
+    # Sibling fix to the agent_links accumulator: when N tool_result entries
+    # land in N separate user messages between two assistant turns, content
+    # block counts on the next assistant turn must include every tool_result,
+    # not just the last user entry's. Pre-fix: last_user_content was
+    # overwritten on each user entry → tool_result count was always 1.
+    base_usage = {"input_tokens": 5, "output_tokens": 10,
+                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    entries = [
+        {"type": "user", "timestamp": "2026-04-28T12:00:00Z",
+         "message": {"role": "user", "content": "spawn 3"}},
+        {"type": "assistant", "timestamp": "2026-04-28T12:00:01Z",
+         "message": {"id": "spawn3", "role": "assistant", "model": "claude-opus-4-7",
+                     "usage": base_usage,
+                     "content": [
+                         {"type": "tool_use", "id": "tu_a", "name": "Task", "input": {}},
+                         {"type": "tool_use", "id": "tu_b", "name": "Task", "input": {}},
+                         {"type": "tool_use", "id": "tu_c", "name": "Task", "input": {}},
+                     ]}},
+        {"type": "user", "timestamp": "2026-04-28T12:00:10Z",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "tu_a", "content": "a"}]}},
+        {"type": "user", "timestamp": "2026-04-28T12:00:11Z",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "tu_b", "content": "b"}]}},
+        {"type": "user", "timestamp": "2026-04-28T12:00:12Z",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "tu_c", "content": "c"}]}},
+        {"type": "assistant", "timestamp": "2026-04-28T12:00:13Z",
+         "message": {"id": "after_3", "role": "assistant", "model": "claude-opus-4-7",
+                     "usage": base_usage,
+                     "content": [{"type": "text", "text": "got 3"}]}},
+    ]
+    turns = sm._extract_turns(entries)
+    after = next(t for t in turns if t["message"]["id"] == "after_3")
+    user_raw = after.get("_preceding_user_content")
+    assert isinstance(user_raw, list), f"expected list snapshot, got {type(user_raw)}"
+    tool_result_blocks = [b for b in user_raw
+                          if isinstance(b, dict) and b.get("type") == "tool_result"]
+    assert len(tool_result_blocks) == 3, (
+        f"expected 3 tool_result blocks across the gap, got {len(tool_result_blocks)}")
+
+
+def test_extract_turns_resets_agent_links_after_assistant_first_occurrence():
+    # The accumulator must reset after the assistant first-occurrence captures
+    # its snapshot, otherwise pairs from one gap leak into the next assistant's
+    # _preceding_user_agent_links.
+    base_usage = {"input_tokens": 5, "output_tokens": 10,
+                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    entries = [
+        {"type": "user", "timestamp": "2026-04-28T11:00:00Z",
+         "message": {"role": "user", "content": "first prompt"}},
+        {"type": "assistant", "timestamp": "2026-04-28T11:00:01Z",
+         "message": {"id": "spawn_msg", "role": "assistant", "model": "claude-opus-4-7",
+                     "usage": base_usage,
+                     "content": [{"type": "tool_use", "id": "tu_x", "name": "Task", "input": {}}]}},
+        {"type": "user", "timestamp": "2026-04-28T11:00:05Z",
+         "toolUseResult": {"agentId": "aid_x"},
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "tu_x", "content": "x done"}]}},
+        {"type": "assistant", "timestamp": "2026-04-28T11:00:06Z",
+         "message": {"id": "first_resp", "role": "assistant", "model": "claude-opus-4-7",
+                     "usage": base_usage,
+                     "content": [{"type": "text", "text": "ok"}]}},
+        {"type": "user", "timestamp": "2026-04-28T11:00:10Z",
+         "message": {"role": "user", "content": "plain follow-up, no spawn"}},
+        {"type": "assistant", "timestamp": "2026-04-28T11:00:11Z",
+         "message": {"id": "second_resp", "role": "assistant", "model": "claude-opus-4-7",
+                     "usage": base_usage,
+                     "content": [{"type": "text", "text": "done"}]}},
+    ]
+    turns = sm._extract_turns(entries)
+    second = next(t for t in turns if t["message"]["id"] == "second_resp")
+    leaked = second.get("_preceding_user_agent_links") or []
+    assert leaked == [], f"agent_links leaked into a later turn: {leaked}"
 
 
 def test_phase_b_load_session_tags_subagent_agent_id():

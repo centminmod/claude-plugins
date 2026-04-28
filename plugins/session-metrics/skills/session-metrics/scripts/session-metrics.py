@@ -454,6 +454,15 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
     last_user_content = None
     last_user_timestamp: str = ""
     last_user_agent_links: list[tuple[str, str]] = []
+    # Accumulators for content blocks across every user entry in the gap
+    # between two assistant turns. Parallel Task tool_results land in N
+    # separate user entries; without accumulation only the last entry's
+    # blocks survive into ``_preceding_user_content`` and content-block
+    # counts (tool_result / image) on the next assistant turn under-count.
+    # ``gap_user_str`` preserves the rare string-form content (compaction
+    # summaries) when no list-shaped content appeared in the gap.
+    gap_user_blocks: list = []
+    gap_user_str: str | None = None
     # Tracks slash commands seen in recent user entries so that skill-dispatch
     # flows (which inject two user entries: the raw slash command entry then the
     # SKILL.md payload) don't lose the slash command when the second entry
@@ -520,7 +529,21 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
                     tuid = block.get("tool_use_id")
                     if isinstance(tuid, str) and tuid:
                         agent_links.append((tuid, tur_agent_id))
-            last_user_agent_links = agent_links
+            # Accumulate across every user entry between two assistant turns.
+            # Parallel Task spawns return one tool_result per user entry, each
+            # carrying its own ``toolUseResult.agentId``; overwriting here
+            # would drop all but the last and orphan the other subagents.
+            last_user_agent_links.extend(agent_links)
+            # Same accumulation for the message content blocks themselves so
+            # tool_result / image counts on the next assistant turn include
+            # every parallel-spawn user entry, not just the most recent one.
+            # String content (compaction summary) preserved separately so the
+            # downstream ``isinstance(user_raw, str)`` compaction guard still
+            # fires when the gap held only a single string-form user entry.
+            if isinstance(last_user_content, list):
+                gap_user_blocks.extend(last_user_content)
+            elif isinstance(last_user_content, str):
+                gap_user_str = last_user_content
             continue
         if t != "assistant":
             continue
@@ -541,11 +564,24 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
         # between, so the triggering user entry is the one we saw before
         # the first streaming chunk.
         if msg_id not in preceding_user:
-            preceding_user[msg_id] = last_user_content
+            # Snapshot merged blocks across the gap when any list-shape content
+            # appeared; fall back to the string-form content for compaction
+            # summaries; fall back to the prior gap's last_user_content for the
+            # rare back-to-back-assistants case (no user entry in this gap) so
+            # existing semantics are preserved.
+            if gap_user_blocks:
+                preceding_user[msg_id] = list(gap_user_blocks)
+            elif gap_user_str is not None:
+                preceding_user[msg_id] = gap_user_str
+            else:
+                preceding_user[msg_id] = last_user_content
             preceding_user_ts[msg_id] = last_user_timestamp
             preceding_user_agent_links[msg_id] = list(last_user_agent_links)
             preceding_user_slash_cmd[msg_id] = last_user_slash_cmd
             last_user_slash_cmd = ""
+            last_user_agent_links = []
+            gap_user_blocks = []
+            gap_user_str = None
             _local_cmd_group_active = False
         content = msg.get("content")
         if isinstance(content, list):
