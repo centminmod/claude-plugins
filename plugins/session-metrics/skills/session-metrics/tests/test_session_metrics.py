@@ -1192,7 +1192,7 @@ def test_cached_parse_matches_uncached(tmp_path, monkeypatch):
 def test_cached_parse_writes_blob(tmp_path, monkeypatch):
     monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
     sm._cached_parse_jsonl(_FIXTURE, use_cache=True)
-    blobs = list((tmp_path / "parse").glob("*.json.gz"))
+    blobs = list((tmp_path / "parse").glob("*.pkl"))
     assert len(blobs) == 1
 
 
@@ -1272,7 +1272,7 @@ def test_cached_parse_same_stem_sibling_dirs_no_collision(tmp_path, monkeypatch)
     assert sm._cached_parse_jsonl(p_a, use_cache=True) == parsed_a
     assert sm._cached_parse_jsonl(p_b, use_cache=True) == parsed_b
     # Two blobs on disk.
-    blobs = list((tmp_path / "parse").glob("*.json.gz"))
+    blobs = list((tmp_path / "parse").glob("*.pkl"))
     assert len(blobs) == 2
 
 
@@ -1314,7 +1314,7 @@ def test_cache_write_concurrent_threads_no_corruption(tmp_path, monkeypatch):
     """Concurrent writers on the same cache path must not corrupt the blob.
 
     Regression for H2: four threads racing to populate the cache for the
-    same source file all succeed, the final blob is a valid gzip+JSON,
+    same source file all succeed, the final blob is a valid pickle blob,
     and no orphan .tmp files are left behind. Threading (not
     multiprocessing) is used intentionally — the contention that matters
     here is on the tmp filename, which the random suffix now guards
@@ -1343,7 +1343,7 @@ def test_cache_write_concurrent_threads_no_corruption(tmp_path, monkeypatch):
     assert errors == [], f"worker raised: {errors!r}"
     # Final cache layer must be consistent: one blob, zero orphaned .tmp files.
     cache_dir = tmp_path / "parse"
-    blobs = list(cache_dir.glob("*.json.gz"))
+    blobs = list(cache_dir.glob("*.pkl"))
     assert len(blobs) == 1, f"expected one blob, saw {[b.name for b in blobs]}"
     orphans = list(cache_dir.glob("*.tmp"))
     assert orphans == [], f"orphan tmp files: {[o.name for o in orphans]}"

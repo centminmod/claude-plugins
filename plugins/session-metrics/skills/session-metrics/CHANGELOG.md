@@ -3,6 +3,26 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.37.0 — 2026-04-30
+
+### Performance — pickle parse cache (-67% cold / -18% warm / -17% project)
+
+Switched the parse cache at `~/.cache/session-metrics/parse/` from gzip+JSON to `pickle` protocol 5 (stdlib, no compression). Single-file change with broad wins across cold parse, warm cache hits, and `--project-cost` fanout on a 158-session corpus.
+
+**Implementation.** `_cached_parse_jsonl` swaps `gzip.open` + `json.load`/`json.dump` for `open` + `pickle.load`/`pickle.dump(protocol=5)`. Filename suffix `.json.gz` → `.pkl`. Read-side exception catch updated from `(OSError, json.JSONDecodeError)` → `(OSError, pickle.UnpicklingError, EOFError)`. Atomic write via random-suffix tmp + `os.replace` is unchanged (POSIX + Windows safe since Py 3.3). `import gzip` removed (no longer used anywhere); `import pickle` added.
+
+**Cache schema bump.** `_SCRIPT_VERSION` 1.0-rc.5 → 1.1.0 invalidates every existing cache blob exactly once. First run after upgrade rebuilds the cache transparently — slower than a warm hit but identical cold-path cost. No data loss; the JSONL transcripts under `~/.claude/projects/` are the source of truth.
+
+**Disk trade-off.** Pickle (no compression) is ~2× larger on disk than the prior gzip+JSON: ~9 MB → ~19 MB for a typical 28 MB JSONL session. At project scale (158 sessions): ~1.4 GB → ~3 GB cache footprint. Acceptable for a developer-tool cache living in `~/.cache/`. Stale cache management (no GC today; mtime_ns and version bumps strand prior blobs) is a known follow-up.
+
+**Stdlib-only invariant preserved.** No new dependencies; the shipped skill remains stdlib-only per `plugin.json` `strict: true`. Cross-platform: identical behaviour on macOS, Linux, Windows. Trust model is single-user-local; pickle of the script's own writes is safe.
+
+### Tests
+
+Four test sites updated to match the new cache extension (`*.json.gz` → `*.pkl`) and docstring ("gzip+JSON" → "pickle"). 643 passed, 1 skipped — same count as v1.36.0.
+
+---
+
 ## v1.36.0 — 2026-04-30
 
 ### Sharing-time hygiene — `--export-share-safe` one-flag pre-share gesture (P5)

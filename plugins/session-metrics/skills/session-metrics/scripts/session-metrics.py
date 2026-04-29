@@ -32,12 +32,12 @@ import atexit
 import bisect
 import csv as csv_mod
 import functools
-import gzip
 import hashlib
 import html as html_mod
 import io
 import json
 import os
+import pickle
 import re
 import secrets
 import sys
@@ -48,7 +48,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Bump when the parsed-entries shape changes — invalidates old parse caches.
-_SCRIPT_VERSION = "1.0-rc.5"
+# 1.1.0 (2026-04-30): cache format switched from gzip+JSON to pickle protocol 5.
+# Bench measured -67% cold / -18% warm / -17% project on this single change
+# (bench/results/README.md in the dev repo). Trade-off: cache files ~2× larger
+# on disk (~9 MB → ~19 MB per typical session); acceptable for a developer-tool
+# cache. Version bump invalidates every existing user blob exactly once.
+_SCRIPT_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Pricing table  (USD per million tokens)
@@ -310,20 +315,22 @@ def _parse_cache_key(path: Path, mtime_ns: int) -> str:
     except OSError:
         abs_path = str(path)
     path_hash = hashlib.sha1(abs_path.encode("utf-8")).hexdigest()[:8]
-    return f"{path.stem}__{path_hash}__{mtime_ns}__{_SCRIPT_VERSION}.json.gz"
+    return f"{path.stem}__{path_hash}__{mtime_ns}__{_SCRIPT_VERSION}.pkl"
 
 
 def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
-    """Return parsed entries from ``path``, using a gzip-JSON cache on disk.
+    """Return parsed entries from ``path``, using a pickle cache on disk.
 
-    Cache hit (typical re-run): ~10x faster than parsing JSONL line-by-line,
-    since ``json.loads`` on one preassembled blob avoids the per-line state
-    machine overhead. Cache miss or ``use_cache=False``: parse fresh and
-    (if caching) write the blob for next time.
+    Cache format is ``pickle`` protocol 5 (stdlib, no compression). Bench
+    measured -67% cold / -18% warm vs the prior gzip+JSON cache because
+    pickle skips JSON's UTF-8 encode/decode and gzip's compression cost
+    on this workload (~5k+ Python dicts of mixed strings/ints/floats).
+    Trade-off: cache files are ~2× larger on disk (no compression).
 
     Cache invalidation is automatic on (a) JSONL mtime change and
     (b) ``_SCRIPT_VERSION`` bump. On I/O errors the cache is silently
-    skipped — correctness first, speed second.
+    skipped — correctness first, speed second. Trust model: single-user-
+    local; pickle of the script's own writes is safe.
     """
     if not use_cache:
         return _parse_jsonl(path)
@@ -335,11 +342,11 @@ def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
     cache_dir = _parse_cache_dir()
     cache_path = cache_dir / _parse_cache_key(path, mtime_ns)
     try:
-        with gzip.open(cache_path, "rt", encoding="utf-8") as fh:
-            return json.load(fh)
+        with open(cache_path, "rb") as fh:
+            return pickle.load(fh)
     except FileNotFoundError:
         pass
-    except (OSError, json.JSONDecodeError):
+    except (OSError, pickle.UnpicklingError, EOFError):
         # Corrupt or unreadable — fall through to fresh parse.
         pass
 
@@ -354,8 +361,8 @@ def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
         tmp = cache_path.with_suffix(
             f"{cache_path.suffix}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
         )
-        with gzip.open(tmp, "wt", encoding="utf-8") as fh:
-            json.dump(entries, fh, separators=(",", ":"))
+        with open(tmp, "wb") as fh:
+            pickle.dump(entries, fh, protocol=5)
         tmp.replace(cache_path)
     except OSError:
         # Non-fatal — the parse already succeeded.
