@@ -41,6 +41,7 @@ import pickle
 import re
 import secrets
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -387,6 +388,83 @@ def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
         except OSError:
             pass  # non-fatal — the write already succeeded
     return entries
+
+
+def _prune_cache_global(cache_dir: Path) -> None:
+    """Lazy global prune of the parse-cache directory.
+
+    Throttled to at most once per 24 hours via a sentinel file so it runs
+    silently on every normal invocation without per-run overhead.
+
+    Deletion criteria for each *.pkl blob:
+    1. Orphaned — the UUID stem matches no JSONL under _projects_dir()
+       (deleted project, renamed slug, migrated machine).
+    2. Inactive session — source JSONL mtime > 60 days (session closed)
+       AND blob mtime > 30 days (not recently cold-parsed).
+    3. Stale blob — blob mtime > 30 days even when the session is still
+       active-ish (JSONL mtime <= 60 days).  One cold re-parse (~0.3 s)
+       is cheaper than keeping blobs that warm-cache hits never refresh.
+
+    The 30 d / 60 d split prevents deleting blobs that are being served
+    on warm hits daily for an ongoing project: if the JSONL is young,
+    we keep the blob even when it hasn't been written in a month.
+
+    All I/O errors are silenced — the prune must never surface to the user
+    or interrupt the main parse path.
+    """
+    sentinel = cache_dir / ".prune_last_run"
+    now = time.time()
+    _24h = 86_400.0
+    _30d = 30 * _24h
+    _60d = 60 * _24h
+
+    try:
+        if sentinel.exists() and (now - sentinel.stat().st_mtime) < _24h:
+            return
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+    except OSError:
+        return
+
+    # Single glob pass — build UUID→path index for all live JSONLs.
+    jsonl_by_stem: dict[str, Path] = {}
+    try:
+        projects_root = _projects_dir()
+        for _j in projects_root.glob("*/*.jsonl"):
+            jsonl_by_stem[_j.stem] = _j
+        for _j in projects_root.glob("*/subagents/*.jsonl"):
+            jsonl_by_stem[_j.stem] = _j
+    except OSError:
+        return  # can't scan — skip this cycle
+
+    try:
+        blobs = list(cache_dir.glob("*.pkl"))
+    except OSError:
+        return
+
+    for _blob in blobs:
+        try:
+            stem = _blob.name.split("__", 1)[0]
+            blob_age = now - _blob.stat().st_mtime
+            _jsonl = jsonl_by_stem.get(stem)
+
+            if _jsonl is None:
+                _blob.unlink()  # orphaned — source JSONL gone
+                continue
+
+            if blob_age <= _30d:
+                continue  # recently written — keep unconditionally
+
+            try:
+                jsonl_age = now - _jsonl.stat().st_mtime
+            except OSError:
+                _blob.unlink()  # can't stat JSONL — treat as orphaned
+                continue
+
+            if jsonl_age > _60d:
+                _blob.unlink()  # session inactive for 60+ days
+        except OSError:
+            pass  # file vanished between glob and unlink — harmless
 
 
 # Resume-marker detection: two high-precision fingerprints produce a no-op
@@ -11111,6 +11189,13 @@ def main() -> None:
     global _ALLOW_UNVERIFIED_CHARTS
     _ALLOW_UNVERIFIED_CHARTS = bool(args.allow_unverified_charts)
     _maybe_warn_chart_license(chart_lib, formats)
+    # Apply --projects-dir override early so _projects_dir() is correct for
+    # both the global cache prune and all subsequent discovery calls.
+    global _PROJECTS_DIR_OVERRIDE
+    if args.projects_dir:
+        _PROJECTS_DIR_OVERRIDE = Path(args.projects_dir).expanduser()
+    if not args.no_cache:
+        _prune_cache_global(_parse_cache_dir())
 
     if args.list:
         _list_sessions(slug)
@@ -11320,13 +11405,6 @@ def main() -> None:
         return
 
     if args.all_projects:
-        # Apply the --projects-dir override (if any) before any discovery
-        # call. ``_projects_dir()`` reads this module-level var first, so
-        # setting it here cascades through _list_all_projects, _load_session,
-        # and every downstream helper without threading an arg through them.
-        if args.projects_dir:
-            global _PROJECTS_DIR_OVERRIDE
-            _PROJECTS_DIR_OVERRIDE = Path(args.projects_dir).expanduser()
         _run_all_projects(
             formats, tz_offset, tz_label,
             peak=peak, single_page=args.single_page,

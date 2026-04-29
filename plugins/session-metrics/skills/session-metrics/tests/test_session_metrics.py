@@ -1436,6 +1436,106 @@ def test_cached_parse_prune_failure_is_non_fatal(tmp_path, monkeypatch):
         cache_dir.chmod(0o700)
 
 
+# ─── _prune_cache_global ─────────────────────────────────────────────────────
+
+def test_prune_cache_global_creates_sentinel(tmp_path, monkeypatch):
+    """First run writes the sentinel file."""
+    cache_dir = tmp_path / "parse"
+    cache_dir.mkdir()
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.setattr(sm, "_PROJECTS_DIR_OVERRIDE", None)
+    sm._prune_cache_global(cache_dir)
+    assert (cache_dir / ".prune_last_run").exists()
+
+
+def test_prune_cache_global_skips_within_24h(tmp_path, monkeypatch):
+    """Fresh sentinel → prune body is skipped; orphaned blobs are untouched."""
+    cache_dir = tmp_path / "parse"
+    cache_dir.mkdir()
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.setattr(sm, "_PROJECTS_DIR_OVERRIDE", None)
+    orphan = cache_dir / "deadbeef__aabbccdd__123456789__1.1.0.pkl"
+    orphan.write_bytes(b"")
+    (cache_dir / ".prune_last_run").touch()  # mark as recently run
+    sm._prune_cache_global(cache_dir)
+    assert orphan.exists()
+
+
+def test_prune_cache_global_deletes_orphaned_blob(tmp_path, monkeypatch):
+    """Blob whose stem matches no live JSONL is deleted."""
+    cache_dir = tmp_path / "parse"
+    cache_dir.mkdir()
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.setattr(sm, "_PROJECTS_DIR_OVERRIDE", None)
+    orphan = cache_dir / "deadbeef__aabbccdd__123456789__1.1.0.pkl"
+    orphan.write_bytes(b"")
+    sm._prune_cache_global(cache_dir)
+    assert not orphan.exists()
+
+
+def test_prune_cache_global_keeps_fresh_blob(tmp_path, monkeypatch):
+    """Blob younger than 30 days is kept regardless of JSONL age."""
+    cache_dir = tmp_path / "parse"
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: cache_dir)
+    projects_dir = tmp_path / "projects"
+    slug_dir = projects_dir / "myproject"
+    slug_dir.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.setattr(sm, "_PROJECTS_DIR_OVERRIDE", None)
+    src = slug_dir / "session.jsonl"
+    src.write_text(_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    sm._cached_parse_jsonl(src, use_cache=True)
+    sm._prune_cache_global(cache_dir)
+    assert len(list(cache_dir.glob("*.pkl"))) == 1
+
+
+def test_prune_cache_global_keeps_old_blob_for_active_session(tmp_path, monkeypatch):
+    """Blob > 30 d old but JSONL mtime < 60 d → session still active → keep."""
+    import os as _os
+    cache_dir = tmp_path / "parse"
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: cache_dir)
+    projects_dir = tmp_path / "projects"
+    slug_dir = projects_dir / "myproject"
+    slug_dir.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.setattr(sm, "_PROJECTS_DIR_OVERRIDE", None)
+    src = slug_dir / "session.jsonl"
+    src.write_text(_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    sm._cached_parse_jsonl(src, use_cache=True)
+    blob = next(cache_dir.glob("*.pkl"))
+    past = blob.stat().st_mtime - 35 * 86400
+    _os.utime(blob, (past, past))  # blob is 35 d old
+    sm._prune_cache_global(cache_dir)
+    assert blob.exists()  # JSONL is fresh, so keep
+
+
+def test_prune_cache_global_deletes_inactive_session_blob(tmp_path, monkeypatch):
+    """Blob > 30 d old AND JSONL mtime > 60 d → session inactive → delete."""
+    import os as _os
+    cache_dir = tmp_path / "parse"
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: cache_dir)
+    projects_dir = tmp_path / "projects"
+    slug_dir = projects_dir / "myproject"
+    slug_dir.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.setattr(sm, "_PROJECTS_DIR_OVERRIDE", None)
+    src = slug_dir / "session.jsonl"
+    src.write_text(_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    sm._cached_parse_jsonl(src, use_cache=True)
+    blob = next(cache_dir.glob("*.pkl"))
+    anchor = blob.stat().st_mtime
+    _os.utime(blob, (anchor - 35 * 86400, anchor - 35 * 86400))  # blob 35 d old
+    _os.utime(src,  (anchor - 65 * 86400, anchor - 65 * 86400))  # JSONL 65 d old
+    sm._prune_cache_global(cache_dir)
+    assert not blob.exists()
+
+
 def test_hour_of_day_dst_boundary_uses_fixed_offset():
     """Behaviour lock: hour_of_day bucketing uses a scalar offset, not per-event DST.
 

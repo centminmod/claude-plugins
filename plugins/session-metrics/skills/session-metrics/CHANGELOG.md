@@ -3,6 +3,14 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.39.0 — 2026-04-30
+
+### Cache hygiene — daily lazy global prune
+
+`_prune_cache_global` runs at most once per 24 hours (sentinel file in cache dir) on every normal invocation. It deletes three categories of blobs: (1) **orphaned** — the UUID stem matches no JSONL under `_projects_dir()` (deleted project, renamed slug); (2) **inactive session** — source JSONL mtime > 60 days AND blob mtime > 30 days (session long closed); (3) **stale blob** — blob mtime > 30 days even for a semi-active session. The 30 d / 60 d split protects blobs that are being served on warm hits for an ongoing project. Subagent JSONLs (`*/subagents/*.jsonl`) are included in the live-session index so their blobs are not incorrectly treated as orphaned. No new CLI flags; honours `--no-cache`. 647 → 653 passed, 1 skipped.
+
+---
+
 ## v1.38.0 — 2026-04-30
 
 ### Cache hygiene — self-pruning parse cache (option a)
