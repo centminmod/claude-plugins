@@ -3,6 +3,22 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.34.0 — 2026-04-29
+
+### Insight — P2 batch (cost-share + paste-bomb classification)
+
+Two user-visible insight gaps closed. Schema-additive: existing tooling that only reads turn counts keeps working; new fields are extra.
+
+**P2.1 — Cost share alongside turn share in Models table + audit playbook.**
+The `models` field in JSON exports gained `cost_usd` per model (was turn count only) and Markdown / HTML / text Models tables now show `Turn %` and `Cost %` columns side by side. The audit playbook's `model_split_clause` is now rendered by cost share — turn share alone hides the long-tail expensive model (e.g. one model with 22% of turns can be 37% of cost). The audit helper still parses pre-v1.34 exports where `models` was `{name: int}`; in that case `cost_pct` is `null` and the playbook falls back to turn share. A turn-share aside is appended when the gap on the dominant model is ≥10pp.
+
+**P2.2 — `paste_bomb` waste category.**
+The waste classifier now flags any turn where the user prompt is >5 000 characters as `paste_bomb` (matching the threshold the audit detailed scan already used for its `paste_bombs` finding). Fires above `reasoning` in the priority waterfall — pasting a wall of text is the actionable user behaviour, the downstream thinking burn is just an effect. Subagent dispatch still wins. The category is risk-flagged in the waste-distribution bar (bright red, between `oververbose_edit` and `dead_end`) and surfaces in the per-turn drawer; previously these turns silently classified as `productive`.
+
+### Tests
+
+8 new regression tests (3 for P2.1, 5 for P2.2). 616 total tests pass (1 skipped).
+
 ---
 
 ## v1.33.0 — 2026-04-29

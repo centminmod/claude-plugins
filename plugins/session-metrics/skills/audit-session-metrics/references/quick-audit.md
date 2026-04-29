@@ -272,9 +272,19 @@ Total cost **${baseline.total_cost_usd:.2f}** across **{baseline.turns} turns**{
 Render rules:
 
 - `{model_split_clause}`: if `len(baseline.models) == 1`, write
-  `, all on \`<model_id>\``. If > 1, write
-  `, split <pct1>% <model_id_1> / <pct2>% <model_id_2>` (round to
-  nearest 1%, drop models < 5%).
+  `, all on \`<model_id>\``. If > 1, render the split **by cost** using
+  each entry's `cost_pct`:
+  `, split <cost_pct1>% cost <model_id_1> / <cost_pct2>% cost <model_id_2>`
+  (round to nearest 1%, drop models with `cost_pct < 5%`, sort
+  descending by `cost_pct`). Cost share is the headline because a
+  small share of expensive turns can dominate spend (e.g. 22% of
+  turns on Sonnet → 37% of cost). When all `cost_pct` values are
+  null (legacy export pre-dating per-model cost), fall back to
+  `turns_pct` and replace `cost` with `turns` in the rendered
+  string. If both cost and turn shares are notable and divergent
+  (≥10pp gap on the top model), follow with one extra clause
+  ` (turn share <turns_pct>%)` on that model so the reader sees the
+  effort-vs-spend mismatch.
 - `{cache_savings_clause}`: if the input digest has `baseline.cache_savings_usd > 0`,
   append ` — caching saved $<savings:.2f> vs. a no-cache run`.
 - `{severity_emoji}`: `🔴` for high, `🟡` for medium, `🟢` for low.

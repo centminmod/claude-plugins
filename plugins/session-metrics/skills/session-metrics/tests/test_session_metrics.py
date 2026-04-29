@@ -257,8 +257,11 @@ def test_fixture_total_cost_exact():
 def test_fixture_turns_count_and_models():
     r = _build_fixture_report()
     assert r["totals"]["turns"] == 6
-    assert r["models"]["claude-opus-4-7"] == 3       # msg_A, msg_C, msg_E
-    assert r["models"]["claude-sonnet-4-7"] == 3     # msg_B, msg_D, msg_F
+    assert r["models"]["claude-opus-4-7"]["turns"] == 3       # msg_A, msg_C, msg_E
+    assert r["models"]["claude-sonnet-4-7"]["turns"] == 3     # msg_B, msg_D, msg_F
+    # v1.34.0: per-model cost is now surfaced alongside turn count (P2.1)
+    assert r["models"]["claude-opus-4-7"]["cost_usd"] >= 0.0
+    assert r["models"]["claude-sonnet-4-7"]["cost_usd"] >= 0.0
 
 
 def test_fixture_time_of_day_total_is_user_prompt_count():
@@ -383,7 +386,8 @@ def test_html_escapes_synthetic_model_name():
     syn_turn = dict(r["sessions"][0]["turns"][0])
     syn_turn["model"] = "<synthetic>"
     r["sessions"][0]["turns"].append(syn_turn)
-    r["models"]["<synthetic>"] = r["models"].get("<synthetic>", 0) + 1
+    # v1.34.0: ``models`` is now ``{name: {turns, cost_usd}}`` (P2.1)
+    r["models"]["<synthetic>"] = {"turns": 1, "cost_usd": 0.0}
 
     html = sm.render_html(r, variant="single")
     # Literal `<synthetic>` must NOT appear outside harmless contexts. Check the
@@ -9714,3 +9718,125 @@ def test_detect_file_reaccesses_cost_two_paths_share_turn_proportionally():
     assert b["cost_usd"] == pytest.approx(0.25, abs=1e-6)
     # Sum of path costs ≤ turn cost (was 2×$1.00 = $2.00 under old bug)
     assert result["total_reaccess_cost"] == pytest.approx(0.50, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# P2.1 — model breakdown ships {turns, cost_usd}; audit baseline emits shares
+# ---------------------------------------------------------------------------
+
+
+def test_model_breakdown_returns_turns_and_cost():
+    """``_model_breakdown`` returns ``{name: {turns, cost_usd}}`` so the
+    Models table and audit playbook can read cost share without a second
+    pass over per-turn records (P2.1)."""
+    turns = [
+        {"model": "claude-opus-4-7",   "cost_usd": 1.50},
+        {"model": "claude-opus-4-7",   "cost_usd": 0.50},
+        {"model": "claude-sonnet-4-7", "cost_usd": 0.10},
+    ]
+    out = sm._model_breakdown(turns)
+    assert out["claude-opus-4-7"]["turns"] == 2
+    assert out["claude-opus-4-7"]["cost_usd"] == pytest.approx(2.00, abs=1e-6)
+    assert out["claude-sonnet-4-7"]["turns"] == 1
+    assert out["claude-sonnet-4-7"]["cost_usd"] == pytest.approx(0.10, abs=1e-6)
+
+
+def test_audit_extract_baseline_models_attaches_cost_pct():
+    """``compute_baseline`` should compute ``turns_pct`` and ``cost_pct``
+    from the new dict-shape ``models`` field so the playbook can render
+    the cost split without LLM arithmetic (P2.1)."""
+    ae = _load_audit_extract()
+    data = _audit_min_export(
+        models={
+            "claude-opus-4-7":   {"turns": 50, "cost_usd": 9.0},
+            "claude-sonnet-4-7": {"turns": 30, "cost_usd": 1.0},
+            "claude-haiku-4-5":  {"turns": 20, "cost_usd": 0.0},
+        },
+    )
+    baseline = ae.compute_baseline(data)
+    opus   = baseline["models"]["claude-opus-4-7"]
+    sonnet = baseline["models"]["claude-sonnet-4-7"]
+    haiku  = baseline["models"]["claude-haiku-4-5"]
+    # Turn shares: 50%, 30%, 20%
+    assert opus["turns_pct"]   == pytest.approx(50.0, abs=0.1)
+    assert sonnet["turns_pct"] == pytest.approx(30.0, abs=0.1)
+    assert haiku["turns_pct"]  == pytest.approx(20.0, abs=0.1)
+    # Cost shares: 90%, 10%, 0% — opus dominates spend despite only 50% turns
+    assert opus["cost_pct"]   == pytest.approx(90.0, abs=0.1)
+    assert sonnet["cost_pct"] == pytest.approx(10.0, abs=0.1)
+    assert haiku["cost_pct"]  == pytest.approx(0.0,  abs=0.1)
+
+
+def test_audit_extract_baseline_models_legacy_int_shape_keeps_turns_only():
+    """Pre-v1.34.0 exports stored ``models`` as ``{name: int}``. The audit
+    must still parse those: turn share is computable, cost share is
+    explicitly null so the playbook can fall back to turn share (P2.1)."""
+    ae = _load_audit_extract()
+    data = _audit_min_export(
+        models={"claude-opus-4-7": 8, "claude-sonnet-4-7": 2},
+    )
+    baseline = ae.compute_baseline(data)
+    opus = baseline["models"]["claude-opus-4-7"]
+    sonnet = baseline["models"]["claude-sonnet-4-7"]
+    assert opus["turns"] == 8
+    assert opus["turns_pct"] == pytest.approx(80.0, abs=0.1)
+    assert opus["cost_pct"] is None
+    assert sonnet["turns_pct"] == pytest.approx(20.0, abs=0.1)
+    assert sonnet["cost_pct"] is None
+
+
+# ---------------------------------------------------------------------------
+# P2.2 — paste_bomb classification (>5000 char prompt → user-side waste)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_turn_paste_bomb_fires_above_5000_chars():
+    """A user prompt >5 000 chars classifies as paste_bomb (P2.2)."""
+    turn = {
+        "index": 0, "tool_use_names": [], "content_blocks": {},
+        "cache_read_tokens": 0, "cache_write_tokens": 0,
+        "input_tokens": 0, "prompt_text": "x" * 5_001,
+    }
+    assert sm._classify_turn(turn, set(), set(), set()) == "paste_bomb"
+
+
+def test_classify_turn_paste_bomb_does_not_fire_at_threshold():
+    """Exactly 5 000 chars is the boundary — strictly greater fires (P2.2)."""
+    turn = {
+        "index": 0, "tool_use_names": [], "content_blocks": {},
+        "cache_read_tokens": 0, "cache_write_tokens": 0,
+        "input_tokens": 0, "prompt_text": "x" * 5_000,
+    }
+    assert sm._classify_turn(turn, set(), set(), set()) == "productive"
+
+
+def test_classify_turn_paste_bomb_beats_reasoning():
+    """A paste-bombed turn that triggers thinking surfaces as paste_bomb,
+    not reasoning — the user's pasted wall is the actionable signal, not
+    the downstream extended-thinking burn (P2.2 priority order)."""
+    turn = {
+        "index": 0, "tool_use_names": [],
+        "content_blocks": {"thinking": 1},
+        "cache_read_tokens": 0, "cache_write_tokens": 0,
+        "input_tokens": 0, "prompt_text": "x" * 6_000,
+    }
+    assert sm._classify_turn(turn, set(), set(), set()) == "paste_bomb"
+
+
+def test_classify_turn_paste_bomb_yields_to_subagent_overhead():
+    """Subagent_overhead still wins over paste_bomb — Agent/Task tool use
+    is the dominant character even when the dispatching prompt was a
+    paste bomb (P2.2 priority order)."""
+    turn = {
+        "index": 0, "tool_use_names": ["Agent"], "content_blocks": {},
+        "cache_read_tokens": 0, "cache_write_tokens": 0,
+        "input_tokens": 0, "prompt_text": "x" * 10_000,
+    }
+    assert sm._classify_turn(turn, set(), set(), set()) == "subagent_overhead"
+
+
+def test_classify_turn_paste_bomb_in_risk_categories():
+    """paste_bomb is a risk signal — should be flagged in the waste bar
+    and per-turn drawer (P2.2)."""
+    assert "paste_bomb" in sm._RISK_CATEGORIES
+    assert "paste_bomb" in sm._TURN_CHARACTER_LABELS

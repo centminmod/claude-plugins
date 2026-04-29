@@ -175,6 +175,48 @@ def _first_user_turn(data: dict) -> dict | None:
     return None
 
 
+def _models_with_shares(data: dict) -> dict[str, dict]:
+    """Normalise the export's ``models`` field and attach turn/cost shares.
+
+    session-metrics v1.34.0+ emits ``{name: {turns, cost_usd}}``. Older exports
+    used ``{name: int}`` (turn count only). Accept both. Returned shape:
+    ``{name: {turns, turns_pct, cost_usd, cost_pct}}`` so the audit playbook
+    can render either share without extra arithmetic. ``cost_pct`` is null
+    when the export pre-dates v1.34.0 (no per-model cost), so the playbook
+    can fall back to ``turns_pct``.
+    """
+    raw = data.get("models") or {}
+    if not raw:
+        return {}
+    parsed: dict[str, dict] = {}
+    has_cost = False
+    for name, val in raw.items():
+        if isinstance(val, dict):
+            t = int(val.get("turns", 0) or 0)
+            c = float(val.get("cost_usd", 0.0) or 0.0)
+            if c > 0:
+                has_cost = True
+            parsed[name] = {"turns": t, "cost_usd": c}
+        else:
+            parsed[name] = {"turns": int(val or 0), "cost_usd": 0.0}
+    total_turns = sum(m["turns"] for m in parsed.values()) or 1
+    total_cost  = sum(m["cost_usd"] for m in parsed.values())
+    out: dict[str, dict] = {}
+    for name, m in parsed.items():
+        cost_pct: float | None
+        if has_cost and total_cost > 0:
+            cost_pct = round(100.0 * m["cost_usd"] / total_cost, 1)
+        else:
+            cost_pct = None
+        out[name] = {
+            "turns":     m["turns"],
+            "turns_pct": round(100.0 * m["turns"] / total_turns, 1),
+            "cost_usd":  round(m["cost_usd"], 4),
+            "cost_pct":  cost_pct,
+        }
+    return out
+
+
 def compute_baseline(data: dict) -> dict:
     totals = data.get("totals", {})
     output = totals.get("output", 0)
@@ -187,7 +229,7 @@ def compute_baseline(data: dict) -> dict:
     return {
         "total_cost_usd": round(totals.get("cost", 0), 2),
         "turns": totals.get("turns", 0),
-        "models": data.get("models", {}),
+        "models": _models_with_shares(data),
         "input_output_ratio": ratio,
         "cache_hit_pct": round(totals.get("cache_hit_pct", 0), 1),
         "cache_savings_usd": round(totals.get("cache_savings", 0), 2),
@@ -920,7 +962,7 @@ def compute_project_baseline(data: dict) -> dict:
         "sessions_count": n,
         "cost_per_session_avg_usd": round(cost / n, 2) if n else 0,
         "turns": totals.get("turns", 0),
-        "models": data.get("models", {}),
+        "models": _models_with_shares(data),
         "input_output_ratio": ratio,
         "cache_hit_pct": round(totals.get("cache_hit_pct", 0), 1),
         "cache_savings_usd": round(totals.get("cache_savings", 0), 2),
@@ -941,7 +983,7 @@ def compute_instance_baseline(data: dict) -> dict:
         "projects_count": data.get("project_count", len(data.get("projects", []))),
         "sessions_count": data.get("session_count", 0),
         "turns": totals.get("turns") or 0,
-        "models": data.get("models", {}),
+        "models": _models_with_shares(data),
         "input_output_ratio": ratio,
         "cache_hit_pct": round(totals.get("cache_hit_pct") or 0, 1),
         "cache_savings_usd": round(totals.get("cache_savings") or 0, 2),

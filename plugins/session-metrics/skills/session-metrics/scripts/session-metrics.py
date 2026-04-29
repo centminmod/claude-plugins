@@ -1762,11 +1762,23 @@ def _totals_from_turns(turn_records: list[dict]) -> dict:
     return t
 
 
-def _model_counts(turn_records: list[dict]) -> dict[str, int]:
-    counts: dict[str, int] = {}
+def _model_breakdown(turn_records: list[dict]) -> dict[str, dict]:
+    """Per-model summary keyed by model id.
+
+    Returns ``{model_id: {"turns": int, "cost_usd": float}}``. The richer
+    shape (vs. the prior plain ``{model_id: int}``) matches what
+    ``_aggregate_models`` already produces at instance scope, so renderers
+    and audit-extract see the same shape regardless of mode. Cost-share
+    surfaces as a column in the Models table and as ``cost_pct`` in the
+    audit baseline (P2.1 — turn share alone hides the long-tail expensive
+    model: 22% turns can be 37% cost).
+    """
+    out: dict[str, dict] = {}
     for r in turn_records:
-        counts[r["model"]] = counts.get(r["model"], 0) + 1
-    return counts
+        m = out.setdefault(r["model"], {"turns": 0, "cost_usd": 0.0})
+        m["turns"] += 1
+        m["cost_usd"] += float(r.get("cost_usd", 0.0))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1900,6 +1912,7 @@ def _detect_cache_breaks(session: dict,
 
 _TURN_CHARACTER_LABELS: dict[str, str] = {
     "subagent_overhead": "Subagent Dispatch",
+    "paste_bomb":        "Paste-Bomb Prompt",
     "reasoning":         "Extended Thinking",
     "cache_read":        "Cache-Heavy",
     "cache_write":       "Cache Payload",
@@ -1910,8 +1923,14 @@ _TURN_CHARACTER_LABELS: dict[str, str] = {
     "productive":        "Productive",
 }
 _RISK_CATEGORIES: frozenset[str] = frozenset(
-    {"retry_error", "dead_end", "oververbose_edit", "file_reread"}
+    {"retry_error", "dead_end", "oververbose_edit", "file_reread", "paste_bomb"}
 )
+# Paste-bomb threshold (P2.2): a user prompt > 5 000 characters is treated
+# as a single waste category regardless of downstream effects (thinking,
+# tool fan-out, cache write). Matches the threshold the audit-extract
+# detailed scan already uses for its `paste_bombs` finding so the two
+# detectors agree on what counts as a paste bomb.
+_PASTE_BOMB_CHARS: int = 5_000
 
 
 def _analyze_stop_reasons(turns: list[dict]) -> dict:
@@ -2201,8 +2220,13 @@ def _classify_turn(turn: dict, retry_idx: set[int],
                    reaccess_idx: set[int], verbose_idx: set[int]) -> str:
     """Assign a single waste category to a turn (priority waterfall).
 
-    Order: subagent_overhead > reasoning > cache_read > cache_write >
-           file_reread > oververbose_edit > retry_error > dead_end > productive
+    Order: subagent_overhead > paste_bomb > reasoning > cache_read >
+           cache_write > file_reread > oververbose_edit > retry_error >
+           dead_end > productive
+
+    paste_bomb fires above reasoning so a turn with a >5 KB pasted prompt
+    that also triggers thinking surfaces as a paste-bomb (the actionable
+    user behaviour) rather than as reasoning (the downstream effect).
     """
     names    = turn.get("tool_use_names") or []
     idx      = turn.get("index", -1)
@@ -2214,6 +2238,8 @@ def _classify_turn(turn: dict, retry_idx: set[int],
 
     if "Agent" in names or "Task" in names:
         return "subagent_overhead"
+    if len(turn.get("prompt_text") or "") > _PASTE_BOMB_CHARS:
+        return "paste_bomb"
     if cb.get("thinking", 0) > 0:
         return "reasoning"
     if cr > 100_000 and total_in > 0 and cr / total_in > 0.5:
@@ -3561,7 +3587,7 @@ def _build_report(
             "wall_clock_seconds":      wall_clock_seconds,
             "turns":                   turn_records,
             "subtotal":                _totals_from_turns(turn_records),
-            "models":                  _model_counts(turn_records),
+            "models":                  _model_breakdown(turn_records),
             "time_of_day":             _build_time_of_day(user_ts, offset_hours=tz_offset_hours),
             "resumes":                 resumes,
             "advisor_configured_model": advisor_configured_model,
@@ -3594,7 +3620,7 @@ def _build_report(
         "tz_label":        tz_label,
         "sessions":        sessions_out,
         "totals":          totals,
-        "models":          _model_counts(all_turns),
+        "models":          _model_breakdown(all_turns),
         "time_of_day":     _build_time_of_day(all_user_ts, offset_hours=tz_offset_hours),
         "session_blocks":  blocks,
         "block_summary":   _weekly_block_counts(blocks),
@@ -3932,7 +3958,7 @@ def _text_legend(tz_label: str, show_mode: bool, show_ttl: bool,
     return "\n".join(lines)
 
 
-def _footer_text(totals: dict, models: dict[str, int],
+def _footer_text(totals: dict, models: dict[str, dict],
                  time_of_day: dict | None = None,
                  tz_label: str = "UTC",
                  session_blocks: list[dict] | None = None,
@@ -3941,7 +3967,7 @@ def _footer_text(totals: dict, models: dict[str, int],
 
     Args:
         totals: Aggregated token/cost totals dict.
-        models: ``{model_id: turn_count}`` mapping.
+        models: ``{model_id: {"turns", "cost_usd"}}`` mapping.
         time_of_day: Optional ``time_of_day`` report section.  When provided,
             a UTC-bucketed user activity summary is appended.
     """
@@ -3985,10 +4011,18 @@ def _footer_text(totals: dict, models: dict[str, int],
     if models:
         lines.append("")
         lines.append("Models used:")
-        for m, cnt in sorted(models.items(), key=lambda x: -x[1]):
+        total_turns = sum(int(i.get("turns", 0)) for i in models.values()) or 1
+        total_cost  = sum(float(i.get("cost_usd", 0.0)) for i in models.values()) or 0.0
+        for m, info in sorted(models.items(),
+                              key=lambda x: -float(x[1].get("cost_usd", 0.0))):
             r = _pricing_for(m)
+            cnt = int(info.get("turns", 0))
+            cost = float(info.get("cost_usd", 0.0))
+            t_pct = 100.0 * cnt / total_turns
+            c_pct = (100.0 * cost / total_cost) if total_cost else 0.0
             lines.append(
-                f"  {m:<40}  {cnt:>3} turns  "
+                f"  {m:<40}  {cnt:>3} turns ({t_pct:>4.1f}%)  "
+                f"${cost:.4f} ({c_pct:>4.1f}%)  "
                 f"(${r['input']:.2f}/${r['output']:.2f}/${r['cache_read']:.2f}/${r['cache_write']:.2f} per 1M in/out/rd/wr)"
             )
     if time_of_day and time_of_day.get("message_count", 0) > 0:
@@ -4524,11 +4558,19 @@ def render_md(report: dict) -> str:
     if report["models"]:
         p("## Models")
         p()
-        p("| Model | Turns | $/M in | $/M out | $/M rd | $/M wr |")
-        p("|-------|------:|------:|------:|------:|------:|")
-        for m, cnt in sorted(report["models"].items(), key=lambda x: -x[1]):
+        p("| Model | Turns | Turn % | Cost $ | Cost % | $/M in | $/M out | $/M rd | $/M wr |")
+        p("|-------|------:|------:|------:|------:|------:|------:|------:|------:|")
+        _t_total = sum(int(i.get("turns", 0)) for i in report["models"].values()) or 1
+        _c_total = sum(float(i.get("cost_usd", 0.0)) for i in report["models"].values()) or 0.0
+        for m, info in sorted(report["models"].items(),
+                              key=lambda x: -float(x[1].get("cost_usd", 0.0))):
             r = _pricing_for(m)
-            p(f"| `{m}` | {cnt:,} | ${r['input']:.2f} | ${r['output']:.2f} | ${r['cache_read']:.2f} | ${r['cache_write']:.2f} |")
+            cnt = int(info.get("turns", 0))
+            cost = float(info.get("cost_usd", 0.0))
+            t_pct = 100.0 * cnt / _t_total
+            c_pct = (100.0 * cost / _c_total) if _c_total else 0.0
+            p(f"| `{m}` | {cnt:,} | {t_pct:.1f}% | ${cost:.4f} | {c_pct:.1f}% "
+              f"| ${r['input']:.2f} | ${r['output']:.2f} | ${r['cache_read']:.2f} | ${r['cache_write']:.2f} |")
         p()
 
     # Phase-A (v1.6.0) sections: skill / subagent / cache-break tables.
@@ -6439,7 +6481,7 @@ def _build_waste_analysis_html(wa: dict) -> str:
     _ORDER = [
         "productive", "cache_read", "cache_write", "reasoning",
         "subagent_overhead", "retry_error", "file_reread",
-        "oververbose_edit", "dead_end",
+        "oververbose_edit", "paste_bomb", "dead_end",
     ]
     _COLORS = {
         "productive":        "#4ade80",  # green
@@ -6450,6 +6492,7 @@ def _build_waste_analysis_html(wa: dict) -> str:
         "retry_error":       "#f87171",  # red
         "file_reread":       "#fbbf24",  # amber
         "oververbose_edit":  "#f472b6",  # pink
+        "paste_bomb":        "#ef4444",  # bright red — user-side waste signal
         "dead_end":          "#9ca3af",  # grey
     }
     bar_parts = []
@@ -8007,17 +8050,31 @@ def render_html(report: dict, variant: str = "single",
                 table_rows.append('</tbody>')
         table_rows.append(subtotal_row("PROJECT TOTAL" if mode == "project" else "TOTAL", totals))
 
-        def _model_row_html(m: str, cnt: int) -> str:
+        _t_total = sum(int(i.get("turns", 0)) for i in report["models"].values()) or 1
+        _c_total = sum(float(i.get("cost_usd", 0.0)) for i in report["models"].values()) or 0.0
+
+        def _model_row_html(m: str, cnt: int, cost: float, t_pct: float, c_pct: float) -> str:
             r = _pricing_for(m)
-            return (f'<tr><td><code>{html_mod.escape(m)}</code></td><td class="num">{cnt:,}</td>'
+            return (f'<tr><td><code>{html_mod.escape(m)}</code></td>'
+                    f'<td class="num">{cnt:,}</td>'
+                    f'<td class="num">{t_pct:.1f}%</td>'
+                    f'<td class="num">${cost:.4f}</td>'
+                    f'<td class="num">{c_pct:.1f}%</td>'
                     f'<td class="num">${r["input"]:.2f}</td>'
                     f'<td class="num">${r["output"]:.2f}</td>'
                     f'<td class="num">${r["cache_read"]:.2f}</td>'
                     f'<td class="num">${r["cache_write"]:.2f}</td></tr>')
 
         model_rows = "".join(
-            _model_row_html(m, cnt)
-            for m, cnt in sorted(report["models"].items(), key=lambda x: -x[1])
+            _model_row_html(
+                m,
+                int(info.get("turns", 0)),
+                float(info.get("cost_usd", 0.0)),
+                100.0 * int(info.get("turns", 0)) / _t_total,
+                (100.0 * float(info.get("cost_usd", 0.0)) / _c_total) if _c_total else 0.0,
+            )
+            for m, info in sorted(report["models"].items(),
+                                  key=lambda x: -float(x[1].get("cost_usd", 0.0)))
         )
 
     # Nav bar: cross-link to the companion page.
@@ -8121,7 +8178,9 @@ def render_html(report: dict, variant: str = "single",
             '<section class="section">\n'
             '<div class="section-title"><h2>Models</h2></div>\n'
             '<table class="models-table">\n'
-            '<thead><tr><th>Model</th><th class="num">Turns</th>\n'
+            '<thead><tr><th>Model</th>\n'
+            '  <th class="num">Turns</th><th class="num">Turn %</th>\n'
+            '  <th class="num">Cost $</th><th class="num">Cost %</th>\n'
             '  <th class="num">$/M input</th><th class="num">$/M output</th>\n'
             '  <th class="num">$/M rd</th><th class="num">$/M wr</th></tr></thead>\n'
             f'<tbody>{model_rows}</tbody>\n</table>\n'

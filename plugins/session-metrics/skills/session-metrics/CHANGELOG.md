@@ -3,6 +3,22 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.34.0 — 2026-04-29
+
+### Insight — P2 batch (cost-share + paste-bomb classification)
+
+Two user-visible insight gaps from the Session 112 audit (P2.1, P2.2). Schema-additive: existing tooling that only reads turn counts keeps working; new fields are extra.
+
+**P2.1 — Cost share alongside turn share in Models table + audit playbook.**
+`_model_counts(turns)` (returning `{name: int}`) was renamed to `_model_breakdown(turns)` returning `{name: {turns, cost_usd}}` — same shape that `_aggregate_models` already produced at instance scope, eliminating the cross-scope divergence. Markdown / HTML / text Models tables gain `Turn %` and `Cost %` columns. `audit-extract.compute_baseline` (and project / instance variants) emits `baseline.models` as `{name: {turns, turns_pct, cost_usd, cost_pct}}` so the audit playbook's `model_split_clause` renders by-cost without LLM arithmetic. Pre-v1.34 exports (where `models` was `{name: int}`) still parse — `cost_pct` is `null` so the playbook falls back to turn share. The audit playbook rule was rewritten to lead with cost share and add a turn-share aside when the gap is ≥10pp. Verified on a real session: Opus 78% turns / 96% cost — turn share alone massively understates the dominant model.
+
+**P2.2 — `paste_bomb` waste category.**
+`_classify_turn` now has a `paste_bomb` arm: prompts >5 000 chars classify as `paste_bomb`, matching the threshold `audit-extract.py`'s detailed scan already used for its `paste_bombs` finding. Fires above `reasoning` in the priority waterfall (paste behaviour is the actionable user signal, thinking is a downstream effect); subagent dispatch still wins. Added to `_RISK_CATEGORIES` and the waste-distribution bar (bright red, between `oververbose_edit` and `dead_end`). Session 112 turns 15/23 (27 KB skill-injected slash-command bodies) — previously classified as `productive` — now surface in the waste bar and per-turn drawer.
+
+### Tests
+
+8 new regression tests (3 for P2.1, 5 for P2.2). 616 total tests pass (1 skipped).
+
 ---
 
 ## v1.33.0 — 2026-04-29
