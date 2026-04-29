@@ -8723,16 +8723,18 @@ def test_audit_extract_weekly_rollup_suppressed_when_first_week():
 # ---------------------------------------------------------------------------
 
 
-def test_audit_extract_digest_schema_version_is_1_2():
+def test_audit_extract_digest_schema_version_is_1_3():
     ae = _load_audit_extract()
     digest = ae.build_digest(_audit_min_export(),
                              "/p/session_t_20260101T000000Z.json", "quick")
-    assert digest["digest_schema_version"] == "1.2"
+    assert digest["digest_schema_version"] == "1.3"
     # v1.1 additions remain (additive evolution)
     assert "positive_triggers" in digest
-    # v1.2 additions
+    # v1.2 additions remain
     assert "session_archetype" in digest
     assert "archetype_signals" in digest
+    # v1.3 additions
+    assert "scope" in digest
     assert "first_turn_cost_usd" in digest["baseline"]
     assert "first_turn_cost_share_pct" in digest["baseline"]
 
