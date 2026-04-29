@@ -9996,3 +9996,182 @@ def test_render_json_redact_preserves_empty_fields():
     for fld in sm._REDACTED_TURN_FIELDS:
         assert t0.get(fld, "") == "", \
             f"redactor must leave empty {fld} alone, got {t0.get(fld)!r}"
+
+
+# --- P3: golden-file + waste-analysis coverage --------------------------------
+# Locks in correctness of _build_waste_analysis, _detect_retry_chains, and
+# _classify_turn waterfall arms not exercised by the existing paste_bomb suite.
+# The golden fixture session_golden_1a68560a.json was regenerated under
+# current (post-P2.2/P1.4) code; if a future code change shifts these
+# numbers, regenerate the fixture deliberately.
+
+_GOLDEN_SESSION = _HERE / "fixtures" / "session_golden_1a68560a.json"
+
+
+def _load_golden_turns() -> list[dict]:
+    """Deep-copy the fixture's turns so tests mutate isolated state."""
+    import copy
+    import json as _json
+    with open(_GOLDEN_SESSION) as f:
+        d = _json.load(f)
+    return copy.deepcopy(d["sessions"][0]["turns"])
+
+
+def _load_golden_doc() -> dict:
+    import json as _json
+    with open(_GOLDEN_SESSION) as f:
+        return _json.load(f)
+
+
+def test_build_waste_analysis_golden_distribution_matches_fixture():
+    doc = _load_golden_doc()
+    turns = _load_golden_turns()
+    result = sm._build_waste_analysis([{"turns": turns}])
+    assert result["distribution"] == doc["waste_analysis"]["distribution"]
+
+
+def test_build_waste_analysis_golden_retry_chains_match_fixture():
+    doc = _load_golden_doc()
+    turns = _load_golden_turns()
+    result = sm._build_waste_analysis([{"turns": turns}])
+    assert result["retry_chains"]["chain_count"] == \
+        doc["waste_analysis"]["retry_chains"]["chain_count"]
+    assert round(result["retry_chains"]["retry_cost_pct"], 6) == \
+        round(doc["waste_analysis"]["retry_chains"]["retry_cost_pct"], 6)
+
+
+def test_build_waste_analysis_golden_file_reaccess_summary_matches_fixture():
+    doc = _load_golden_doc()
+    turns = _load_golden_turns()
+    result = sm._build_waste_analysis([{"turns": turns}])
+    expected = doc["waste_analysis"]["file_reaccesses"]
+    actual   = result["file_reaccesses"]
+    assert len(actual["details"]) == len(expected["details"])
+    assert round(actual.get("total_reaccess_cost", 0), 6) == \
+        round(expected.get("total_reaccess_cost", 0), 6)
+
+
+def test_build_waste_analysis_golden_stop_reasons_match_fixture():
+    doc = _load_golden_doc()
+    turns = _load_golden_turns()
+    result = sm._build_waste_analysis([{"turns": turns}])
+    assert result["stop_reasons"] == doc["waste_analysis"]["stop_reasons"]
+
+
+def test_build_waste_analysis_classifies_resume_marker_as_productive():
+    """Resume markers bypass the classifier and stay productive + non-risk."""
+    turns = [
+        {"index": 0, "is_resume_marker": True, "prompt_text": "", "model": "opus"},
+        {"index": 1, "prompt_text": "do work", "model": "opus", "cost_usd": 0.10,
+         "tool_use_names": [], "content_blocks": {}},
+    ]
+    sm._build_waste_analysis([{"turns": turns}])
+    assert turns[0]["turn_character"] == "productive"
+    assert turns[0]["turn_risk"] is False
+    assert turns[0]["reread_cross_ctx"] is False
+
+
+# --- _detect_retry_chains direct unit tests (zero coverage prior to P3) ------
+
+def test_detect_retry_chains_empty_input_returns_zero_chains():
+    result = sm._detect_retry_chains([])
+    assert result == {"chains": [], "chain_count": 0, "retry_cost_pct": 0.0}
+
+
+def test_detect_retry_chains_dissimilar_prompts_form_no_chain():
+    turns = [
+        {"index": 0, "prompt_text": "explain how database indexing works in postgres",
+         "cost_usd": 1.0},
+        {"index": 1, "prompt_text": "list the planets in our solar system by mass",
+         "cost_usd": 1.0},
+    ]
+    result = sm._detect_retry_chains(turns)
+    assert result["chain_count"] == 0
+    assert result["chains"] == []
+    assert result["retry_cost_pct"] == 0.0
+
+
+def test_detect_retry_chains_identical_prompts_form_chain():
+    turns = [
+        {"index": 0, "prompt_text": "fix the failing test",  "cost_usd": 1.0},
+        {"index": 1, "prompt_text": "fix the failing test",  "cost_usd": 2.0},
+        {"index": 2, "prompt_text": "fix the failing test",  "cost_usd": 3.0},
+    ]
+    result = sm._detect_retry_chains(turns)
+    assert result["chain_count"] == 1
+    chain = result["chains"][0]
+    assert chain["turn_indices"] == [0, 1, 2]
+    assert chain["length"] == 3
+    assert chain["cost_usd"] == 6.0
+    assert round(result["retry_cost_pct"], 6) == 100.0
+
+
+def test_detect_retry_chains_breaks_on_dissimilar_prompt():
+    turns = [
+        {"index": 0, "prompt_text": "fix the failing test", "cost_usd": 1.0},
+        {"index": 1, "prompt_text": "fix the failing test", "cost_usd": 1.0},
+        {"index": 2, "prompt_text": "explain how database indexing works",
+         "cost_usd": 5.0},
+        {"index": 3, "prompt_text": "explain how database indexing works",
+         "cost_usd": 5.0},
+    ]
+    result = sm._detect_retry_chains(turns)
+    # Two separate chains: [0,1] and [2,3] — each ≥2 entries, broken at index 2.
+    assert result["chain_count"] == 2
+    indices = sorted(c["turn_indices"] for c in result["chains"])
+    assert indices == [[0, 1], [2, 3]]
+
+
+def test_detect_retry_chains_skips_resume_marker_in_chain_membership():
+    """Resume markers are filtered from `prompted` and never appear in a
+    chain's turn_indices, even if their cost would otherwise be summed."""
+    turns = [
+        {"index": 0, "prompt_text": "fix failing test", "cost_usd": 1.0},
+        {"index": 1, "prompt_text": "",                 "cost_usd": 0.0,
+         "is_resume_marker": True},
+        {"index": 2, "prompt_text": "fix failing test", "cost_usd": 1.0},
+    ]
+    result = sm._detect_retry_chains(turns)
+    assert result["chain_count"] == 1
+    assert result["chains"][0]["turn_indices"] == [0, 2]
+    # retry_cost_pct denominator includes ALL turns (even the resume marker
+    # at cost 0), but the chain's own cost is just the two prompted turns.
+    assert round(result["retry_cost_pct"], 6) == 100.0
+
+
+# --- _classify_turn waterfall arms not covered by the paste_bomb suite -------
+
+def test_classify_turn_subagent_overhead_wins_when_agent_in_tool_names():
+    turn = {"prompt_text": "go", "tool_use_names": ["Agent"], "content_blocks": {}}
+    assert sm._classify_turn(turn, set(), set(), set()) == "subagent_overhead"
+
+
+def test_classify_turn_reasoning_when_thinking_block_present():
+    turn = {"prompt_text": "go", "tool_use_names": [],
+            "content_blocks": {"thinking": 1}}
+    assert sm._classify_turn(turn, set(), set(), set()) == "reasoning"
+
+
+def test_classify_turn_cache_read_when_cr_dominates_input():
+    turn = {"prompt_text": "go", "tool_use_names": [], "content_blocks": {},
+            "cache_read_tokens": 200_000, "input_tokens": 50_000}
+    # cr=200K > 100K AND cr/(cr+inp)=0.8 > 0.5 → cache_read
+    assert sm._classify_turn(turn, set(), set(), set()) == "cache_read"
+
+
+def test_classify_turn_cache_write_when_cw_above_threshold():
+    turn = {"prompt_text": "go", "tool_use_names": [], "content_blocks": {},
+            "cache_write_tokens": 150_000}
+    assert sm._classify_turn(turn, set(), set(), set()) == "cache_write"
+
+
+def test_classify_turn_dead_end_when_stop_reason_max_tokens():
+    turn = {"prompt_text": "go", "tool_use_names": [], "content_blocks": {},
+            "stop_reason": "max_tokens"}
+    assert sm._classify_turn(turn, set(), set(), set()) == "dead_end"
+
+
+def test_classify_turn_productive_baseline_when_no_signals():
+    turn = {"prompt_text": "go", "tool_use_names": [], "content_blocks": {},
+            "stop_reason": "end_turn"}
+    assert sm._classify_turn(turn, set(), set(), set()) == "productive"
