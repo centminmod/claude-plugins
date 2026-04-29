@@ -37,6 +37,9 @@ parsing is required — just compare strings.
 | `compare-run`       | Fully automated capture: spawns two `claude -p` sessions, feeds the suite, then runs `--compare` | `## Model comparison` below, then [`references/model-compare.md`](references/model-compare.md) "Workflow A — automated" |
 | `compare-prep`      | Print manual capture protocol + 10-prompt suite (fallback when headless is unavailable) | `## Model comparison` below |
 | `count-tokens`      | API-key-only tokenizer check              | `## Model comparison` below |
+| `export`            | Natural-language export shortcut — scan full arg string to determine session vs project scope | `## Export shortcuts` below |
+| `project`           | All sessions for the current project — timeline + per-session subtotals + grand total | `## Quick usage` below (`--project-cost`); also scan remaining args for `--output` format flags |
+| `project-cost`      | Alias for `project`                       | `## Quick usage` below (`--project-cost`); also scan remaining args for `--output` format flags |
 | *(empty, or any other value)* | Default single-session report   | `## Quick usage` below |
 
 This is the single gate that keeps compare mode off the natural-language
@@ -56,6 +59,35 @@ benchmark.
 
 - skill-dir: ${CLAUDE_SKILL_DIR}
 - session-id: ${CLAUDE_SESSION_ID}
+
+## Export shortcuts
+
+Reached when `$ARGUMENTS[0]` is `export`. Scan the **full argument string** (not just `$ARGUMENTS[0]`) to determine scope and formats. Apply these checks **in order** (first match wins):
+
+1. Full arg string contains `all-projects` → `--all-projects --output <formats>`
+2. Full arg string contains `project` (and not already caught above) → `--project-cost --output <formats>`
+3. Otherwise → current session `--session ${CLAUDE_SESSION_ID} --output <formats>`
+
+Infer format flags from the argument string: `html` → `html`, `csv` → `csv`, `md` or `markdown` → `md`. Always add `json` alongside any requested format per the post-export audit convention (see `## Optional post-export audit` below).
+
+**Examples:**
+
+| Full argument string | Command |
+|---|---|
+| `export session` | `--session ${CLAUDE_SESSION_ID} --output json` |
+| `export session to html` | `--session ${CLAUDE_SESSION_ID} --output html json` |
+| `export session metrics to html` | `--session ${CLAUDE_SESSION_ID} --output html json` |
+| `export to html` | `--session ${CLAUDE_SESSION_ID} --output html json` |
+| `export project` | `--project-cost --output json` |
+| `export project to html` | `--project-cost --output html json` |
+| `export project sessions` | `--project-cost --output json` |
+| `export project sessions to html` | `--project-cost --output html json` |
+| `export entire project's session metrics to html` | `--project-cost --output html json` |
+| `export project metrics to html csv` | `--project-cost --output html csv json` |
+| `export all-projects` | `--all-projects --output json` |
+| `export all-projects to html` | `--all-projects --output html json` |
+
+`project` and `project-cost` as the first arg also pick up `--output` flags from remaining args the same way (e.g. `/session-metrics project metrics export to html` → `--project-cost --output html json`).
 
 ## Quick usage
 

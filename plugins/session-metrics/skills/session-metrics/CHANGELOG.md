@@ -5,6 +5,42 @@ Versions match the `plugin.json` / `marketplace.json` version field.
 
 ---
 
+## v1.31.0 — 2026-04-29
+
+### Feature — natural-language export dispatch keywords
+
+`SKILL.md` gains an `export` dispatch keyword and a new `## Export shortcuts` section so users can invoke the skill with natural-language phrases documented in the plugin marketplace article.
+
+**New dispatch keywords** (matched on `$ARGUMENTS[0]`):
+
+- `export` — routes to `## Export shortcuts`; scans the full argument string to determine scope and output formats
+- `project` — runs `--project-cost`, also picking up `--output` format flags from remaining args
+- `project-cost` — alias for `project`
+
+**Export shortcuts routing** (priority-ordered, first match wins):
+
+1. Arg string contains `all-projects` → `--all-projects --output <formats>`
+2. Arg string contains `project` → `--project-cost --output <formats>`
+3. Otherwise → single session `--session <id> --output <formats>`
+
+Format flags (`html`, `csv`, `md`/`markdown`) are inferred from the argument text; `json` is always appended per the post-export audit convention. Bare invocations without a format word default to `--output json`.
+
+**Example mappings now explicitly documented:**
+
+| Invocation | Command |
+|---|---|
+| `export session` | `--session … --output json` |
+| `export session to html` | `--session … --output html json` |
+| `export project` | `--project-cost --output json` |
+| `export project to html` | `--project-cost --output html json` |
+| `export project sessions to html` | `--project-cost --output html json` |
+| `export all-projects` | `--all-projects --output json` |
+| `export all-projects to html` | `--all-projects --output html json` |
+
+**Bug fixed:** the prior `export all-projects` path would have matched the `project` substring check and silently routed to `--project-cost`; priority ordering now prevents this.
+
+---
+
 ## v1.30.1 — 2026-04-29
 
 ### Fix — audit suggestion shown after every export
