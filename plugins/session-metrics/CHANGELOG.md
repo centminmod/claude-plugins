@@ -5,6 +5,24 @@ Versions match the `plugin.json` / `marketplace.json` version field.
 
 ---
 
+## v1.32.0 — 2026-04-29
+
+### Feature — project-scope and instance-scope audit support in `audit-session-metrics`
+
+`audit-extract.py` now auto-detects the JSON scope from `data["mode"]` and branches into three code paths:
+
+**Project scope** (`project_*.json`): per-session cost ranking, poor-cache-health sessions (avg cache-hit < 80%), sessions with cache breaks, weekly cost and cache delta. Intra-session-only triggers (`idle_gap_cache_decay`, `session_warmup_overhead`) are suppressed via a `SESSION_ONLY_METRICS` frozenset.
+
+**Instance scope** (`instance/*/index.json`): cross-project cost ranking with cost-share %, poor-cache projects, instance-wide cache-hit average, weekly trend. `fired_triggers` and `top_expensive_turns` are always `[]` (no per-turn data at instance scope). `None`-safe evaluation for `cache_hit_pct` and `cache_savings` (present-but-`null` in instance JSON).
+
+**Schema**: `DIGEST_SCHEMA_VERSION` bumped `1.2 → 1.3` (additive — adds `scope`, `project_analysis`, `instance_analysis` fields).
+
+**New reference playbooks**: `project-quick-audit.md`, `project-detailed-audit.md`, `instance-quick-audit.md`.
+
+**SKILL.md routing**: `audit-session-metrics/SKILL.md` gains a scope routing dispatch matrix. `session-metrics/SKILL.md` now shows scope-aware post-export audit suggestions (project → per-session audit, instance → cross-project audit).
+
+---
+
 ## v1.31.0 — 2026-04-29
 
 ### Feature — natural-language export dispatch keywords

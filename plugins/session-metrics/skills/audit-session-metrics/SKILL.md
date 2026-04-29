@@ -7,8 +7,9 @@ description: >
   /audit-session-metrics, when session-metrics suggests an audit after an
   HTML export, or when the user asks to audit / review / find waste in a
   saved session-metrics JSON. Two modes: "quick" (ratios + cache health +
-  top expensive turns) and "detailed" (adds CLAUDE.md / settings /
-  re-read scan). Args: $ARGUMENTS[0] = quick|detailed,
+  top expensive turns/sessions) and "detailed" (adds CLAUDE.md / settings /
+  re-read scan). Supports session, project, and instance JSON scopes.
+  Args: $ARGUMENTS[0] = quick|detailed,
   $ARGUMENTS[1] = path to a session-metrics JSON export.
 ---
 
@@ -18,6 +19,11 @@ Reads a session-metrics JSON export and produces a prioritised, plain-English
 audit of token-usage waste. Pinned to Haiku in frontmatter so it runs ~10×
 cheaper than Sonnet for a turn that is mostly summarisation work.
 
+Supports three JSON scopes auto-detected from `digest.scope`:
+- **session** — single session (`session_*.json`) — per-turn analysis
+- **project** — all sessions for one project (`project_*.json`) — per-session analysis
+- **instance** — all projects (`instance/*/index.json`) — per-project analysis
+
 ## Dispatch — how to route this invocation
 
 **First positional argument received:** `$ARGUMENTS[0]`
@@ -25,20 +31,26 @@ cheaper than Sonnet for a turn that is mostly summarisation work.
 
 Read `$ARGUMENTS[0]` and match by **literal equality**:
 
-| `$ARGUMENTS[0]` | Route                    | Then read |
-|-----------------|--------------------------|-----------|
-| `quick`         | Quick audit              | [`references/quick-audit.md`](references/quick-audit.md) |
-| `detailed`      | Detailed audit           | [`references/detailed-audit.md`](references/detailed-audit.md) |
-| *(empty / other)* | Print usage and stop   | this file's "Usage" block below |
+| `$ARGUMENTS[0]` | Route                    | Then read (session scope) | Then read (project/instance scope) |
+|-----------------|--------------------------|---------------------------|------------------------------------|
+| `quick`         | Quick audit              | [`references/quick-audit.md`](references/quick-audit.md) | see Scope routing below |
+| `detailed`      | Detailed audit           | [`references/detailed-audit.md`](references/detailed-audit.md) | see Scope routing below |
+| *(empty / other)* | Print usage and stop   | this file's "Usage" block below | — |
 
-`$ARGUMENTS[1]` must be the path to a JSON export written by
-session-metrics (e.g. `exports/session-metrics/session_<id8>_<ts>.json`).
-If it is missing, empty, or the file does not exist, print:
+`$ARGUMENTS[1]` must be the path to a JSON export written by session-metrics.
+Accepted patterns:
+- `exports/session-metrics/session_<id8>_<ts>.json` — session scope
+- `exports/session-metrics/project_<ts>.json` — project scope
+- `exports/session-metrics/instance/<datedir>/index.json` — instance scope
+
+If `$ARGUMENTS[1]` is missing, empty, or the file does not exist, print:
 
 > Usage: /audit-session-metrics {quick|detailed} <path-to-session-metrics.json>
 >
-> Run `/session-metrics --output json` first to produce the export, or
-> point at an existing `exports/session-metrics/session_*.json`.
+> Accepted JSON types:
+>   session:  exports/session-metrics/session_*.json
+>   project:  exports/session-metrics/project_*.json
+>   instance: exports/session-metrics/instance/*/index.json
 
 …and stop without further work.
 
@@ -50,23 +62,30 @@ If it is missing, empty, or the file does not exist, print:
    python3 scripts/audit-extract.py $ARGUMENTS[1] --mode $ARGUMENTS[0]
    ```
 
-   The helper emits a single JSON digest to stdout: baseline metrics,
-   fired triggers (with suggested severity + estimated impact USD
-   pre-computed), top-3 expensive turns (with cross-finding correlation
-   flags), and — in `detailed` mode — pre-computed scans (re-reads,
-   paste-bombs, wrong-model turns, verbose responses, weekly delta,
-   subagent orphans). **Do not** read the raw `.jsonl`, and **do not**
-   re-derive numbers the digest already carries.
-2. Read the matching reference file (`quick-audit.md` for `quick`,
-   `detailed-audit.md` for `detailed`). Follow the playbook there
-   step-by-step. Do not improvise additional phases.
-3. For `detailed` mode the playbook also asks you to read the user's
-   config files (`~/.claude/CLAUDE.md`, `./CLAUDE.md`, `~/.claude/settings.json`,
-   `./.claude/settings.json`, `./.claudeignore`). Each is capped at
-   ≤500 lines — if a file is bigger, that itself is a finding.
-   This is the one part the helper script cannot do (no filesystem
-   access outside the export).
-4. **Output contract — three artefacts.** Both playbooks specify the
+   The helper emits a single JSON digest to stdout. Read `digest.scope`
+   from the output — it will be `"session"`, `"project"`, or `"instance"`.
+   **Do not** read the raw `.jsonl`, and **do not** re-derive numbers the
+   digest already carries.
+
+2. **Scope routing — read the matching reference file:**
+
+   | `digest.scope` | `$ARGUMENTS[0]` | Reference file |
+   |----------------|-----------------|----------------|
+   | `session`      | `quick`         | [`references/quick-audit.md`](references/quick-audit.md) |
+   | `session`      | `detailed`      | [`references/detailed-audit.md`](references/detailed-audit.md) |
+   | `project`      | `quick`         | [`references/project-quick-audit.md`](references/project-quick-audit.md) |
+   | `project`      | `detailed`      | [`references/project-detailed-audit.md`](references/project-detailed-audit.md) |
+   | `instance`     | `quick` or `detailed` | [`references/instance-quick-audit.md`](references/instance-quick-audit.md) |
+
+   Follow the playbook step-by-step. Do not improvise additional phases.
+
+3. For `detailed` mode **on session scope only**, the playbook also asks
+   you to read the user's config files (`~/.claude/CLAUDE.md`,
+   `./CLAUDE.md`, `~/.claude/settings.json`, `./.claude/settings.json`,
+   `./.claudeignore`). Each is capped at ≤500 lines — if a file is
+   bigger, that itself is a finding.
+
+4. **Output contract — three artefacts.** All playbooks specify the
    same three-artefact contract:
    - **JSON sidecar** at `<project>/exports/session-metrics/audit_<id8>_<ts>_<mode>.json` — structured findings (versioned schema, enum'd metrics).
    - **Markdown copy** at `<project>/exports/session-metrics/audit_<id8>_<ts>_<mode>.md` — same content rendered for humans.
@@ -74,7 +93,8 @@ If it is missing, empty, or the file does not exist, print:
 
    `<id8>` and `<ts>` come from `digest.session_id_short` and
    `digest.ts_str` (the helper parses the input filename and
-   normalises both legacy and current naming patterns).
+   normalises all three filename patterns).
+
 5. **Write order.** Populate the JSON object first using the digest
    values, write the JSON sidecar, render the markdown using the
    template in the playbook, write the markdown copy, then print the
@@ -104,9 +124,23 @@ command keeps the model swap intact.
 
 ## Reference files
 
+### Session scope
 - [`references/quick-audit.md`](references/quick-audit.md) — Distilled
-  ratios + cache health + top expensive turns. Read when
-  `$ARGUMENTS[0]` is `quick`.
+  ratios + cache health + top expensive turns. Read when scope=session,
+  mode=quick.
 - [`references/detailed-audit.md`](references/detailed-audit.md) — Quick
-  audit findings plus config + re-read scans. Read when
-  `$ARGUMENTS[0]` is `detailed`.
+  audit findings plus config + re-read scans. Read when scope=session,
+  mode=detailed.
+
+### Project scope
+- [`references/project-quick-audit.md`](references/project-quick-audit.md) —
+  Per-session cost outliers, cache health, breaks, weekly trend. Read when
+  scope=project, mode=quick.
+- [`references/project-detailed-audit.md`](references/project-detailed-audit.md) —
+  Project quick findings plus per-session turn-level drilldown on the most
+  expensive sessions. Read when scope=project, mode=detailed.
+
+### Instance scope
+- [`references/instance-quick-audit.md`](references/instance-quick-audit.md) —
+  Per-project cost breakdown, cache health, weekly cost trend. Used for both
+  quick and detailed modes (no per-turn data available at instance scope).

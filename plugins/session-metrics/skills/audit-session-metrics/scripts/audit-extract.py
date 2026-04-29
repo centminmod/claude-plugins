@@ -41,7 +41,7 @@ OPUS_INPUT_RATE_PER_M = 5.00
 # would have hit. Independent of the HTML --idle-gap-minutes UI threshold.
 CACHE_TTL_5M_SECONDS = 300
 
-DIGEST_SCHEMA_VERSION = "1.2"
+DIGEST_SCHEMA_VERSION = "1.3"
 
 # Session archetype enum — emitted as a top-level digest field. The classifier
 # is intentionally biased toward `unknown` at low confidence (lesson learned
@@ -55,6 +55,15 @@ SESSION_ARCHETYPES = (
     "exploratory_chat",  # turns > 5 AND tool_call_total / turns < 1.0
     "unknown",           # default — no clear pattern
 )
+
+# Metrics that are only meaningful within a single session. Suppressed when
+# scope is "project" or "instance" (where turns span many sessions or are
+# absent entirely, making intra-session gap detection and per-session turn
+# counts meaningless).
+SESSION_ONLY_METRICS: frozenset[str] = frozenset({
+    "idle_gap_cache_decay",    # intra-session idle gap detection
+    "session_warmup_overhead", # first-turn warmup relative to session length
+})
 
 
 def session_filename_parts(path: str) -> tuple[str, str]:
@@ -76,6 +85,41 @@ def session_filename_parts(path: str) -> tuple[str, str]:
     if len(parts) >= 3:
         return parts[1], "_".join(parts[2:])
     return "unknown", "unknown"
+
+
+def project_filename_parts(path: str) -> tuple[str, str]:
+    """Return ("project", ts_str) from project_<YYYYMMDD>T<HHMMSS>Z.json."""
+    name = os.path.basename(path)
+    m = re.match(r"^project_(\d{8}T\d{6}Z)\.json$", name)
+    if m:
+        return "project", m.group(1)
+    return "project", "unknown"
+
+
+def instance_filename_parts(path: str) -> tuple[str, str]:
+    """Return ("instance", ts_str) from instance/<datedir>/index.json.
+
+    The parent directory is typically named YYYY-MM-DD-HHMMSS."""
+    parent = os.path.basename(os.path.dirname(os.path.abspath(path)))
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}-\d{6})$", parent)
+    if m:
+        return "instance", m.group(1)
+    return "instance", "unknown"
+
+
+def detect_scope(data: dict, path: str) -> str:
+    """Return scope string: "session" | "project" | "instance".
+
+    Reads data["mode"] first (authoritative); falls back to filename pattern."""
+    mode = data.get("mode", "")
+    if mode in ("session", "project", "instance"):
+        return mode
+    name = os.path.basename(path)
+    if name.startswith("project_"):
+        return "project"
+    if name == "index.json":
+        return "instance"
+    return "session"
 
 
 def flatten_turns(data: dict) -> list[dict]:
@@ -478,9 +522,9 @@ def evaluate_positive_triggers(data: dict) -> list[dict]:
     schema 1.1: cache_savings_high and cache_health_excellent."""
     fired: list[dict] = []
     totals = data.get("totals", {})
-    cost = totals.get("cost", 0) or 0.0
-    cache_savings = totals.get("cache_savings", 0) or 0
-    cache_hit = totals.get("cache_hit_pct", 0) or 0
+    cost = totals.get("cost") or 0.0
+    cache_savings = totals.get("cache_savings") or 0
+    cache_hit = totals.get("cache_hit_pct") or 0
     cache_breaks = data.get("cache_breaks", []) or []
 
     # cache_savings_high — savings > 3× cost OR > $5 absolute
@@ -778,13 +822,258 @@ def detailed_candidates(data: dict, turns: list[dict]) -> dict:
     }
 
 
+def _weekly_rollup_summary(data: dict) -> dict | None:
+    """Extract cost + cache-hit weekly trend from data["weekly_rollup"].
+
+    Shared by project and instance baselines."""
+    weekly = data.get("weekly_rollup") or {}
+    if not weekly.get("has_data"):
+        return None
+    trail = weekly.get("trailing_7d", {}) or {}
+    prior = weekly.get("prior_7d", {}) or {}
+    prior_cost = prior.get("cost", 0) or 0
+    trail_cost = trail.get("cost", 0) or 0
+    if prior_cost <= 0:
+        return None
+    return {
+        "trailing_7d_cost_usd": round(trail_cost, 2),
+        "prior_7d_cost_usd": round(prior_cost, 2),
+        "cost_delta_pct": round((trail_cost - prior_cost) / prior_cost * 100, 1),
+        "trailing_7d_cache_hit_pct": round(trail.get("cache_hit_pct", 0), 1),
+        "prior_7d_cache_hit_pct": round(prior.get("cache_hit_pct", 0), 1),
+        "cache_hit_delta_pp": round(
+            trail.get("cache_hit_pct", 0) - prior.get("cache_hit_pct", 0), 1
+        ),
+    }
+
+
+def compute_project_baseline(data: dict) -> dict:
+    """Baseline metrics for a project-scope JSON export."""
+    totals = data.get("totals", {})
+    sessions = data.get("sessions", [])
+    n = len(sessions)
+    cost = totals.get("cost", 0) or 0
+    output = totals.get("output", 0)
+    uncached_input = totals.get("total_input", 0) - totals.get("cache_read", 0)
+    ratio = int(round(uncached_input / output)) if output else 0
+    return {
+        "total_cost_usd": round(cost, 2),
+        "sessions_count": n,
+        "cost_per_session_avg_usd": round(cost / n, 2) if n else 0,
+        "turns": totals.get("turns", 0),
+        "models": data.get("models", {}),
+        "input_output_ratio": ratio,
+        "cache_hit_pct": round(totals.get("cache_hit_pct", 0), 1),
+        "cache_savings_usd": round(totals.get("cache_savings", 0), 2),
+        "no_cache_cost_usd": round(totals.get("no_cache_cost", 0), 2),
+        "weekly_rollup": _weekly_rollup_summary(data),
+    }
+
+
+def compute_instance_baseline(data: dict) -> dict:
+    """Baseline metrics for an instance-scope (all-projects) JSON export."""
+    totals = data.get("totals", {})
+    cost = totals.get("cost") or 0
+    output = totals.get("output") or 0
+    uncached_input = (totals.get("total_input") or 0) - (totals.get("cache_read") or 0)
+    ratio = int(round(uncached_input / output)) if output else 0
+    return {
+        "total_cost_usd": round(cost, 2),
+        "projects_count": data.get("project_count", len(data.get("projects", []))),
+        "sessions_count": data.get("session_count", 0),
+        "turns": totals.get("turns") or 0,
+        "models": data.get("models", {}),
+        "input_output_ratio": ratio,
+        "cache_hit_pct": round(totals.get("cache_hit_pct") or 0, 1),
+        "cache_savings_usd": round(totals.get("cache_savings") or 0, 2),
+        "no_cache_cost_usd": round(totals.get("no_cache_cost") or 0, 2),
+        "weekly_rollup": _weekly_rollup_summary(data),
+    }
+
+
+def compute_project_session_analysis(data: dict) -> dict:
+    """Per-session breakdown for a project-scope audit.
+
+    Surfaces the four metrics the user cares about: top expensive sessions,
+    sessions with below-average cache health, sessions that had cache breaks,
+    and the weekly cost trend.
+    """
+    sessions = data.get("sessions", [])
+    total_cost = (data.get("totals", {}) or {}).get("cost", 0) or 0
+    overall_cache_hit = (data.get("totals", {}) or {}).get("cache_hit_pct", 0) or 0
+
+    # Top 5 most expensive sessions
+    by_cost = sorted(
+        sessions,
+        key=lambda s: (s.get("subtotal") or {}).get("cost", 0),
+        reverse=True,
+    )
+    top_sessions = []
+    for s in by_cost[:5]:
+        sub = s.get("subtotal") or {}
+        sc = sub.get("cost", 0) or 0
+        top_sessions.append({
+            "session_id_short": (s.get("session_id") or "")[:8],
+            "first_ts": s.get("first_ts"),
+            "cost_usd": round(sc, 4),
+            "cost_share_pct": round(sc / total_cost * 100, 1) if total_cost else 0,
+            "turns": sub.get("turns", 0),
+            "cache_hit_pct": round(sub.get("cache_hit_pct", 0), 1),
+        })
+
+    # Sessions with poor cache health (below 80% AND cost > $0.01)
+    POOR_CACHE_THRESHOLD = 80.0
+    poor_cache = []
+    for s in sessions:
+        sub = s.get("subtotal") or {}
+        hit = sub.get("cache_hit_pct", 0) or 0
+        sc = sub.get("cost", 0) or 0
+        if hit < POOR_CACHE_THRESHOLD and sc > 0.01:
+            poor_cache.append({
+                "session_id_short": (s.get("session_id") or "")[:8],
+                "first_ts": s.get("first_ts"),
+                "cache_hit_pct": round(hit, 1),
+                "cost_usd": round(sc, 4),
+                "gap_from_avg_pp": round(hit - overall_cache_hit, 1),
+            })
+    poor_cache.sort(key=lambda x: x["cache_hit_pct"])
+
+    # Sessions that had cache break events
+    sessions_with_breaks = []
+    for s in sessions:
+        breaks = s.get("cache_breaks") or []
+        if breaks:
+            sub = s.get("subtotal") or {}
+            sessions_with_breaks.append({
+                "session_id_short": (s.get("session_id") or "")[:8],
+                "first_ts": s.get("first_ts"),
+                "break_count": len(breaks),
+                "cost_usd": round((sub.get("cost", 0) or 0), 4),
+            })
+    sessions_with_breaks.sort(key=lambda x: x["break_count"], reverse=True)
+
+    return {
+        "top_expensive_sessions": top_sessions,
+        "poor_cache_health_sessions": poor_cache[:10],
+        "sessions_with_cache_breaks": sessions_with_breaks[:10],
+        "project_cache_hit_avg_pct": round(overall_cache_hit, 1),
+        "poor_cache_threshold_pct": POOR_CACHE_THRESHOLD,
+    }
+
+
+def compute_instance_project_analysis(data: dict) -> dict:
+    """Per-project breakdown for an instance-scope (all-projects) audit."""
+    projects = data.get("projects", [])
+    total_cost = (data.get("totals", {}) or {}).get("cost", 0) or 0
+
+    # Top 5 most expensive projects
+    by_cost = sorted(
+        projects,
+        key=lambda p: p.get("cost_usd", 0) or 0,
+        reverse=True,
+    )
+    top_projects = []
+    for p in by_cost[:5]:
+        pc = p.get("cost_usd", 0) or 0
+        top_projects.append({
+            "slug": p.get("slug", ""),
+            "cost_usd": round(pc, 2),
+            "cost_share_pct": round(pc / total_cost * 100, 1) if total_cost else 0,
+            "session_count": p.get("session_count", 0),
+            "turn_count": p.get("turn_count", 0),
+        })
+
+    # Projects with poor average cache health
+    POOR_CACHE_THRESHOLD = 80.0
+    overall_cache_hit = (data.get("totals", {}) or {}).get("cache_hit_pct", 0) or 0
+    poor_cache = []
+    for p in projects:
+        p_sessions = p.get("sessions") or []
+        if not p_sessions:
+            continue
+        hits = [
+            (s.get("subtotal") or {}).get("cache_hit_pct", 0) or 0
+            for s in p_sessions
+        ]
+        avg_hit = sum(hits) / len(hits) if hits else 0
+        pc = p.get("cost_usd", 0) or 0
+        if avg_hit < POOR_CACHE_THRESHOLD and pc > 0.10:
+            poor_cache.append({
+                "slug": p.get("slug", ""),
+                "avg_cache_hit_pct": round(avg_hit, 1),
+                "cost_usd": round(pc, 2),
+                "gap_from_avg_pp": round(avg_hit - overall_cache_hit, 1),
+            })
+    poor_cache.sort(key=lambda x: x["avg_cache_hit_pct"])
+
+    return {
+        "top_expensive_projects": top_projects,
+        "poor_cache_health_projects": poor_cache[:5],
+        "instance_cache_hit_avg_pct": round(overall_cache_hit, 1),
+        "poor_cache_threshold_pct": POOR_CACHE_THRESHOLD,
+        "total_projects": len(projects),
+        "total_sessions": data.get("session_count", 0),
+    }
+
+
 def build_digest(data: dict, json_path: str, mode: str) -> dict:
+    scope = detect_scope(data, json_path)
+
+    if scope == "project":
+        id8, ts = project_filename_parts(json_path)
+        turns = flatten_turns(data)
+        cache_breaks = data.get("cache_breaks", []) or []
+        fired = [
+            t for t in evaluate_triggers(data, turns)
+            if t["metric"] not in SESSION_ONLY_METRICS
+        ]
+        digest: dict[str, Any] = {
+            "digest_schema_version": DIGEST_SCHEMA_VERSION,
+            "scope": scope,
+            "session_id_short": id8,
+            "ts_str": ts,
+            "input_json": os.path.abspath(json_path),
+            "mode_hint": mode,
+            "session_archetype": "n/a",
+            "archetype_signals": {"scope": "project", "sessions_count": len(data.get("sessions", []))},
+            "baseline": compute_project_baseline(data),
+            "fired_triggers": fired,
+            "positive_triggers": evaluate_positive_triggers(data),
+            "top_expensive_turns": top_expensive_turns(turns, cache_breaks),
+            "project_analysis": compute_project_session_analysis(data),
+        }
+        return digest
+
+    if scope == "instance":
+        id8, ts = instance_filename_parts(json_path)
+        digest = {
+            "digest_schema_version": DIGEST_SCHEMA_VERSION,
+            "scope": scope,
+            "session_id_short": id8,
+            "ts_str": ts,
+            "input_json": os.path.abspath(json_path),
+            "mode_hint": mode,
+            "session_archetype": "n/a",
+            "archetype_signals": {
+                "scope": "instance",
+                "projects_count": len(data.get("projects", [])),
+            },
+            "baseline": compute_instance_baseline(data),
+            "fired_triggers": [],
+            "positive_triggers": evaluate_positive_triggers(data),
+            "top_expensive_turns": [],
+            "instance_analysis": compute_instance_project_analysis(data),
+        }
+        return digest
+
+    # session scope (existing path)
     turns = flatten_turns(data)
     cache_breaks = data.get("cache_breaks", []) or []
     id8, ts = session_filename_parts(json_path)
     archetype, archetype_signals = classify_session_archetype(data, turns)
-    digest: dict[str, Any] = {
+    digest = {
         "digest_schema_version": DIGEST_SCHEMA_VERSION,
+        "scope": scope,
         "session_id_short": id8,
         "ts_str": ts,
         "input_json": os.path.abspath(json_path),

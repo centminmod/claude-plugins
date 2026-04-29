@@ -9102,3 +9102,319 @@ def test_audit_extract_first_turn_cost_share_zero_when_no_turns():
     digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
     assert digest["baseline"]["first_turn_cost_usd"] == 0
     assert digest["baseline"]["first_turn_cost_share_pct"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# audit-extract.py — project and instance scope (v1.3)
+# ---------------------------------------------------------------------------
+
+def _audit_min_project_export(**overrides) -> dict:
+    """Minimal project-scope JSON export for audit-extract tests."""
+    base = {
+        "generated_at": "2026-04-29T00:00:00Z",
+        "mode": "project",
+        "slug": "-test-project",
+        "tz_offset_hours": 0,
+        "tz_label": "UTC",
+        "models": {"claude-opus-4-7": 10},
+        "totals": {
+            "input": 500, "output": 5000, "cache_read": 90000, "cache_write": 10000,
+            "cache_write_5m": 5000, "cache_write_1h": 5000, "extra_1h_cost": 0.5,
+            "cost": 10.0, "no_cache_cost": 50.0, "turns": 100,
+            "advisor_call_count": 0, "advisor_cost_usd": 0.0,
+            "total": 105500, "total_input": 100500,
+            "cache_savings": 40.0, "cache_hit_pct": 89.5,
+            "thinking_turn_count": 20, "thinking_turn_pct": 20.0,
+            "tool_call_total": 80, "tool_names_top3": ["Bash", "Read", "Edit"],
+        },
+        "sessions": [
+            {
+                "session_id": "aaaa1111bbbb2222cccc3333dddd4444",
+                "first_ts": "2026-04-01 10:00:00",
+                "last_ts": "2026-04-01 12:00:00",
+                "subtotal": {"cost": 6.0, "turns": 60, "cache_hit_pct": 92.0,
+                             "cache_savings": 25.0, "no_cache_cost": 31.0,
+                             "input": 300, "output": 3000, "cache_read": 55000,
+                             "cache_write": 6000, "total_input": 61300},
+                "turns": [],
+                "cache_breaks": [],
+            },
+            {
+                "session_id": "bbbb2222cccc3333dddd4444eeee5555",
+                "first_ts": "2026-04-02 08:00:00",
+                "last_ts": "2026-04-02 09:00:00",
+                "subtotal": {"cost": 3.0, "turns": 30, "cache_hit_pct": 70.0,
+                             "cache_savings": 12.0, "no_cache_cost": 15.0,
+                             "input": 150, "output": 1500, "cache_read": 25000,
+                             "cache_write": 3000, "total_input": 28150},
+                "turns": [],
+                "cache_breaks": [{"turn_index": 5, "uncached": 10000}],
+            },
+            {
+                "session_id": "cccc3333dddd4444eeee5555ffff6666",
+                "first_ts": "2026-04-03 14:00:00",
+                "last_ts": "2026-04-03 14:30:00",
+                "subtotal": {"cost": 1.0, "turns": 10, "cache_hit_pct": 20.0,
+                             "cache_savings": 3.0, "no_cache_cost": 4.0,
+                             "input": 50, "output": 500, "cache_read": 10000,
+                             "cache_write": 1000, "total_input": 11050},
+                "turns": [],
+                "cache_breaks": [],
+            },
+        ],
+        "cache_breaks": [{"turn_index": 5, "uncached": 10000}],
+        "by_skill": [],
+        "by_subagent_type": [],
+        "subagent_attribution_summary": {
+            "attributed_turns": 0, "orphan_subagent_turns": 0,
+            "nested_levels_seen": 0, "cycles_detected": 0},
+        "subagent_share_stats": {
+            "include_subagents": True, "has_attribution": False,
+            "total_cost": 10.0, "attributed_cost": 0.0, "share_pct": 0.0,
+            "spawn_count": 0, "attributed_count": 0, "orphan_turns": 0},
+        "weekly_rollup": {"has_data": True,
+                          "trailing_7d": {"cost": 5.0, "cache_hit_pct": 88.0},
+                          "prior_7d": {"cost": 4.0, "cache_hit_pct": 90.0}},
+    }
+    base.update(overrides)
+    return base
+
+
+def _audit_min_instance_export(**overrides) -> dict:
+    """Minimal instance-scope JSON export for audit-extract tests."""
+    base = {
+        "generated_at": "2026-04-29T00:00:00Z",
+        "mode": "instance",
+        "slug": "-home-user",
+        "projects_dir": "/home/user/.claude/projects",
+        "tz_offset_hours": 0,
+        "tz_label": "UTC",
+        "project_count": 3,
+        "session_count": 20,
+        "models": {"claude-opus-4-7": 100},
+        "totals": {
+            "input": 2000, "output": 20000, "cache_read": 500000, "cache_write": 50000,
+            "cache_write_5m": 25000, "cache_write_1h": 25000, "extra_1h_cost": 5.0,
+            "cost": 100.0, "no_cache_cost": 600.0, "turns": 1000,
+            "advisor_call_count": 0, "advisor_cost_usd": 0.0,
+            "total": 572000, "total_input": 552000,
+            "cache_savings": 500.0, "cache_hit_pct": None,
+        },
+        "projects": [
+            {"slug": "-proj-alpha", "cost_usd": 60.0, "session_count": 10,
+             "turn_count": 600,
+             "sessions": [
+                 {"subtotal": {"cache_hit_pct": 95.0}},
+                 {"subtotal": {"cache_hit_pct": 90.0}},
+             ]},
+            {"slug": "-proj-beta", "cost_usd": 30.0, "session_count": 7,
+             "turn_count": 300,
+             "sessions": [
+                 {"subtotal": {"cache_hit_pct": 50.0}},
+                 {"subtotal": {"cache_hit_pct": 60.0}},
+             ]},
+            {"slug": "-proj-gamma", "cost_usd": 10.0, "session_count": 3,
+             "turn_count": 100,
+             "sessions": [
+                 {"subtotal": {"cache_hit_pct": 92.0}},
+             ]},
+        ],
+        "sessions": [],
+        "cache_breaks": [],
+        "weekly_rollup": {"has_data": True,
+                          "trailing_7d": {"cost": 55.0, "cache_hit_pct": 88.0},
+                          "prior_7d": {"cost": 40.0, "cache_hit_pct": 90.0}},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_audit_extract_project_filename_parts_canonical():
+    ae = _load_audit_extract()
+    scope, ts = ae.project_filename_parts("/exports/project_20260429T031942Z.json")
+    assert scope == "project"
+    assert ts == "20260429T031942Z"
+
+
+def test_audit_extract_project_filename_parts_unrecognised():
+    ae = _load_audit_extract()
+    scope, ts = ae.project_filename_parts("/exports/project_unknown.json")
+    assert scope == "project"
+    assert ts == "unknown"
+
+
+def test_audit_extract_instance_filename_parts_canonical():
+    ae = _load_audit_extract()
+    scope, ts = ae.instance_filename_parts(
+        "/exports/session-metrics/instance/2026-04-29-034750/index.json"
+    )
+    assert scope == "instance"
+    assert ts == "2026-04-29-034750"
+
+
+def test_audit_extract_instance_filename_parts_unrecognised():
+    ae = _load_audit_extract()
+    scope, ts = ae.instance_filename_parts("/exports/weirdpath/index.json")
+    assert scope == "instance"
+    assert ts == "unknown"
+
+
+def test_audit_extract_detect_scope_from_mode_field():
+    ae = _load_audit_extract()
+    assert ae.detect_scope({"mode": "session"}, "/p/whatever.json") == "session"
+    assert ae.detect_scope({"mode": "project"}, "/p/whatever.json") == "project"
+    assert ae.detect_scope({"mode": "instance"}, "/p/whatever.json") == "instance"
+
+
+def test_audit_extract_detect_scope_falls_back_to_filename():
+    ae = _load_audit_extract()
+    assert ae.detect_scope({}, "/p/project_20260429T031942Z.json") == "project"
+    assert ae.detect_scope({}, "/instance/2026-04-29/index.json") == "instance"
+    assert ae.detect_scope({}, "/p/session_abc_20260429T000000Z.json") == "session"
+
+
+def test_audit_extract_project_baseline_fields():
+    ae = _load_audit_extract()
+    data = _audit_min_project_export()
+    base = ae.compute_project_baseline(data)
+    assert base["sessions_count"] == 3
+    assert base["total_cost_usd"] == pytest.approx(10.0)
+    assert base["cost_per_session_avg_usd"] == pytest.approx(10.0 / 3, rel=0.01)
+    assert base["cache_hit_pct"] == pytest.approx(89.5)
+    assert base["cache_savings_usd"] == pytest.approx(40.0)
+    assert "weekly_rollup" in base
+
+
+def test_audit_extract_instance_baseline_fields():
+    ae = _load_audit_extract()
+    data = _audit_min_instance_export()
+    base = ae.compute_instance_baseline(data)
+    assert base["projects_count"] == 3
+    assert base["sessions_count"] == 20
+    assert base["total_cost_usd"] == pytest.approx(100.0)
+
+
+def test_audit_extract_project_session_analysis_top_sessions():
+    ae = _load_audit_extract()
+    data = _audit_min_project_export()
+    pa = ae.compute_project_session_analysis(data)
+    top = pa["top_expensive_sessions"]
+    assert len(top) <= 5
+    # Most expensive is session aaaa1111 at $6.00
+    assert top[0]["session_id_short"] == "aaaa1111"
+    assert top[0]["cost_usd"] == pytest.approx(6.0)
+    assert top[0]["cost_share_pct"] == pytest.approx(60.0)
+
+
+def test_audit_extract_project_session_analysis_poor_cache():
+    ae = _load_audit_extract()
+    data = _audit_min_project_export()
+    pa = ae.compute_project_session_analysis(data)
+    poor = pa["poor_cache_health_sessions"]
+    # Sessions with cache_hit_pct < 80: session bbbb (70%) and cccc (20%)
+    slugs = [s["session_id_short"] for s in poor]
+    assert "bbbb2222" in slugs
+    assert "cccc3333" in slugs
+    assert "aaaa1111" not in slugs  # 92% — above threshold
+
+
+def test_audit_extract_project_session_analysis_cache_breaks():
+    ae = _load_audit_extract()
+    data = _audit_min_project_export()
+    pa = ae.compute_project_session_analysis(data)
+    breaks = pa["sessions_with_cache_breaks"]
+    # Only session bbbb has cache_breaks
+    assert len(breaks) == 1
+    assert breaks[0]["session_id_short"] == "bbbb2222"
+    assert breaks[0]["break_count"] == 1
+
+
+def test_audit_extract_instance_project_analysis_top_projects():
+    ae = _load_audit_extract()
+    data = _audit_min_instance_export()
+    ia = ae.compute_instance_project_analysis(data)
+    top = ia["top_expensive_projects"]
+    assert top[0]["slug"] == "-proj-alpha"
+    assert top[0]["cost_usd"] == pytest.approx(60.0)
+    assert top[0]["cost_share_pct"] == pytest.approx(60.0)
+
+
+def test_audit_extract_instance_project_analysis_poor_cache():
+    ae = _load_audit_extract()
+    data = _audit_min_instance_export()
+    ia = ae.compute_instance_project_analysis(data)
+    poor = ia["poor_cache_health_projects"]
+    # proj-beta avg=(50+60)/2=55% < 80 and cost=$30 > 0.10
+    assert any(p["slug"] == "-proj-beta" for p in poor)
+    # proj-alpha avg=(95+90)/2=92.5% — above threshold
+    assert not any(p["slug"] == "-proj-alpha" for p in poor)
+
+
+def test_audit_extract_build_digest_project_scope_sets_scope_field():
+    ae = _load_audit_extract()
+    data = _audit_min_project_export()
+    digest = ae.build_digest(data, "/p/project_20260429T031942Z.json", "quick")
+    assert digest["scope"] == "project"
+    assert digest["session_id_short"] == "project"
+    assert digest["session_archetype"] == "n/a"
+    assert "project_analysis" in digest
+    assert "instance_analysis" not in digest
+
+
+def test_audit_extract_build_digest_project_suppresses_session_only_metrics():
+    ae = _load_audit_extract()
+    data = _audit_min_project_export()
+    digest = ae.build_digest(data, "/p/project_20260429T031942Z.json", "quick")
+    fired_metrics = {t["metric"] for t in digest["fired_triggers"]}
+    # SESSION_ONLY_METRICS must not fire at project scope
+    assert "idle_gap_cache_decay" not in fired_metrics
+    assert "session_warmup_overhead" not in fired_metrics
+
+
+def test_audit_extract_build_digest_instance_scope():
+    ae = _load_audit_extract()
+    data = _audit_min_instance_export()
+    digest = ae.build_digest(
+        data,
+        "/exports/session-metrics/instance/2026-04-29-034750/index.json",
+        "quick",
+    )
+    assert digest["scope"] == "instance"
+    assert digest["session_id_short"] == "instance"
+    assert digest["session_archetype"] == "n/a"
+    assert digest["fired_triggers"] == []
+    assert digest["top_expensive_turns"] == []
+    assert "instance_analysis" in digest
+    assert "project_analysis" not in digest
+
+
+def test_audit_extract_build_digest_session_scope_now_has_scope_field():
+    ae = _load_audit_extract()
+    data = _audit_min_export()
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    assert digest["scope"] == "session"
+    assert "project_analysis" not in digest
+    assert "instance_analysis" not in digest
+
+
+def test_audit_extract_schema_version_is_1_3():
+    ae = _load_audit_extract()
+    assert ae.DIGEST_SCHEMA_VERSION == "1.3"
+
+
+def test_audit_new_reference_files_exist():
+    refs = (_HERE.parent.parent / "audit-session-metrics" / "references")
+    assert (refs / "project-quick-audit.md").exists()
+    assert (refs / "project-detailed-audit.md").exists()
+    assert (refs / "instance-quick-audit.md").exists()
+
+
+def test_audit_new_reference_files_have_schema_v1_3():
+    import re
+    refs = (_HERE.parent.parent / "audit-session-metrics" / "references")
+    for fname in ("project-quick-audit.md", "project-detailed-audit.md",
+                  "instance-quick-audit.md"):
+        text = (refs / fname).read_text(encoding="utf-8")
+        m = re.search(r"JSON schema \(v([\d.]+)\)", text)
+        assert m is not None, f"{fname} missing 'JSON schema (vX.Y)' header"
+        assert m.group(1) == "1.3", f"{fname} schema version should be 1.3, got {m.group(1)}"

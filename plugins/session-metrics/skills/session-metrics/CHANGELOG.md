@@ -5,6 +5,43 @@ Versions match the `plugin.json` / `marketplace.json` version field.
 
 ---
 
+## v1.32.0 — 2026-04-29
+
+### Feature — project-scope and instance-scope audit support in `audit-session-metrics`
+
+`audit-extract.py` now auto-detects the JSON scope from `data["mode"]` and branches into three code paths:
+
+**Project scope** (`project_*.json`):
+- Computes per-session cost ranking (`top_expensive_sessions`, top 5), poor-cache-health sessions (avg cache-hit < 80%, cost > $0.10), sessions with cache breaks, weekly cost and cache delta.
+- Suppresses intra-session-only triggers (`idle_gap_cache_decay`, `session_warmup_overhead`) via a `SESSION_ONLY_METRICS` frozenset — these are not meaningful across a multi-session aggregate.
+- Baseline gains `sessions_count` and `cost_per_session_avg_usd` in addition to session fields.
+
+**Instance scope** (`instance/*/index.json`):
+- Cross-project cost ranking (`top_expensive_projects`, top 5 with cost-share %), poor-cache projects, instance-wide cache-hit average.
+- `fired_triggers` and `top_expensive_turns` are always `[]` — no per-turn data exists at instance scope.
+- `None`-safe evaluation for `cache_hit_pct` and `cache_savings` (present-but-`null` in instance JSON); fixed by using `or 0` instead of `.get(k, 0)`.
+
+**Schema**: `DIGEST_SCHEMA_VERSION` bumped `1.2 → 1.3` (additive — adds `scope`, `project_analysis`, `instance_analysis` fields).
+
+**New reference playbooks** (three files under `audit-session-metrics/references/`):
+- `project-quick-audit.md` — session breakdown table, poor-cache list, cache-break list, weekly trend, fix-first bullets.
+- `project-detailed-audit.md` — extends quick with per-session turn drilldown, model distribution, cache-outlier hypothesis.
+- `instance-quick-audit.md` — covers both quick and detailed at instance scope (same playbook, no per-turn drilldown available).
+
+**SKILL.md routing**: `audit-session-metrics/SKILL.md` gains a scope routing dispatch matrix replacing the single-row session-only table; `session-metrics/SKILL.md` removes the scope guard that suppressed the post-export audit suggestion for project/instance exports and replaces it with scope-aware suggestions (project → per-session audit, instance → cross-project audit).
+
+### Tests
+
+20 new unit tests in `tests/test_session_metrics.py` (596 total, +20 since v1.31.0):
+- `project_filename_parts` / `instance_filename_parts` parser variants.
+- `detect_scope` from `data["mode"]` and from filename fallback.
+- `compute_project_baseline` and `compute_instance_baseline` (including `None`-safe fields).
+- `compute_project_session_analysis` and `compute_instance_project_analysis`.
+- `build_digest` for all three scopes — schema version, `scope` field, suppressed triggers, empty instance fired/turns.
+- Reference file existence and `v1.3` schema header anchors.
+
+---
+
 ## v1.31.0 — 2026-04-29
 
 ### Feature — natural-language export dispatch keywords

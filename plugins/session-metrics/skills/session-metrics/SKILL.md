@@ -387,12 +387,26 @@ For example, if the user asked for `--output html`, run the script with
 audit suggestion can always be shown.
 
 After all `[export] FMT → path` lines are printed and the optional
-`[self-cost]` line lands, append a two-line suggestion telling the user how
-to audit the run:
+`[self-cost]` line lands, append an audit suggestion based on the export scope.
+Determine scope from the JSON filename printed by the `[export] JSON` line:
 
+- `session_*.json` → session scope
+- `project_*.json` → project scope
+- `instance/*/index.json` → instance scope
+
+**Session scope:**
 > Want a token-usage audit of this session?
 >   `/audit-session-metrics quick   <json-path>`   (Haiku — ~10× cheaper than Sonnet)
 >   `/audit-session-metrics detailed <json-path>`  (Haiku, also reads CLAUDE.md + settings)
+
+**Project scope:**
+> Want a per-session cost and cache health audit of this project?
+>   `/audit-session-metrics quick   <json-path>`   (Haiku — surfaces top expensive sessions, cache outliers)
+>   `/audit-session-metrics detailed <json-path>`  (Haiku, also drills into top session turn patterns)
+
+**Instance scope:**
+> Want a cross-project cost breakdown audit?
+>   `/audit-session-metrics quick   <json-path>`   (Haiku — per-project cost shares and cache health)
 
 Substitute `<json-path>` with the actual path printed by the
 `[export] JSON` line.
