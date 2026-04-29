@@ -29,6 +29,7 @@ Environment variables (all optional — CLI flags take precedence):
 
 import argparse
 import atexit
+import bisect
 import csv as csv_mod
 import functools
 import gzip
@@ -41,6 +42,7 @@ import re
 import secrets
 import sys
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -1851,6 +1853,11 @@ def _detect_cache_breaks(session: dict,
             "turn_index": t.get("index"),
         })
         last_text = txt
+    # Precompute prompt turn-indices once for bisect (P4.2). prompts is
+    # built by walking turns in chronological order, so this list is
+    # monotonically non-decreasing — required for bisect_right. Parser
+    # invariant: every prompt has an integer turn_index.
+    prompt_indices: list[int] = [p["turn_index"] for p in prompts]
     # Detect flagged turns, attach context window.
     breaks: list[dict] = []
     for t in turns:
@@ -1866,13 +1873,8 @@ def _detect_cache_breaks(session: dict,
         # turn_index >= prompt.turn_index. The closest prompt whose
         # turn_index <= flagged turn's index is "this turn's" prompt; its
         # ±context_radius neighbours form the context window.
-        anchor = -1
         ti = t.get("index")
-        for i, p in enumerate(prompts):
-            if p["turn_index"] is not None and ti is not None and p["turn_index"] <= ti:
-                anchor = i
-            else:
-                break
+        anchor = bisect.bisect_right(prompt_indices, ti) - 1 if ti is not None else -1
         ctx: list[dict] = []
         if anchor >= 0:
             lo = max(0, anchor - context_radius)
@@ -1932,6 +1934,26 @@ _RISK_CATEGORIES: frozenset[str] = frozenset(
 # detectors agree on what counts as a paste bomb.
 _PASTE_BOMB_CHARS: int = 5_000
 
+# File-reaccess detector regexes (P4.1: hoisted to module scope so they
+# compile once at import-time rather than on every `_detect_file_reaccesses`
+# call). See the function docstring for usage. The `(?<![\w.])` start-of-arg
+# boundary is intentional — keeps `cat .claude/skills/foo.py` from matching
+# `/skills/foo.py` mid-string and silently merging same-suffix files across
+# projects.
+_EXT_GROUP: str = (
+    r"py|js|ts|mjs|jsx|tsx|json|yaml|yml|toml|sh|bash|zsh|txt|csv|md|"
+    r"html|htm|css|scss|rs|go|rb|php|java|c|cpp|h|sql|xml|cfg|conf|log|"
+    r"ini|env|lock"
+)
+_BASH_PATH_RE: re.Pattern[str] = re.compile(
+    r"(?<![\w.])(?:"
+    r"\.{1,2}/[\w.\-/]+\.(?:" + _EXT_GROUP + r")(?!\w)"
+    r"|/[\w.\-/]+\.(?:" + _EXT_GROUP + r")(?!\w)"
+    r"|~/[\w.\-/]+\.(?:py|js|ts|json|yaml|yml|md|sh|txt)(?!\w))"
+)
+# For Read/Edit/Write, filter out directory paths (no extension = not a file).
+_READ_EXT_RE: re.Pattern[str] = re.compile(r"\.(?:" + _EXT_GROUP + r")$")
+
 
 def _analyze_stop_reasons(turns: list[dict]) -> dict:
     """Aggregate stop_reason distribution across real (non-resume) turns."""
@@ -1957,11 +1979,8 @@ def _detect_retry_chains(turns: list[dict], threshold: float = 0.80) -> dict:
     per session (not on a cross-session flat list) to avoid false positives
     at session boundaries.
     """
-    import re as _re
-    from difflib import SequenceMatcher
-
     def _tok(text: str) -> list[str]:
-        return _re.findall(r"\w+", text.lower())
+        return re.findall(r"\w+", text.lower())
 
     prompted = [t for t in turns
                 if not t.get("is_resume_marker") and (t.get("prompt_text") or "").strip()]
@@ -2046,25 +2065,7 @@ def _detect_file_reaccesses(turns: list[dict]) -> dict:
     Callers must strip ``_turn_to_paths`` and ``_turn_to_paths_ctx`` before
     JSON serialisation.
     """
-    import re as _re
     from collections import defaultdict
-    _EXT_GROUP = (
-        r"py|js|ts|mjs|jsx|tsx|json|yaml|yml|toml|sh|bash|zsh|txt|csv|md|"
-        r"html|htm|css|scss|rs|go|rb|php|java|c|cpp|h|sql|xml|cfg|conf|log|"
-        r"ini|env|lock"
-    )
-    # (?!\w) prevents matching .c inside .claude, .go inside .golang, etc.
-    # Leading (?<![\w.]) anchors the path token to a start-of-arg boundary,
-    # so ``cat .claude/skills/foo.py`` no longer extracts ``/skills/foo.py``
-    # (which would silently merge same-suffix files across projects).
-    _BASH_PATH_RE = _re.compile(
-        r"(?<![\w.])(?:"
-        r"\.{1,2}/[\w.\-/]+\.(?:" + _EXT_GROUP + r")(?!\w)"
-        r"|/[\w.\-/]+\.(?:" + _EXT_GROUP + r")(?!\w)"
-        r"|~/[\w.\-/]+\.(?:py|js|ts|json|yaml|yml|md|sh|txt)(?!\w))"
-    )
-    # For Read/Edit/Write, filter out directory paths (no extension = not a file)
-    _READ_EXT_RE = _re.compile(r"\.(?:" + _EXT_GROUP + r")$")
 
     # (path, seg) → list of turn indices that accessed path in that segment
     seg_turns: dict[tuple[str, int], list[int]] = defaultdict(list)
