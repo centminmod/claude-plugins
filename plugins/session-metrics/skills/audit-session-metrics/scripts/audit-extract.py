@@ -429,25 +429,40 @@ def evaluate_triggers(data: dict, turns: list[dict]) -> list[dict]:
             "impact_basis": "totals.extra_1h_cost (1h-tier surcharge over 5m baseline)",
         })
 
-    # session_warmup_overhead — first turn > 20% of cost AND turns <= 15
-    if turns and len(turns) <= 15 and cost > 0:
+    # session_warmup_overhead — first turn > 20% of cost. Length-agnostic
+    # since v1.35.0 (was previously gated on len(turns) <= 15, which silenced
+    # mid-length sessions where the first turn still dominated). For long
+    # sessions where the first-turn share is notable but not dominant, the
+    # severity downgrades to low — the absolute warmup cost is the same but
+    # the user has more turns to amortise it across.
+    if turns and cost > 0:
         first = turns[0]
         first_cost = first.get("cost_usd", 0) or 0
         first_pct = _safe_div_pct(first_cost, cost)
         if first_pct > 20:
+            n_turns = len(turns)
+            suggested = "medium"
+            downgrade_reason: str | None = None
+            if n_turns > 30 and first_pct < 30:
+                suggested = "low"
+                downgrade_reason = (
+                    f"long session ({n_turns} turns) — first-turn share "
+                    f"is high ({round(first_pct, 1)}%) but warmup is "
+                    "small relative to overall work; informational only"
+                )
             fired.append({
                 "metric": "session_warmup_overhead",
                 "default_severity": "medium",
-                "suggested_severity": "medium",
-                "downgrade_reason": None,
+                "suggested_severity": suggested,
+                "downgrade_reason": downgrade_reason,
                 "evidence": {
                     "first_turn_cost_usd": round(first_cost, 2),
                     "total_cost_usd": round(cost, 2),
                     "pct_of_total": round(first_pct, 1),
-                    "total_turns": len(turns),
+                    "total_turns": n_turns,
                 },
                 "estimated_impact_usd": None,
-                "impact_basis": "n/a — short-session warmup, no direct savings figure",
+                "impact_basis": "n/a — first-turn warmup share, no direct savings figure",
             })
 
     # tool_result_bloat — turn with cache_write > 50K right after Bash/Read/WebFetch

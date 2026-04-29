@@ -3,6 +3,24 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.35.0 — 2026-04-29
+
+### Insight + sharing — P2 batch (warmup-trigger length cap + JSON redaction)
+
+Two follow-up fixes from the Session 112 audit (P2.3, P2.4). Schema-additive: existing tooling keeps working; new behaviour is opt-in.
+
+**P2.3 — `session_warmup_overhead` now length-agnostic.**
+The trigger was previously gated on `len(turns) <= 15`, which silently silenced mid-length sessions where the first turn still dominated cost. A 17-turn session with 30% first-turn cost never fired. The cap is dropped: any session with `first_turn_cost / total_cost > 20%` now surfaces. To keep the signal honest on long sessions, the suggested severity downgrades to `low` (with a `downgrade_reason`) when `total_turns > 30 AND first_pct < 30` — the warmup cost amortises across many turns. Default severity is unchanged (`medium`); the playbook row in `quick-audit.md` was rewritten to match.
+
+**P2.4 — `--redact-user-prompts` wired through `render_json`.**
+The `--redact-user-prompts` flag at `session-metrics.py:10719` was silently ineffective on JSON exports — the redact path only ran in compare HTML, while `render_json` wrote full `prompt_text` and `assistant_text` verbatim. The flag now also masks `prompt_text` / `prompt_snippet` and `assistant_text` / `assistant_snippet` on every turn of single-session and project JSON exports with `[redacted]`. Tool inputs, slash-command names, and structured cost / token fields stay visible so the redacted JSON is still useful for cost analysis. Empty fields stay empty (truthiness preserved). No-op for instance-scope JSON, which carries no per-turn records. Help text updated to document JSON coverage explicitly.
+
+### Tests
+
+8 new regression tests (4 for P2.3 length cap + downgrade matrix, 4 for P2.4 redaction including default-off, structured-field visibility, and empty-field preservation). 624 total tests pass (1 skipped).
+
+---
+
 ## v1.34.0 — 2026-04-29
 
 ### Insight — P2 batch (cost-share + paste-bomb classification)

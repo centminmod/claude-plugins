@@ -9840,3 +9840,159 @@ def test_classify_turn_paste_bomb_in_risk_categories():
     and per-turn drawer (P2.2)."""
     assert "paste_bomb" in sm._RISK_CATEGORIES
     assert "paste_bomb" in sm._TURN_CHARACTER_LABELS
+
+
+# v1.35.0 — P2.3: drop length cap on session_warmup_overhead
+
+def test_audit_extract_warmup_fires_for_mid_length_session_above_15_turns():
+    """Pre-v1.35 the trigger was gated on len(turns) <= 15 — a 17-turn
+    session with 30% first-turn cost was silently never surfaced. Drop
+    the cap so it fires (P2.3)."""
+    ae = _load_audit_extract()
+    turns = [_audit_min_turn(index=1, cost_usd=0.30)]
+    turns.extend(_audit_min_turn(index=i, cost_usd=0.70 / 16)
+                 for i in range(2, 18))  # 16 more turns; 17 total
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "cost": 1.0, "turns": 17,
+                "output": 100, "total_input": 100},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    warm = next((t for t in digest["fired_triggers"]
+                 if t["metric"] == "session_warmup_overhead"), None)
+    assert warm is not None
+    assert warm["evidence"]["pct_of_total"] == pytest.approx(30.0)
+    assert warm["evidence"]["total_turns"] == 17
+    # 17 turns is not "long" by the new downgrade rule (>30) — stays medium.
+    assert warm["suggested_severity"] == "medium"
+    assert warm["downgrade_reason"] is None
+
+
+def test_audit_extract_warmup_downgrades_to_low_for_long_session():
+    """Long-session (>30 turns) with first-turn share between 20-30% should
+    downgrade to ``low`` because the warmup cost amortises across many turns
+    (P2.3)."""
+    ae = _load_audit_extract()
+    turns = [_audit_min_turn(index=1, cost_usd=0.22)]
+    turns.extend(_audit_min_turn(index=i, cost_usd=0.78 / 39)
+                 for i in range(2, 41))  # 39 more turns; 40 total
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "cost": 1.0, "turns": 40,
+                "output": 100, "total_input": 100},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    warm = next((t for t in digest["fired_triggers"]
+                 if t["metric"] == "session_warmup_overhead"), None)
+    assert warm is not None
+    assert warm["evidence"]["total_turns"] == 40
+    assert warm["suggested_severity"] == "low"
+    assert warm["downgrade_reason"] is not None
+    assert "long session" in warm["downgrade_reason"]
+
+
+def test_audit_extract_warmup_stays_medium_when_share_dominates_long_session():
+    """If a long session has ≥30% first-turn share, the warmup cost is
+    large enough that the downgrade should NOT apply — keep medium."""
+    ae = _load_audit_extract()
+    turns = [_audit_min_turn(index=1, cost_usd=0.40)]
+    turns.extend(_audit_min_turn(index=i, cost_usd=0.60 / 49)
+                 for i in range(2, 51))  # 49 more turns; 50 total
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "cost": 1.0, "turns": 50,
+                "output": 100, "total_input": 100},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    warm = next((t for t in digest["fired_triggers"]
+                 if t["metric"] == "session_warmup_overhead"), None)
+    assert warm is not None
+    assert warm["suggested_severity"] == "medium"
+    assert warm["downgrade_reason"] is None
+
+
+def test_audit_extract_warmup_does_not_fire_below_threshold():
+    """Threshold (>20%) is unchanged — share at or below 20% never fires."""
+    ae = _load_audit_extract()
+    turns = [_audit_min_turn(index=1, cost_usd=0.18)]
+    turns.extend(_audit_min_turn(index=i, cost_usd=0.82 / 4)
+                 for i in range(2, 6))  # 4 more turns; 5 total
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "cost": 1.0, "turns": 5,
+                "output": 100, "total_input": 100},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    metrics = {t["metric"] for t in digest["fired_triggers"]}
+    assert "session_warmup_overhead" not in metrics
+
+
+# v1.35.0 — P2.4: --redact-user-prompts wired through render_json
+
+def test_render_json_redacts_prompt_and_assistant_text():
+    """When ``redact_user_prompts=True`` the JSON export replaces freeform
+    prompt and assistant text on every turn with ``[redacted]`` so the
+    file is safe to share (P2.4)."""
+    import json as _json
+    r = _build_fixture_report()
+    # Force at least one turn to have non-empty freeform text so the
+    # redaction has something to replace — the bundled fixture has empty
+    # ``prompt_text`` because it's a tool-result-only sequence.
+    r["sessions"][0]["turns"][0]["prompt_text"]      = "search the web for X"
+    r["sessions"][0]["turns"][0]["prompt_snippet"]   = "search the web for X"
+    r["sessions"][0]["turns"][0]["assistant_text"]   = "OK, fetching results..."
+    r["sessions"][0]["turns"][0]["assistant_snippet"] = "OK, fetching..."
+    redacted = _json.loads(sm.render_json(r, redact_user_prompts=True))
+    t0 = redacted["sessions"][0]["turns"][0]
+    assert t0["prompt_text"]      == "[redacted]"
+    assert t0["prompt_snippet"]   == "[redacted]"
+    assert t0["assistant_text"]   == "[redacted]"
+    assert t0["assistant_snippet"] == "[redacted]"
+
+
+def test_render_json_default_leaves_prompt_text_intact():
+    """Without the flag the freeform fields stay as-is — the redaction
+    must be opt-in so existing pipelines don't suddenly lose data."""
+    import json as _json
+    r = _build_fixture_report()
+    r["sessions"][0]["turns"][0]["prompt_text"]    = "verbatim prompt content"
+    r["sessions"][0]["turns"][0]["assistant_text"] = "verbatim reply"
+    plain = _json.loads(sm.render_json(r))
+    t0 = plain["sessions"][0]["turns"][0]
+    assert t0["prompt_text"]    == "verbatim prompt content"
+    assert t0["assistant_text"] == "verbatim reply"
+
+
+def test_render_json_redact_keeps_structured_fields_visible():
+    """Redaction targets only freeform PII fields. Token counts, costs,
+    tool inputs, slash-command names, and turn timestamps must stay
+    visible so the JSON remains useful for cost analysis."""
+    import json as _json
+    r = _build_fixture_report()
+    r["sessions"][0]["turns"][0]["prompt_text"]   = "secret content"
+    r["sessions"][0]["turns"][0]["slash_command"] = "/audit-session-metrics"
+    redacted = _json.loads(sm.render_json(r, redact_user_prompts=True))
+    t0 = redacted["sessions"][0]["turns"][0]
+    assert t0["prompt_text"]    == "[redacted]"
+    assert t0["slash_command"]  == "/audit-session-metrics"
+    assert "cost_usd"           in t0
+    assert "input_tokens"       in t0
+    assert "cache_read_tokens"  in t0
+
+
+def test_render_json_redact_preserves_empty_fields():
+    """Empty prompt_text means a tool-result-only turn — the truthiness
+    is meaningful downstream (e.g. ``if t.get("prompt_text"):``). The
+    redactor must NOT replace empty strings with ``[redacted]``."""
+    import json as _json
+    r = _build_fixture_report()
+    # Force the freeform fields to empty so we can verify the redactor
+    # leaves empties alone (the bundled fixture has compaction-marker
+    # text on turn 0, which would mask this assertion).
+    for fld in sm._REDACTED_TURN_FIELDS:
+        r["sessions"][0]["turns"][0][fld] = ""
+    redacted = _json.loads(sm.render_json(r, redact_user_prompts=True))
+    t0 = redacted["sessions"][0]["turns"][0]
+    for fld in sm._REDACTED_TURN_FIELDS:
+        assert t0.get(fld, "") == "", \
+            f"redactor must leave empty {fld} alone, got {t0.get(fld)!r}"

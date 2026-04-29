@@ -100,7 +100,7 @@ Quote the number in your `fix` paragraph; do not re-derive it.
 | `input_output_ratio_uncached` | uncached_input/output > 50:1 AND `cache_hit_pct` < 60 | high | `null` — depends on prompt-caching applicability |
 | `subagent_share` | `subagent_share_stats.share_pct` > 50 | medium | `subagent_share_stats.attributed_cost` (already realised) |
 | `cache_ttl_1h_unused` | `extra_1h_cost` > 0 AND `cache_read` < 50% of `cache_write_1h` | medium | `totals.extra_1h_cost` (1h-tier surcharge) |
-| `session_warmup_overhead` | `first_turn_cost / total_cost > 0.20` AND `total_turns ≤ 15` | medium | `null` — short-session warmup |
+| `session_warmup_overhead` | `first_turn_cost / total_cost > 0.20` (length-agnostic; downgrades to low when `total_turns > 30 AND first_pct < 30`) | medium (low for long sessions, see trigger) | `null` — first-turn warmup share |
 | `tool_result_bloat` | A turn with `cache_write_tokens > 50000` immediately after a turn whose `tool_use_names` included `Bash`, `Read`, or `WebFetch` | medium | `null` — savings depend on cache reuse |
 | `heavy_reader_tools` | `Read` or `WebFetch` in `tool_names_top3` | low | `null` — informational |
 | `cache_savings_low` | `cache_savings` < 10% of `cost` | low | `null` — depends on prompt-reuse pattern |

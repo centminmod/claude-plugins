@@ -4166,13 +4166,48 @@ def _tod_for_json(tod: dict) -> dict:
     }
 
 
-def render_json(report: dict) -> str:
+# Fields redacted from JSON exports under ``--redact-user-prompts``. These
+# carry freeform user / assistant text that may contain PII; ``slash_command``
+# and tool input previews are canonical / structured and stay visible so the
+# export remains useful for cost analysis.
+_REDACTED_TURN_FIELDS = (
+    "prompt_text", "prompt_snippet",
+    "assistant_text", "assistant_snippet",
+)
+_REDACTED_PLACEHOLDER = "[redacted]"
+
+
+def _redact_turns_for_json(sessions: list[dict]) -> list[dict]:
+    """Return a shallow copy of ``sessions`` with freeform prompt/assistant
+    text replaced by ``[redacted]`` on every turn. Empty fields stay empty so
+    downstream filters (``if t.get("prompt_text"):``) keep their meaning."""
+    out = []
+    for s in sessions:
+        new_turns = []
+        for t in s.get("turns", []):
+            redacted = {**t}
+            for fld in _REDACTED_TURN_FIELDS:
+                if redacted.get(fld):
+                    redacted[fld] = _REDACTED_PLACEHOLDER
+            new_turns.append(redacted)
+        out.append({**s, "turns": new_turns})
+    return out
+
+
+def render_json(report: dict, *, redact_user_prompts: bool = False) -> str:
     """Render the full report as indented JSON.
 
     Internal ``epoch_secs`` lists in ``time_of_day`` sections are converted to
     ISO-8601 ``utc_timestamps`` for human readability.  The transform uses a
     shallow copy of the report — session turns, subtotals, and model dicts are
     shared by reference to avoid copying ~thousands of turn record dicts.
+
+    ``redact_user_prompts`` masks ``prompt_text`` / ``prompt_snippet`` and
+    ``assistant_text`` / ``assistant_snippet`` on every turn with
+    ``[redacted]`` so the JSON is safe to share publicly. Tool inputs,
+    slash-command names, and structured cost / token fields stay visible.
+    Instance-scope JSON has no per-turn records, so the flag is a no-op
+    there.
     """
     if report.get("mode") == "compare":
         return sys.modules["session_metrics_compare"].render_compare_json(report)
@@ -4183,10 +4218,13 @@ def render_json(report: dict) -> str:
     if "time_of_day" in export:
         export["time_of_day"] = _tod_for_json(export["time_of_day"])
     if "sessions" in export:
+        sessions = export["sessions"]
+        if redact_user_prompts:
+            sessions = _redact_turns_for_json(sessions)
         export["sessions"] = [
             {**s, "time_of_day": _tod_for_json(s["time_of_day"])}
             if "time_of_day" in s else s
-            for s in export["sessions"]
+            for s in sessions
         ]
     return json.dumps(export, indent=2)
 
@@ -10492,6 +10530,8 @@ def _dispatch(report: dict, formats: list[str],
         if fmt == "html":
             content = render_html(report, variant="single", chart_lib=chart_lib,
                                    idle_gap_minutes=idle_gap_minutes)
+        elif fmt == "json":
+            content = render_json(report, redact_user_prompts=redact_user_prompts)
         else:
             content = _RENDERERS[fmt](report)
         path = _write_output(fmt, content, report)
@@ -10717,10 +10757,17 @@ def _build_parser() -> argparse.ArgumentParser:
                         "orchestrator.")
     # --- Phase 6 / 7 — HTML compare + Insights card ----------------------
     p.add_argument("--redact-user-prompts", action="store_true",
-                   help="In the compare HTML report, replace freeform "
-                        "user-prompt fingerprints with '[redacted]' so the "
-                        "file is safe to share. Sentinel-tagged suite "
-                        "prompts (canonical, non-PII) stay visible.")
+                   help="Replace freeform user-prompt and assistant-reply "
+                        "text with '[redacted]' so reports are safe to "
+                        "share. Applies to: compare HTML "
+                        "(prompt fingerprints; sentinel-tagged suite "
+                        "prompts stay visible) and JSON exports of "
+                        "single-session and project reports "
+                        "(prompt_text / prompt_snippet / assistant_text / "
+                        "assistant_snippet on every turn). Tool inputs, "
+                        "slash-command names, and structured cost / token "
+                        "fields stay visible. No-op for instance-scope "
+                        "JSON, which carries no per-turn records.")
     p.add_argument("--no-model-compare-insight", action="store_true",
                    help="Suppress the Model-compare insight card on the "
                         "single-session / project dashboards. Use when the "
