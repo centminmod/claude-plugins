@@ -702,9 +702,9 @@ _ASSISTANT_TEXT_CAP = 2000
 _PROMPT_TEXT_CAP   = 1000
 
 
-def _truncate(text: str, n: int) -> str:
+def _truncate(text: str | None, n: int) -> str:
     """Slice to ``n`` characters, appending an ellipsis when truncated."""
-    if not isinstance(text, str):
+    if text is None:
         return ""
     if len(text) <= n:
         return text
@@ -1244,6 +1244,7 @@ def _build_session_blocks(
         if kind == "user":
             b["user_msg_count"] += 1
         else:
+            assert turn is not None  # user events carry None; assistant turns carry a dict
             msg   = turn["message"]
             u     = msg["usage"]
             model = msg.get("model", "unknown")
@@ -2230,7 +2231,7 @@ def _detect_file_reaccesses(turns: list[dict]) -> dict:
         turn_total_tools_by_idx[idx] = len(t.get("tool_use_detail", []))
 
     path_count_per_turn: dict[tuple[str, int], int] = defaultdict(int)
-    for (p, _seg), idx_list in seg_turns.items():
+    for (p, _), idx_list in seg_turns.items():
         for idx in idx_list:
             path_count_per_turn[(p, idx)] += 1
 
@@ -2265,7 +2266,7 @@ def _detect_file_reaccesses(turns: list[dict]) -> dict:
     return {
         "reaccessed_count":      len(all_reaccessed),
         "details":               details,
-        "total_reaccess_cost":   sum(d["cost_usd"] for d in details),
+        "total_reaccess_cost":   sum(float(d["cost_usd"]) for d in details),
         "_turn_to_paths":        dict(turn_to_paths),      # risk; strip before export
         "_turn_to_paths_ctx":    dict(turn_to_paths_ctx),  # expected; strip before export
     }
@@ -2456,7 +2457,7 @@ def _finalise_skill_rows(rows: dict, total_cost: float) -> list[dict]:
     """Compute derived fields (pct_total_cost, cache_hit_pct) and drop the
     internal ``_sessions`` set; return a list ordered by cost descending."""
     out: list[dict] = []
-    for name, row in rows.items():
+    for _, row in rows.items():
         row = dict(row)
         row["session_count"] = len(row.pop("_sessions", set()) or set())
         total_input_side = (row["input"] + row["cache_read"] + row["cache_write"]) or 1
@@ -2604,7 +2605,7 @@ def _empty_subagent_row(name: str) -> dict:
 
 def _finalise_subagent_rows(rows: dict, total_cost: float) -> list[dict]:
     out: list[dict] = []
-    for name, row in rows.items():
+    for _, row in rows.items():
         row = dict(row)
         row["session_count"] = len(row.pop("_sessions", set()) or set())
         total_input_side = (row["input"] + row["cache_read"] + row["cache_write"]) or 1

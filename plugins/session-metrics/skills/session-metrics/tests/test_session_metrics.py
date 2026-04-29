@@ -19,8 +19,10 @@ _FIXTURE    = _HERE / "fixtures" / "mini.jsonl"
 
 def _load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None, f"could not locate module spec for {path}"
     mod  = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
+    assert spec.loader is not None, f"spec has no loader for {path}"
     spec.loader.exec_module(mod)
     return mod
 
@@ -59,7 +61,7 @@ smc = _load_module("session_metrics_compare", _COMPARE)
 # Tests that legitimately need to read the user's real projects dir can
 # opt out with ``@pytest.mark.real_projects_dir``.
 @pytest.fixture(autouse=True)
-def _isolate_projects_dir(tmp_path, monkeypatch, request):
+def isolate_projects_dir(tmp_path, monkeypatch, request):
     if request.node.get_closest_marker("real_projects_dir"):
         return
     safe = tmp_path / "_autouse_projects"
@@ -275,7 +277,6 @@ def test_fixture_time_of_day_total_is_user_prompt_count():
 def test_fixture_ttl_classification_per_turn():
     """Each turn carries a correct `cache_write_ttl` derived from its split."""
     r = _build_fixture_report()
-    by_id = {t["model"] + "_" + str(t["index"]): t for t in r["sessions"][0]["turns"]}
     # Index 1 = msg_A (legacy flat → classified as 5m via fallback)
     assert r["sessions"][0]["turns"][0]["cache_write_ttl"] == "5m"
     # Index 5 = msg_E (pure 1h)
@@ -845,7 +846,7 @@ def test_no_content_blocks_means_column_omitted_in_text():
     assert sm._has_content_blocks(r) is False
     text = sm.render_text(r)
     # Column legend lists the standard columns only — no `Content` row.
-    legend_block, _rest = text.split("\n\n", 1)
+    legend_block = text.split("\n\n", 1)[0]
     assert "Content" not in legend_block
 
 
@@ -1073,7 +1074,7 @@ def test_build_peak_defaults_to_los_angeles():
     assert "community" in p["note"].lower()
 
 
-def _raise_zoneinfo_missing(*args, **kwargs):
+def _raise_zoneinfo_missing(*_):
     raise sm.ZoneInfoNotFoundError("simulated windows-without-tzdata")
 
 
@@ -2536,7 +2537,7 @@ def test_resolve_compare_arg_last_family_min_turns_override(tmp_path, monkeypatc
         ],
     )
     monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(projects_dir))
-    kind, paths = smc._resolve_compare_arg(
+    _, paths = smc._resolve_compare_arg(
         "last-opus-4-7", "test-slug", min_turns=1, use_cache=False,
     )
     assert paths[0].name == "compare_opus_4_7_short.jsonl"
@@ -2599,7 +2600,7 @@ def test_resolve_compare_arg_unknown_family_lists_present(tmp_path, monkeypatch)
     assert "sonnet-4-7" in msg
 
 
-def test_resolve_compare_arg_empty_family_slug_raises(tmp_path):
+def test_resolve_compare_arg_empty_family_slug_raises():
     with pytest.raises(smc.CompareArgError, match="missing a family slug"):
         smc._resolve_compare_arg("last-", "slug")
 
@@ -3387,7 +3388,7 @@ def test_confirm_aggregate_interactive_y_proceeds(monkeypatch, capsys):
     fake_stdin = io.StringIO("y\n")
     fake_stdin.isatty = lambda: True   # pretend we're interactive
     monkeypatch.setattr("sys.stdin", fake_stdin)
-    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    monkeypatch.setattr("builtins.input", lambda _="": "y")
     smc._confirm_aggregate_or_exit(a, b, assume_yes=False)   # must not exit
     err = capsys.readouterr().err
     assert "aggregate preview" in err
@@ -3399,7 +3400,7 @@ def test_confirm_aggregate_interactive_n_aborts(monkeypatch, capsys):
     fake_stdin = io.StringIO("n\n")
     fake_stdin.isatty = lambda: True
     monkeypatch.setattr("sys.stdin", fake_stdin)
-    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    monkeypatch.setattr("builtins.input", lambda _="": "n")
     with pytest.raises(SystemExit) as exc:
         smc._confirm_aggregate_or_exit(a, b, assume_yes=False)
     assert exc.value.code == 0
@@ -3656,7 +3657,7 @@ def test_predicate_json_reshape_validates_shape():
 
 def test_predicate_exception_returns_false():
     # A predicate that raises must not crash the run — returns False.
-    def bad(text):
+    def bad(_):
         raise RuntimeError("boom")
     assert smc._run_predicate(bad, "whatever") is False
 
@@ -3767,7 +3768,7 @@ def test_intrasession_suite_mix_advises_when_allowed():
     # default the cross-side mismatch refuses outright. With
     # allow_mismatch=True the compare still surfaces both the intra-session
     # mix advisory and the cross-side mismatch advisory.
-    va, vb, advisories = smc._resolve_suite_versions(
+    va, _, advisories = smc._resolve_suite_versions(
         a_turns, b_turns, allow_mismatch=True,
     )
     assert len(va) == 2
@@ -4768,7 +4769,7 @@ class _MockResp:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, *_) -> bool:
         return False
 
     def read(self):
@@ -4785,7 +4786,7 @@ def _make_mock_urlopen(responses):
     import urllib.error as ue
     from email.message import Message as _HdrsMsg
 
-    def _urlopen(req, timeout=None):
+    def _urlopen(req, timeout=None):  # noqa: ARG001 — timeout required by urlopen API
         # Pull the body out to find which model the request targets.
         import json as _json
         payload = _json.loads(req.data.decode("utf-8"))
@@ -4850,9 +4851,7 @@ def test_count_tokens_request_network_error_raises():
 
 def test_count_tokens_request_malformed_body_raises():
     """Server returned JSON but no ``input_tokens`` key."""
-    import urllib.error as ue  # noqa: F401
-
-    def _urlopen(req, timeout=None):
+    def _urlopen(_req, timeout=None):  # noqa: ARG001 — timeout required by urlopen API
         return _MockResp(b'{"something_else": 123}')
     with pytest.raises(smc.CountTokensError) as exc:
         smc._count_tokens_request(
@@ -4865,7 +4864,7 @@ def test_count_tokens_request_malformed_body_raises():
 def test_count_tokens_request_sends_correct_headers():
     captured = {}
 
-    def _urlopen(req, timeout=None):
+    def _urlopen(req, timeout=None):  # noqa: ARG001 — timeout required by urlopen API
         captured["headers"] = dict(req.headers)
         captured["method"] = req.get_method()
         captured["url"] = req.full_url
@@ -4893,7 +4892,7 @@ def test_run_count_tokens_only_missing_api_key(monkeypatch, capsys):
     assert "ANTHROPIC_API_KEY" in err
 
 
-def test_run_count_tokens_only_pair_emits_ratio(capsys):
+def test_run_count_tokens_only_pair_emits_ratio():
     import io as _io
     urlopen = _make_mock_urlopen({
         "claude-opus-4-6": 100,
@@ -4967,7 +4966,7 @@ def test_run_count_tokens_only_single_model_accepts(capsys):
     assert text.count(" 77") >= 10
 
 
-def test_run_count_tokens_only_confirmation_required_without_yes(monkeypatch, capsys):
+def test_run_count_tokens_only_confirmation_required_without_yes(capsys):
     """Non-interactive stdin + missing --yes → hard refusal."""
     import io as _io
     urlopen = _make_mock_urlopen({
@@ -5003,7 +5002,7 @@ def test_run_count_tokens_only_empty_suite_errors(tmp_path, capsys):
     assert "prompt suite is empty" in err
 
 
-def test_run_count_tokens_only_defaults_to_reference_pair(capsys):
+def test_run_count_tokens_only_defaults_to_reference_pair():
     """No models passed → canonical ``4-6`` / ``4-7`` reference pair."""
     import io as _io
     urlopen = _make_mock_urlopen({
