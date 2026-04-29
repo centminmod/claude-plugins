@@ -348,11 +348,15 @@ use.
 
 ## Optional post-export audit
 
-When a `json` format was included in `--output`, the script writes a
-`session_<id8>_<ts>.json` file alongside the other exports. After all
-`[export] FMT → path` lines are printed and the optional `[self-cost]`
-line lands, append a two-line suggestion telling the user how to
-audit the run:
+When any `--output` format is specified (`html`, `csv`, `md`, or `json`),
+always include `json` in the script invocation if it is not already present.
+For example, if the user asked for `--output html`, run the script with
+`--output html json`. This ensures the JSON export is always written and the
+audit suggestion can always be shown.
+
+After all `[export] FMT → path` lines are printed and the optional
+`[self-cost]` line lands, append a two-line suggestion telling the user how
+to audit the run:
 
 > Want a token-usage audit of this session?
 >   `/audit-session-metrics quick   <json-path>`   (Haiku — ~10× cheaper than Sonnet)
@@ -367,10 +371,6 @@ only takes effect when the audit skill is the entry point of its own
 turn — invoking via the Skill tool inside a session-metrics turn
 keeps the parent's Sonnet model and erases the cost win. The user
 runs the slash command at their own discretion.
-
-If `--output` did not include `json` (e.g. `--output html` only),
-**skip the audit suggestion entirely** — the audit playbook reads
-the JSON export and has nothing to work from without it.
 
 ## Self-cost meta-metric
 

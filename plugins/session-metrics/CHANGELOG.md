@@ -5,6 +5,16 @@ Versions match the `plugin.json` / `marketplace.json` version field.
 
 ---
 
+## v1.30.1 — 2026-04-29
+
+### Fix — audit suggestion shown after every export
+
+When the session-metrics skill is invoked with `--output html` (or `csv` or `md`), it now automatically appends `json` to the format list if absent. This ensures the JSON sidecar is always written and the `/audit-session-metrics quick <path>` suggestion is always shown — previously the hint was suppressed on html-only exports, requiring a redundant second `/session-metrics --output json` invocation before the audit could be run.
+
+The Haiku model-pinning on the audit skill is unaffected — the skill still prints the slash-command suggestion rather than invoking the audit programmatically.
+
+---
+
 ## v1.30.0 — 2026-04-29
 
 ### Feature — session archetype classifier (Tier-2 batch 2: detect-only) + first-turn cost share
