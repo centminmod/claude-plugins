@@ -41,6 +41,7 @@ import os
 import re
 import secrets
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -1761,7 +1762,63 @@ def _totals_from_turns(turn_records: list[dict]) -> dict:
     # Stable ordering: count desc, then name asc so ties are deterministic.
     ranked = sorted(name_counts.items(), key=lambda x: (-x[1], x[0]))
     t["tool_names_top3"] = [name for name, _ in ranked[:3]]
+    # Internal field carried so `_add_totals` (P4.4) can fold per-session
+    # subtotals into a project-wide total without re-iterating turns. Stripped
+    # off the top-level project totals + each session subtotal in
+    # `_build_report` after the reduce so it never lands in JSON exports.
+    t["_tool_name_counts"] = name_counts
     return t
+
+
+def _add_totals(a: dict, b: dict) -> dict:
+    """Pairwise sum two `_totals_from_turns` outputs into a new total dict.
+
+    Used by `_build_report` (P4.4) to fold per-session subtotals into the
+    project-wide total without a second linear pass over every turn record.
+    Re-derives the computed fields (`total`, `total_input`, `cache_savings`,
+    `cache_hit_pct`, `thinking_turn_pct`, `tool_call_total`,
+    `tool_call_avg_per_turn`, `tool_names_top3`) from the merged additive
+    state so the output is byte-equivalent to running `_totals_from_turns`
+    over the concatenation of the two source turn lists.
+    """
+    out: dict = {
+        "input":               a["input"]               + b["input"],
+        "output":              a["output"]              + b["output"],
+        "cache_read":          a["cache_read"]          + b["cache_read"],
+        "cache_write":         a["cache_write"]         + b["cache_write"],
+        "cache_write_5m":      a["cache_write_5m"]      + b["cache_write_5m"],
+        "cache_write_1h":      a["cache_write_1h"]      + b["cache_write_1h"],
+        "extra_1h_cost":       a["extra_1h_cost"]       + b["extra_1h_cost"],
+        "cost":                a["cost"]                + b["cost"],
+        "no_cache_cost":       a["no_cache_cost"]       + b["no_cache_cost"],
+        "turns":               a["turns"]               + b["turns"],
+        "advisor_call_count":  a["advisor_call_count"]  + b["advisor_call_count"],
+        "advisor_cost_usd":    a["advisor_cost_usd"]    + b["advisor_cost_usd"],
+        "thinking_turn_count": a["thinking_turn_count"] + b["thinking_turn_count"],
+    }
+    cb_a = a.get("content_blocks") or {}
+    cb_b = b.get("content_blocks") or {}
+    cb: dict[str, int] = {}
+    for k in set(cb_a) | set(cb_b):
+        cb[k] = int(cb_a.get(k, 0)) + int(cb_b.get(k, 0))
+    out["content_blocks"] = cb
+    nc_a = a.get("_tool_name_counts") or {}
+    nc_b = b.get("_tool_name_counts") or {}
+    nc: dict[str, int] = dict(nc_a)
+    for k, v in nc_b.items():
+        nc[k] = nc.get(k, 0) + v
+    out["_tool_name_counts"] = nc
+    out["total"]         = out["input"] + out["output"] + out["cache_read"] + out["cache_write"]
+    out["total_input"]   = out["input"] + out["cache_read"] + out["cache_write"]
+    out["cache_savings"] = out["no_cache_cost"] - out["cost"]
+    out["cache_hit_pct"] = 100 * out["cache_read"] / max(1, out["total_input"])
+    n = out["turns"]
+    out["thinking_turn_pct"]      = 100 * out["thinking_turn_count"] / n if n else 0.0
+    out["tool_call_total"]        = cb.get("tool_use", 0)
+    out["tool_call_avg_per_turn"] = out["tool_call_total"] / n if n else 0.0
+    ranked = sorted(nc.items(), key=lambda x: (-x[1], x[0]))
+    out["tool_names_top3"] = [name for name, _ in ranked[:3]]
+    return out
 
 
 def _model_breakdown(turn_records: list[dict]) -> dict[str, dict]:
@@ -3612,7 +3669,22 @@ def _build_report(
     all_turns = [t for s in sessions_out for t in s["turns"]]
     all_user_ts = sorted(ts for _, _, uts in sessions_raw for ts in uts)
     blocks = _build_session_blocks(sessions_raw)
-    totals = _totals_from_turns(all_turns)
+    # P4.4: fold per-session subtotals into the project-wide total via
+    # `_add_totals` instead of re-iterating every turn through
+    # `_totals_from_turns(all_turns)`. Each subtotal already carries the
+    # additive state (and `_tool_name_counts`) needed to reconstruct an
+    # identical total. Strip the internal `_tool_name_counts` from the
+    # project total + each session subtotal before any renderer / JSON
+    # exporter sees them.
+    if sessions_out:
+        totals = functools.reduce(
+            _add_totals, (s["subtotal"] for s in sessions_out)
+        )
+    else:
+        totals = _totals_from_turns([])
+    totals.pop("_tool_name_counts", None)
+    for s in sessions_out:
+        s["subtotal"].pop("_tool_name_counts", None)
     report = {
         "generated_at":    datetime.now(timezone.utc).isoformat(),
         "mode":            mode,
@@ -9726,7 +9798,6 @@ def _run_all_projects(formats: list[str],
           file=sys.stderr)
     print(file=sys.stderr)
 
-    project_reports: list[dict] = []
     # Instance-scope UUID dedup: one set spans every JSONL across every
     # project so a session that was resumed (replaying prior UUIDs into a
     # new file) can't double-count in instance totals. Loaded entries add
@@ -9738,6 +9809,12 @@ def _run_all_projects(formats: list[str],
     # the post-processed turn records lack the ``message.usage`` subtree
     # that session_blocks reads for token tallies.
     all_sessions_raw: list[tuple[str, list[dict], list[int]]] = []
+    # P4.3: split per-project work into two phases. Phase 1 (this loop)
+    # remains serial because `_load_session` mutates the shared
+    # `instance_seen` UUID set — parallelising it would race the dedup
+    # ("first occurrence wins" needs deterministic order). Phase 2 fans
+    # out the pure-CPU `_build_report` calls across a thread pool below.
+    project_inputs: list[tuple[str, list[tuple[str, list[dict], list[int]]]]] = []
     for i, (slug, project_dir) in enumerate(discovered, 1):
         jsonls = sorted(
             [p for p in project_dir.glob("*.jsonl") if p.is_file()],
@@ -9758,10 +9835,24 @@ def _run_all_projects(formats: list[str],
         if not sessions_raw:
             print(f"[skip] {slug}: no usable turns", file=sys.stderr)
             continue
-        print(f"[{i}/{len(discovered)}] Loading {slug} "
-              f"({len(sessions_raw)} session(s))...", file=sys.stderr)
-        pr = _build_report(
-            "project", slug, sessions_raw,
+        print(f"[{i}/{len(discovered)}] Loaded {slug} "
+              f"({len(sessions_raw)} session(s))", file=sys.stderr)
+        project_inputs.append((slug, sessions_raw))
+        all_sessions_raw.extend(sessions_raw)
+
+    # Phase 2: build per-project reports in parallel. `_build_report` is
+    # pure over its `sessions_raw` argument (no shared mutable state across
+    # projects — `_load_session`'s parse cache is the only on-disk shared
+    # store and it's atomic via lockfile). Threads suffice over processes:
+    # JSON parsing inside `_build_turn_record` releases the GIL on most
+    # CPython builds, and the pickle / start-up cost of processes would
+    # erase the gain on small projects. Order is preserved by collecting
+    # results in submit-order rather than completion-order so per-project
+    # ordering across `project_reports` matches the discovery order.
+    def _build_one_project(slug_and_raw: tuple[str, list]) -> dict:
+        slug_, sessions_raw_ = slug_and_raw
+        return _build_report(
+            "project", slug_, sessions_raw_,
             tz_offset_hours=tz_offset, tz_label=tz_label, peak=peak,
             suppress_model_compare_insight=True,  # per-project, suppress noise
             cache_break_threshold=cache_break_threshold,
@@ -9769,8 +9860,15 @@ def _run_all_projects(formats: list[str],
             sort_prompts_by=sort_prompts_by,
             include_subagents=include_subagents,
         )
-        project_reports.append(pr)
-        all_sessions_raw.extend(sessions_raw)
+
+    if len(project_inputs) > 1:
+        max_workers = min(8, (os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            project_reports: list[dict] = list(
+                ex.map(_build_one_project, project_inputs)
+            )
+    else:
+        project_reports = [_build_one_project(p) for p in project_inputs]
 
     if not project_reports:
         print("[info] No projects yielded usable turns.", file=sys.stderr)
