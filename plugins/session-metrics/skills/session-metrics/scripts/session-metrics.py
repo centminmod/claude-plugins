@@ -367,6 +367,25 @@ def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
     except OSError:
         # Non-fatal — the parse already succeeded.
         pass
+    else:
+        # Prune stranded blobs for the same source file (same stem + path_hash)
+        # that were left behind by an mtime_ns bump or a _SCRIPT_VERSION change.
+        # Only runs on cache miss (post-successful write) — no latency on warm hits.
+        try:
+            try:
+                _abs = str(path.resolve())
+            except OSError:
+                _abs = str(path)
+            _ph = hashlib.sha1(_abs.encode("utf-8")).hexdigest()[:8]
+            _prefix = f"{path.stem}__{_ph}__"
+            for _stale in cache_dir.glob(f"{_prefix}*"):
+                if _stale.name != cache_path.name:
+                    try:
+                        _stale.unlink()
+                    except OSError:
+                        pass  # racing writer / file vanished between glob and unlink
+        except OSError:
+            pass  # non-fatal — the write already succeeded
     return entries
 
 

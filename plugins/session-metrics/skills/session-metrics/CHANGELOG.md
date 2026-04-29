@@ -3,6 +3,28 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.38.0 — 2026-04-30
+
+### Cache hygiene — self-pruning parse cache (option a)
+
+`_cached_parse_jsonl` now deletes stranded blobs for the same source file on every cache write. Each JSONL has a unique `{stem}__{path_hash}__` prefix in the cache filename; any blob sharing that prefix but not matching the just-written filename was stranded by a previous `mtime_ns` bump or `_SCRIPT_VERSION` change. The prune glob runs only on cache miss (post-successful write) — zero latency on warm hits. Failures are non-fatal; the parse result is always returned. No `_SCRIPT_VERSION` bump (cache schema unchanged), no new CLI flags.
+
+**Motivation.** v1.37.0 switched to pickle (no compression), which is ~2× larger per blob (~9 MB → ~19 MB per typical session). Live sessions receive a new `mtime_ns` on every appended turn, stranding the prior blob each time. At project scale the orphaned files accumulate silently — 768 MB / 1 584 files measured on the dev machine before this was noticed. The per-file prune targets the structural cause (same-source stranding) without a whole-cache scan.
+
+**Stdlib-only, cross-platform, single-user-local trust model.** No new dependencies or CLI surface.
+
+### Tests
+
+Four new tests; one existing test updated to match the new prune behaviour. 643 → 647 passed, 1 skipped.
+
+- `test_cached_parse_prunes_stale_mtime` — mtime bump leaves exactly 1 blob.
+- `test_cached_parse_prunes_stale_version` — version bump leaves exactly 1 (new-version) blob.
+- `test_cached_parse_prune_does_not_touch_other_jsonls` — prune for source A leaves source B's blob intact.
+- `test_cached_parse_prune_failure_is_non_fatal` — read-only cache dir does not propagate OSError; entries are still returned.
+- `test_cached_parse_invalidates_on_mtime` updated: now asserts 1 blob post-bump (was 2 pre-prune).
+
+---
+
 ## v1.37.0 — 2026-04-30
 
 ### Performance — pickle parse cache (-67% cold / -18% warm / -17% project)

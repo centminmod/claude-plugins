@@ -1217,9 +1217,9 @@ def test_cached_parse_invalidates_on_mtime(tmp_path, monkeypatch):
     os.utime(src, (stat.st_atime, stat.st_mtime + 2))
     sm._cached_parse_jsonl(src, use_cache=True)
     after = {p.name for p in (tmp_path / "parse").iterdir()}
-    # Two distinct cache files now.
-    assert len(after) == 2
-    assert before.issubset(after)
+    # New key was written and the old blob was pruned — only 1 blob remains.
+    assert len(after) == 1
+    assert before.isdisjoint(after)
 
 
 def test_parse_cache_key_includes_path_hash(tmp_path):
@@ -1350,6 +1350,89 @@ def test_cache_write_concurrent_threads_no_corruption(tmp_path, monkeypatch):
     # Reading the cached blob must succeed and return a usable list.
     parsed = sm._cached_parse_jsonl(src, use_cache=True)
     assert isinstance(parsed, list)
+
+
+def test_cached_parse_prunes_stale_mtime(tmp_path, monkeypatch):
+    """After an mtime bump, the old blob is deleted on the next cache write."""
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    src = tmp_path / "mini.jsonl"
+    src.write_text(_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    # Prime the cache.
+    sm._cached_parse_jsonl(src, use_cache=True)
+    assert len(list((tmp_path / "parse").glob("*.pkl"))) == 1
+    # Bump mtime to force a cache miss on the next call.
+    import os
+    stat = src.stat()
+    os.utime(src, (stat.st_atime, stat.st_mtime + 2))
+    sm._cached_parse_jsonl(src, use_cache=True)
+    # Prune must have run: only the new blob remains.
+    blobs = list((tmp_path / "parse").glob("*.pkl"))
+    assert len(blobs) == 1
+
+
+def test_cached_parse_prunes_stale_version(tmp_path, monkeypatch):
+    """After a _SCRIPT_VERSION bump, the old blob is deleted on the next cache write."""
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    src = tmp_path / "mini.jsonl"
+    src.write_text(_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    # Write cache under old version.
+    monkeypatch.setattr(sm, "_SCRIPT_VERSION", "1.1.0-test-old")
+    sm._cached_parse_jsonl(src, use_cache=True)
+    assert len(list((tmp_path / "parse").glob("*.pkl"))) == 1
+    # Bump version to force a cache miss.
+    monkeypatch.setattr(sm, "_SCRIPT_VERSION", "1.1.0-test-new")
+    sm._cached_parse_jsonl(src, use_cache=True)
+    # Only the new-version blob must survive.
+    blobs = list((tmp_path / "parse").glob("*.pkl"))
+    assert len(blobs) == 1
+    assert "1.1.0-test-new" in blobs[0].name
+
+
+def test_cached_parse_prune_does_not_touch_other_jsonls(tmp_path, monkeypatch):
+    """Pruning blobs for source A must not delete blobs for source B."""
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    src_a = tmp_path / "session_a.jsonl"
+    src_b = tmp_path / "session_b.jsonl"
+    content = _FIXTURE.read_text(encoding="utf-8")
+    src_a.write_text(content, encoding="utf-8")
+    src_b.write_text(content, encoding="utf-8")
+    # Prime both caches.
+    sm._cached_parse_jsonl(src_a, use_cache=True)
+    sm._cached_parse_jsonl(src_b, use_cache=True)
+    assert len(list((tmp_path / "parse").glob("*.pkl"))) == 2
+    # Touch A to cause a prune on A's blobs only.
+    import os
+    stat = src_a.stat()
+    os.utime(src_a, (stat.st_atime, stat.st_mtime + 2))
+    sm._cached_parse_jsonl(src_a, use_cache=True)
+    blobs = list((tmp_path / "parse").glob("*.pkl"))
+    # Still 2 blobs: A (new) + B (untouched).
+    assert len(blobs) == 2
+    # B's blob must still be intact and loadable.
+    entries_b = sm._cached_parse_jsonl(src_b, use_cache=True)
+    assert isinstance(entries_b, list)
+
+
+def test_cached_parse_prune_failure_is_non_fatal(tmp_path, monkeypatch):
+    """An OSError during prune must not propagate — entries are still returned."""
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    src = tmp_path / "mini.jsonl"
+    src.write_text(_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    # Prime cache, then bump mtime to trigger a cache miss + write + prune.
+    sm._cached_parse_jsonl(src, use_cache=True)
+    import os
+    stat = src.stat()
+    os.utime(src, (stat.st_atime, stat.st_mtime + 2))
+    # Make the parse dir read-only so glob() raises OSError.
+    cache_dir = tmp_path / "parse"
+    cache_dir.chmod(0o500)
+    try:
+        result = sm._cached_parse_jsonl(src, use_cache=True)
+        # Must still return parsed entries — prune failure is non-fatal.
+        assert isinstance(result, list)
+        assert len(result) > 0
+    finally:
+        cache_dir.chmod(0o700)
 
 
 def test_hour_of_day_dst_boundary_uses_fixed_offset():
