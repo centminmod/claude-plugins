@@ -3,6 +3,24 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.36.0 — 2026-04-30
+
+### Sharing-time hygiene — `--export-share-safe` one-flag pre-share gesture (P5)
+
+Closes the audit-driven plan's Priority 5 block. Adds a single CLI flag for the common "I'm about to publish or paste this somewhere" workflow, plus README / SKILL.md guidance documenting the redact + share-safe surfaces.
+
+**P5.1 — Documentation for `--redact-user-prompts` + `--export-share-safe`.**
+The README gains a new *Sharing exports safely* subsection under *Privacy* with an at-a-glance table of which surfaces are redacted (JSON + compare HTML) versus chmod-only (HTML / MD / CSV / text). The most-used-commands block gains an `--export-share-safe` example. SKILL.md documents both flags in the *Other useful flags* table.
+
+**P5.2 — `--export-share-safe` flag.**
+One-flag bundle that implies `--redact-user-prompts` and `--no-self-cost`, and chmods every written export file to `0o600` (`rw-------`) immediately after the write. Wired through `_write_output`, `_dispatch`, `_dispatch_instance`, plus the compare-mode write sites (`_run_compare`, `_run_compare_run`, `_emit_compare_run_extras`) and the split-HTML / per-project drilldown writers — every export-file write site is covered. Implication is applied in `main()` after `parse_args` so all downstream code paths read a consistent argparse namespace regardless of which combination the user typed. Verified end-to-end against a real 361-turn session: 198 turns redacted, 0 with verbatim prompt text, `self_cost` absent from JSON, both files chmod'd to `-rw-------`. Help text explicitly documents the JSON-only redaction caveat (HTML / MD / CSV / text are chmod'd but contain verbatim prompts) so users pair `--export-share-safe` with `--output json` for full redaction.
+
+### Tests
+
+3 new regression tests (argparse implication: `--export-share-safe → redact + no_self_cost`; chmod 0o600 on a written file with `share_safe=True`; default `share_safe=False` does NOT chmod). 643 total tests pass (1 skipped).
+
+---
+
 ## v1.35.0 — 2026-04-29
 
 ### Insight + sharing — P2 batch (warmup-trigger length cap + JSON redaction)

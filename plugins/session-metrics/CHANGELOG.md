@@ -3,6 +3,24 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.36.0 — 2026-04-30
+
+### Sharing-time hygiene — `--export-share-safe` one-flag pre-share gesture
+
+Adds a single CLI flag for the common "I'm about to publish or paste this somewhere" workflow, plus README / SKILL.md guidance documenting which export surfaces redact and which only chmod.
+
+**Documentation — `--redact-user-prompts` + `--export-share-safe`.**
+The README gains a *Sharing exports safely* subsection under *Privacy* with an at-a-glance table of redacted (JSON + compare HTML) versus chmod-only (HTML / MD / CSV / text) surfaces. Most-used-commands block gains an `--export-share-safe` example. SKILL.md *Other useful flags* table documents both `--redact-user-prompts` and `--export-share-safe`.
+
+**`--export-share-safe` flag.**
+One-flag bundle that implies `--redact-user-prompts` and `--no-self-cost`, and chmods every written export file to `0o600` (`rw-------`) immediately after the write. Wired through every export write site — single-session, project, instance JSON / HTML / MD / CSV, the split-HTML / per-project drilldown writers, plus the compare-mode and compare-run-extras writers. Verified end-to-end against a real 361-turn session: 198 turns redacted, 0 verbatim, `self_cost` absent, both files chmod'd to `-rw-------`. Help text explicitly documents the JSON-only redaction caveat (HTML / MD / CSV / text are chmod'd but contain verbatim prompts) so users pair `--export-share-safe` with `--output json` for full redaction.
+
+### Tests
+
+3 new regression tests (argparse implication; chmod 0o600 on a `share_safe=True` write; default-off does NOT chmod). 643 total tests pass (1 skipped).
+
+---
+
 ## v1.35.0 — 2026-04-29
 
 ### Insight + sharing — P2 batch (warmup-trigger length cap + JSON redaction)

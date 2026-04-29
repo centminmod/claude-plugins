@@ -9159,7 +9159,8 @@ def _export_dir() -> Path:
 
 def _write_output(fmt: str, content: str, report: dict,
                    suffix: str = "",
-                   explicit_ts: str | None = None) -> Path:
+                   explicit_ts: str | None = None,
+                   share_safe: bool = False) -> Path:
     """Write ``content`` to an export file; ``suffix`` is appended before
     the extension (e.g. ``"_dashboard"``, ``"_detail"``).
 
@@ -9167,6 +9168,11 @@ def _write_output(fmt: str, content: str, report: dict,
     filename. Used by ``_emit_compare_run_extras`` so a bundle of companion
     files (per-session dashboards + analysis.md) all share the same
     timestamp and the Markdown href links resolve.
+
+    ``share_safe`` chmods the file to ``0o600`` (rw-------) immediately
+    after the write. Set by ``--export-share-safe`` so single-user shells
+    can drop exports into shared directories (Dropbox, etc.) without
+    accidentally publishing freeform prompt text.
     """
     out_dir = _export_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -9183,6 +9189,8 @@ def _write_output(fmt: str, content: str, report: dict,
         stem = f"session_{sid}_{ts}"
     path = out_dir / f"{stem}{suffix}.{_EXTENSIONS[fmt]}"
     path.write_text(content, encoding="utf-8")
+    if share_safe:
+        path.chmod(0o600)
     return path
 
 
@@ -9297,7 +9305,9 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
                          cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
                          subagent_attribution: bool = True,
                          sort_prompts_by: str | None = None,
-                         no_self_cost: bool = False) -> None:
+                         no_self_cost: bool = False,
+                         redact_user_prompts: bool = False,
+                         share_safe: bool = False) -> None:
     print(f"Session : {jsonl_path.stem}", file=sys.stderr)
     print(f"File    : {jsonl_path}", file=sys.stderr)
     print(file=sys.stderr)
@@ -9323,7 +9333,9 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
     )
     self_cost = report.pop("self_cost", None) if no_self_cost else report.get("self_cost")
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib,
-              idle_gap_minutes=idle_gap_minutes)
+              idle_gap_minutes=idle_gap_minutes,
+              redact_user_prompts=redact_user_prompts,
+              share_safe=share_safe)
     if not no_self_cost and self_cost:
         _print_self_cost_summary(self_cost)
 
@@ -9339,7 +9351,9 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
                       cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
                       subagent_attribution: bool = True,
                       sort_prompts_by: str | None = None,
-                      no_self_cost: bool = False) -> None:
+                      no_self_cost: bool = False,
+                      redact_user_prompts: bool = False,
+                      share_safe: bool = False) -> None:
     files = _find_jsonl_files(slug)
     if not files:
         print(f"[error] No sessions found for slug: {slug}", file=sys.stderr)
@@ -9372,7 +9386,9 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
     )
     self_cost = report.pop("self_cost", None) if no_self_cost else report.get("self_cost")
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib,
-              idle_gap_minutes=idle_gap_minutes)
+              idle_gap_minutes=idle_gap_minutes,
+              redact_user_prompts=redact_user_prompts,
+              share_safe=share_safe)
     if not no_self_cost and self_cost:
         _print_self_cost_summary(self_cost)
 
@@ -9785,7 +9801,8 @@ def _run_all_projects(formats: list[str],
                       suppress_model_compare_insight: bool = False,
                       cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
                       subagent_attribution: bool = True,
-                      sort_prompts_by: str | None = None) -> None:
+                      sort_prompts_by: str | None = None,
+                      share_safe: bool = False) -> None:
     projects_dir = _projects_dir()
     print(f"Scanning: {projects_dir}", file=sys.stderr)
     discovered = _list_all_projects()
@@ -9894,7 +9911,8 @@ def _run_all_projects(formats: list[str],
     _dispatch_instance(instance_report, project_reports, formats,
                         chart_lib=chart_lib,
                         idle_gap_minutes=idle_gap_minutes,
-                        drilldown=drilldown)
+                        drilldown=drilldown,
+                        share_safe=share_safe)
 
 
 def _instance_export_root(now: datetime | None = None) -> Path:
@@ -9909,7 +9927,8 @@ def _dispatch_instance(instance_report: dict,
                         formats: list[str],
                         chart_lib: str = "highcharts",
                         idle_gap_minutes: int = 10,
-                        drilldown: bool = True) -> None:
+                        drilldown: bool = True,
+                        share_safe: bool = False) -> None:
     """Write all instance exports (and, optionally, per-project drilldown
     HTMLs) into a dated subfolder so successive runs don't overwrite each
     other. The instance ``index.html`` uses relative ``projects/<slug>.html``
@@ -9943,6 +9962,8 @@ def _dispatch_instance(instance_report: dict,
             content = _RENDERERS[fmt](instance_report)
         out = root / f"index.{_EXTENSIONS[fmt]}"
         out.write_text(content, encoding="utf-8")
+        if share_safe:
+            out.chmod(0o600)
         written.append((fmt, out))
         print(f"[export] {fmt.upper():4} → {out}", file=sys.stderr)
 
@@ -9965,10 +9986,13 @@ def _dispatch_instance(instance_report: dict,
                 print(f"[warn] {slug}: HTML render failed ({exc})",
                       file=sys.stderr)
                 continue
-            (root / "projects" / f"{slug}_dashboard.html").write_text(
-                dash_html, encoding="utf-8")
-            (root / "projects" / f"{slug}_detail.html").write_text(
-                det_html, encoding="utf-8")
+            dash_p = root / "projects" / f"{slug}_dashboard.html"
+            det_p  = root / "projects" / f"{slug}_detail.html"
+            dash_p.write_text(dash_html, encoding="utf-8")
+            det_p.write_text(det_html, encoding="utf-8")
+            if share_safe:
+                dash_p.chmod(0o600)
+                det_p.chmod(0o600)
             drilldown_slugs.add(slug)
         print(f"[export] per-project drilldowns → {root / 'projects'}",
               file=sys.stderr)
@@ -10581,7 +10605,8 @@ def _dispatch(report: dict, formats: list[str],
                single_page: bool = False,
                chart_lib: str = "highcharts",
                idle_gap_minutes: int = 10,
-               redact_user_prompts: bool = False) -> None:
+               redact_user_prompts: bool = False,
+               share_safe: bool = False) -> None:
     # Always render text to stdout
     print(render_text(report))
 
@@ -10600,7 +10625,7 @@ def _dispatch(report: dict, formats: list[str],
             content = smc.render_compare_html(
                 report, redact_user_prompts=redact_user_prompts,
             )
-            path = _write_output(fmt, content, report)
+            path = _write_output(fmt, content, report, share_safe=share_safe)
             print(f"[export] HTML (compare) → {path}", file=sys.stderr)
             continue
         if fmt == "html" and not single_page:
@@ -10623,6 +10648,9 @@ def _dispatch(report: dict, formats: list[str],
             _export_dir().mkdir(parents=True, exist_ok=True)
             p1.write_text(dash, encoding="utf-8")
             p2.write_text(det,  encoding="utf-8")
+            if share_safe:
+                p1.chmod(0o600)
+                p2.chmod(0o600)
             print(f"[export] HTML (dashboard) → {p1}", file=sys.stderr)
             print(f"[export] HTML (detail)    → {p2}", file=sys.stderr)
             continue
@@ -10633,7 +10661,7 @@ def _dispatch(report: dict, formats: list[str],
             content = render_json(report, redact_user_prompts=redact_user_prompts)
         else:
             content = _RENDERERS[fmt](report)
-        path = _write_output(fmt, content, report)
+        path = _write_output(fmt, content, report, share_safe=share_safe)
         print(f"[export] {fmt.upper():4} → {path}", file=sys.stderr)
 
 
@@ -10744,6 +10772,18 @@ def _build_parser() -> argparse.ArgumentParser:
                         "Only meaningful at session and project scope; "
                         "instance scope (--all-projects) does not compute "
                         "self-cost.")
+    p.add_argument("--export-share-safe", action="store_true",
+                   help="One-flag pre-share gesture for exports published "
+                        "to articles, gists, or shared folders. Implies "
+                        "--redact-user-prompts and --no-self-cost, and "
+                        "chmods every written export file to 0600 "
+                        "(rw-------) immediately after the write. "
+                        "Caveat: full prompt-text redaction only applies "
+                        "to JSON exports and compare HTML — HTML / MD / "
+                        "CSV / text exports are still chmod'd but contain "
+                        "verbatim prompt text. For maximum redaction "
+                        "before publishing, prefer --output json. "
+                        "No-op for instance JSON (no per-turn records).")
     p.add_argument("--chart-lib", metavar="LIB",
                    choices=sorted(CHART_RENDERERS.keys()),
                    default="highcharts",
@@ -11022,6 +11062,15 @@ def _load_compare_module():
 
 def main() -> None:
     args = _build_parser().parse_args()
+    # P5.2: --export-share-safe is a one-flag bundle that implies
+    # --redact-user-prompts and --no-self-cost (chmod 0600 is wired
+    # separately at every export write site via the share_safe param).
+    # Set the implications here so all downstream code paths read a
+    # consistent argparse namespace regardless of which flag combination
+    # the user actually typed.
+    if getattr(args, "export_share_safe", False):
+        args.redact_user_prompts = True
+        args.no_self_cost = True
     slug = args.slug or _env_slug() or _cwd_to_slug()
     _validate_slug(slug)
     formats: list[str] = args.output or []
@@ -11175,6 +11224,7 @@ def main() -> None:
             single_page=args.single_page,
             chart_lib=chart_lib,
             redact_user_prompts=args.redact_user_prompts,
+            share_safe=args.export_share_safe,
             tz_offset=tz_offset,
             tz_label=tz_label,
             use_cache=not args.no_cache,
@@ -11236,6 +11286,7 @@ def main() -> None:
             prompt_suite_dir=suite_dir,
             allow_suite_mismatch=args.allow_suite_mismatch,
             redact_user_prompts=args.redact_user_prompts,
+            share_safe=args.export_share_safe,
             effort_a=effort_a_compare,
             effort_b=effort_b_compare,
         )
@@ -11260,6 +11311,7 @@ def main() -> None:
             cache_break_threshold=args.cache_break_threshold,
             subagent_attribution=not args.no_subagent_attribution,
             sort_prompts_by=args.sort_prompts_by,
+            share_safe=args.export_share_safe,
         )
         return
 
@@ -11277,6 +11329,8 @@ def main() -> None:
             subagent_attribution=not args.no_subagent_attribution,
             sort_prompts_by=args.sort_prompts_by,
             no_self_cost=args.no_self_cost,
+            redact_user_prompts=args.redact_user_prompts,
+            share_safe=args.export_share_safe,
         )
         return
 
@@ -11293,6 +11347,8 @@ def main() -> None:
         subagent_attribution=not args.no_subagent_attribution,
         sort_prompts_by=args.sort_prompts_by,
         no_self_cost=args.no_self_cost,
+        redact_user_prompts=args.redact_user_prompts,
+        share_safe=args.export_share_safe,
     )
 
 

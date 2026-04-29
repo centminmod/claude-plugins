@@ -149,6 +149,8 @@ project root, named `session_<id8>_<YYYYMMDD_HHMMSS>.<ext>` (single) or
 | `--utc-offset <H>`           | Fixed UTC offset, DST-naive. Use `--tz` for DST-aware. |
 | `--no-cache`                 | Skip `~/.cache/session-metrics/parse/` and always re-parse from scratch. |
 | `--no-self-cost`             | Suppress the self-cost meta-metric (stderr `[self-cost]` line, HTML KPI card, and JSON `self_cost` key). |
+| `--redact-user-prompts`      | Replace freeform `prompt_text` / `prompt_snippet` / `assistant_text` / `assistant_snippet` with `[redacted]` on every turn of single-session and project **JSON** exports, plus compare HTML. Tool inputs, slash-command names, and structured cost / token fields stay visible. HTML / MD / CSV / text are NOT redacted. |
+| `--export-share-safe`        | One-flag pre-share gesture (v1.36.0+): implies `--redact-user-prompts` and `--no-self-cost`, and chmods every written export file to `0600` (`rw-------`). For full prompt redaction, pair with `--output json`. |
 | `--no-include-subagents`     | Skip spawned subagent JSONL files. Subagents are included by default; use this for faster runs when subagent detail is not needed. |
 | `--cache-break-threshold <N>` | Turns whose `input + cache_creation` exceed N are flagged as **cache-break events** (default 100 000). Matches Anthropic's `session-report` convention. |
 | `--no-subagent-attribution`  | Disable Phase-B subagent → parent-prompt token attribution. Default behaviour rolls every subagent's tokens up onto the user prompt that spawned the chain (additional `attributed_subagent_*` fields, no double-counting). |

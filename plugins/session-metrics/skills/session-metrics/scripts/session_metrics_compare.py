@@ -3169,6 +3169,7 @@ def _run_compare(
     prompt_suite_dir: Path | None = None,
     allow_suite_mismatch: bool = False,
     redact_user_prompts: bool = False,
+    share_safe: bool = False,
     effort_a: str | None = None,
     effort_b: str | None = None,
 ) -> dict | None:
@@ -3246,7 +3247,8 @@ def _run_compare(
         )
         m._dispatch(report, formats, single_page=single_page,
                     chart_lib=chart_lib,
-                    redact_user_prompts=redact_user_prompts)
+                    redact_user_prompts=redact_user_prompts,
+                    share_safe=share_safe)
         return report
 
     # compare_mode == "controlled" — Mode 1
@@ -3292,7 +3294,8 @@ def _run_compare(
         sys.exit(1)
     m._dispatch(report, formats, single_page=single_page,
                 chart_lib=chart_lib,
-                redact_user_prompts=redact_user_prompts)
+                redact_user_prompts=redact_user_prompts,
+                share_safe=share_safe)
     return report
 
 
@@ -4139,6 +4142,7 @@ def _run_compare_run(
     single_page: bool = False,
     chart_lib: str = "highcharts",
     redact_user_prompts: bool = False,
+    share_safe: bool = False,
     tz_offset: float = 0.0,
     tz_label: str = "UTC",
     use_cache: bool = True,
@@ -4337,6 +4341,7 @@ def _run_compare_run(
             prompt_suite_dir=suite_dir,
             allow_suite_mismatch=allow_suite_mismatch,
             redact_user_prompts=redact_user_prompts,
+            share_safe=share_safe,
             effort_a=effort_a,
             effort_b=effort_b,
         )
@@ -4360,6 +4365,7 @@ def _run_compare_run(
                     include_subagents=include_subagents,
                     use_cache=use_cache,
                     progress_out=progress_out,
+                    share_safe=share_safe,
                 )
             except Exception as exc:  # noqa: BLE001
                 # Never fail the whole compare-run because extras emission
@@ -4975,6 +4981,7 @@ def _emit_compare_run_extras(
     include_subagents: bool,
     use_cache: bool,
     progress_out=None,
+    share_safe: bool = False,
 ) -> dict:
     """Emit the 5 per-session + analysis.md companion artefacts.
 
@@ -5087,6 +5094,9 @@ def _emit_compare_run_extras(
                 det_path = out_dir / det_name
                 dash_path.write_text(dash, encoding="utf-8")
                 det_path.write_text(det, encoding="utf-8")
+                if share_safe:
+                    dash_path.chmod(0o600)
+                    det_path.chmod(0o600)
                 diagnostic[side_key]["html_dashboard"] = dash_path
                 diagnostic[side_key]["html_detail"] = det_path
                 print(
@@ -5106,7 +5116,8 @@ def _emit_compare_run_extras(
             else:
                 content = m._RENDERERS[fmt](report)
             path = m._write_output(fmt, content, report,
-                                   explicit_ts=export_ts)
+                                   explicit_ts=export_ts,
+                                   share_safe=share_safe)
             diagnostic[side_key][fmt] = path
             print(
                 f"[export] side {side_label} {fmt.upper():4} → {path}",
@@ -5159,6 +5170,7 @@ def _emit_compare_run_extras(
     analysis_path = m._write_output(
         "md", content, compare_report,
         suffix="_analysis", explicit_ts=export_ts,
+        share_safe=share_safe,
     )
     diagnostic["analysis_md"] = analysis_path
     print(
