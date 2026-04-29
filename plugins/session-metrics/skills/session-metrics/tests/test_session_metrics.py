@@ -8512,6 +8512,98 @@ def test_audit_extract_cache_break_severity_downgrades_when_rare():
     assert "0.5%" in cb["downgrade_reason"]
 
 
+def test_audit_extract_input_rate_for_model_table():
+    """P1.2 regression — _input_rate_for_model returns the correct $/M rate for
+    each canonical model family. Previously a single OPUS_INPUT_RATE_PER_M=$5
+    was applied uniformly, overstating Sonnet impact by 67% and Haiku by 400%."""
+    ae = _load_audit_extract()
+    assert ae._input_rate_for_model("claude-opus-4-7") == 5.00
+    assert ae._input_rate_for_model("claude-opus-4-1") == 15.00
+    assert ae._input_rate_for_model("claude-sonnet-4-6") == 3.00
+    assert ae._input_rate_for_model("claude-haiku-4-5-20251001") == 1.00
+    assert ae._input_rate_for_model("claude-3-5-haiku") == 0.80
+    # Substring matching still works on family-only strings.
+    assert ae._input_rate_for_model("claude-haiku") == 1.00
+    # Unknown / missing / synthetic → default fallback (Sonnet rate).
+    assert ae._input_rate_for_model("") == ae._DEFAULT_INPUT_RATE_PER_M
+    assert ae._input_rate_for_model(None) == ae._DEFAULT_INPUT_RATE_PER_M
+    assert ae._input_rate_for_model("<synthetic>") == ae._DEFAULT_INPUT_RATE_PER_M
+    assert ae._input_rate_for_model("gpt-5.5") == ae._DEFAULT_INPUT_RATE_PER_M
+
+
+def test_audit_extract_cache_break_impact_uses_per_break_model():
+    """P1.2 regression — cache_break impact is summed per-break with each
+    break's own model rate, not the Opus rate applied to all of them.
+    A 200k-token Haiku break must cost $0.20, not $1.00."""
+    ae = _load_audit_extract()
+    data = _audit_min_export(
+        cache_breaks=[{
+            "turn_index": 5, "uncached": 200_000, "cache_break_pct": 100,
+            "session_id": "s", "timestamp": "", "timestamp_fmt": "",
+            "total_tokens": 200_000, "prompt_snippet": "",
+            "slash_command": "", "model": "claude-haiku-4-5-20251001",
+            "context": [],
+        }],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    cb = next(t for t in digest["fired_triggers"] if t["metric"] == "cache_break")
+    # 200k × $1/M (Haiku) = $0.20, not $1.00 (Opus)
+    assert cb["estimated_impact_usd"] == pytest.approx(0.20, abs=0.01)
+    assert "claude-haiku-4-5-20251001" in cb["impact_basis"]
+    assert "$1.00/M" in cb["impact_basis"]
+
+
+def test_audit_extract_cache_break_impact_mixed_models():
+    """P1.2 regression — mixed-model cache_breaks sum their respective rates
+    instead of multiplying total uncached by a single rate."""
+    ae = _load_audit_extract()
+    data = _audit_min_export(
+        cache_breaks=[
+            {"turn_index": 5, "uncached": 100_000, "cache_break_pct": 100,
+             "session_id": "s", "timestamp": "", "timestamp_fmt": "",
+             "total_tokens": 100_000, "prompt_snippet": "", "slash_command": "",
+             "model": "claude-opus-4-7", "context": []},
+            {"turn_index": 7, "uncached": 100_000, "cache_break_pct": 100,
+             "session_id": "s", "timestamp": "", "timestamp_fmt": "",
+             "total_tokens": 100_000, "prompt_snippet": "", "slash_command": "",
+             "model": "claude-haiku-4-5-20251001", "context": []},
+        ],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    cb = next(t for t in digest["fired_triggers"] if t["metric"] == "cache_break")
+    # 100k × $5/M (Opus) + 100k × $1/M (Haiku) = $0.50 + $0.10 = $0.60
+    assert cb["estimated_impact_usd"] == pytest.approx(0.60, abs=0.01)
+    assert "mixed models" in cb["impact_basis"]
+    assert "claude-opus-4-7" in cb["impact_basis"]
+    assert "claude-haiku-4-5-20251001" in cb["impact_basis"]
+
+
+def test_audit_extract_idle_gap_cache_decay_uses_turn_model():
+    """P1.2 regression — _detect_idle_gap_cache_decay uses each turn's own
+    model for the rebuild cost. A Sonnet rebuild must cost 60% of an Opus
+    rebuild for the same token count."""
+    ae = _load_audit_extract()
+    turns = [
+        _audit_min_turn(index=1, timestamp="2026-04-29T10:00:00Z",
+                        cache_write_tokens=10, input_tokens=100,
+                        cache_read_tokens=0, model="claude-sonnet-4-6"),
+        _audit_min_turn(index=2, timestamp="2026-04-29T10:06:00Z",
+                        cache_write_tokens=200_000, input_tokens=100,
+                        cache_read_tokens=0, model="claude-sonnet-4-6"),
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 2, "cost": 1.0,
+                "output": 100, "total_input": 200},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "quick")
+    fired = next((t for t in digest["fired_triggers"]
+                  if t["metric"] == "idle_gap_cache_decay"), None)
+    assert fired is not None
+    # 200k × $3/M (Sonnet) = $0.60, not $1.00 (Opus)
+    assert fired["estimated_impact_usd"] == pytest.approx(0.60, abs=0.01)
+
+
 def test_audit_extract_top_turn_share_fires_above_30pct():
     ae = _load_audit_extract()
     turns = [
@@ -8663,12 +8755,15 @@ def test_audit_extract_top_turns_hypothesis_classification():
 
 def test_audit_extract_detailed_mode_includes_candidates():
     ae = _load_audit_extract()
-    # File re-read fixture: 3 reads of same file
+    # File re-read fixture: 3 reads of same file. The session-metrics export
+    # schema serialises Read's path as `input_preview` (a string), not a
+    # nested `input.file_path` dict — see _summarise_tool_input in
+    # session-metrics.py.
     turns = []
     for i in range(1, 4):
         turns.append(_audit_min_turn(
             index=i, tool_use_names=["Read"],
-            tool_use_detail=[{"name": "Read", "input": {"file_path": "/x/y.py"}}],
+            tool_use_detail=[{"name": "Read", "input_preview": "/x/y.py"}],
         ))
     data = _audit_min_export(
         totals={**_audit_min_export()["totals"], "turns": 3},
@@ -8678,6 +8773,29 @@ def test_audit_extract_detailed_mode_includes_candidates():
     assert "detailed_candidates" in digest
     re_reads = digest["detailed_candidates"]["file_re_reads"]
     assert any(r["file_path"] == "/x/y.py" and r["read_count"] == 3 for r in re_reads)
+
+
+def test_audit_extract_file_re_reads_ignores_legacy_input_dict_shape():
+    """Regression guard for P1.1 — the detector must NOT reach for
+    `input.file_path`. Old assumption was that tool_use_detail carried a
+    structured `input` dict; the actual export only has `input_preview`.
+    Feeding the legacy shape must produce zero re-reads, proving the
+    detector reads the documented field rather than silently hitting a
+    nested key that no real export contains."""
+    ae = _load_audit_extract()
+    turns = [
+        _audit_min_turn(
+            index=i, tool_use_names=["Read"],
+            tool_use_detail=[{"name": "Read", "input": {"file_path": "/x/y.py"}}],
+        )
+        for i in range(1, 4)
+    ]
+    data = _audit_min_export(
+        totals={**_audit_min_export()["totals"], "turns": 3},
+        sessions=[{"subtotal": {}, "turns": turns}],
+    )
+    digest = ae.build_digest(data, "/p/session_t_20260101T000000Z.json", "detailed")
+    assert digest["detailed_candidates"]["file_re_reads"] == []
 
 
 def test_audit_extract_quick_mode_omits_detailed_candidates():
@@ -9420,3 +9538,179 @@ def test_audit_new_reference_files_have_schema_v1_3():
         m = re.search(r"JSON schema \(v([\d.]+)\)", text)
         assert m is not None, f"{fname} missing 'JSON schema (vX.Y)' header"
         assert m.group(1) == "1.3", f"{fname} schema version should be 1.3, got {m.group(1)}"
+
+
+# --- P1.3 — _BASH_PATH_RE must require ≥1 leading dot OR start-of-arg boundary
+
+def test_detect_file_reaccesses_ignores_hidden_dir_path_in_bash():
+    """P1.3 regression: ``.claude/skills/foo.py`` in a Bash command must NOT
+    be captured as ``/skills/foo.py``. The old regex allowed zero leading
+    dots (``\\.{0,2}/``), which silently merged same-suffix files across
+    different project subtrees in the re-read detector.
+    """
+    turns = [
+        {"index": 0, "_ctx_seg": 0, "cost_usd": 0.0,
+         "tool_use_detail": [{"name": "Bash",
+                              "input_preview": "cat .claude/skills/foo.py"}]},
+        {"index": 1, "_ctx_seg": 0, "cost_usd": 0.0,
+         "tool_use_detail": [{"name": "Bash",
+                              "input_preview": "cat other-project/skills/foo.py"}]},
+    ]
+    result = sm._detect_file_reaccesses(turns)
+    paths_seen = {d["path"] for d in result["details"]}
+    assert "/skills/foo.py" not in paths_seen
+    assert result["reaccessed_count"] == 0
+
+
+def test_detect_file_reaccesses_keeps_dot_relative_bash_path():
+    """Sanity: ``./scripts/run.py`` accessed twice in the same segment is
+    still flagged as a re-read after the boundary fix."""
+    turns = [
+        {"index": 0, "_ctx_seg": 0, "cost_usd": 0.10,
+         "tool_use_detail": [{"name": "Bash",
+                              "input_preview": "cat ./scripts/run.py"}]},
+        {"index": 1, "_ctx_seg": 0, "cost_usd": 0.10,
+         "tool_use_detail": [{"name": "Bash",
+                              "input_preview": "head -n 10 ./scripts/run.py"}]},
+    ]
+    result = sm._detect_file_reaccesses(turns)
+    assert result["reaccessed_count"] == 1
+    assert result["details"][0]["path"] == "./scripts/run.py"
+    assert result["details"][0]["count"] == 2
+
+
+def test_detect_file_reaccesses_keeps_absolute_bash_path():
+    """Sanity: ``/etc/hosts.conf`` (start-of-arg boundary) still matches."""
+    turns = [
+        {"index": 0, "_ctx_seg": 0, "cost_usd": 0.0,
+         "tool_use_detail": [{"name": "Bash",
+                              "input_preview": "cat /etc/hosts.conf"}]},
+        {"index": 1, "_ctx_seg": 0, "cost_usd": 0.0,
+         "tool_use_detail": [{"name": "Bash",
+                              "input_preview": "diff /etc/hosts.conf /tmp/x"}]},
+    ]
+    result = sm._detect_file_reaccesses(turns)
+    assert result["reaccessed_count"] == 1
+    assert result["details"][0]["path"] == "/etc/hosts.conf"
+
+
+def test_detect_file_reaccesses_keeps_tilde_home_bash_path():
+    """Sanity: ``~/dotfiles/zshrc.sh`` (tilde branch) still matches."""
+    turns = [
+        {"index": 0, "_ctx_seg": 0, "cost_usd": 0.0,
+         "tool_use_detail": [{"name": "Bash",
+                              "input_preview": "cat ~/dotfiles/zshrc.sh"}]},
+        {"index": 1, "_ctx_seg": 0, "cost_usd": 0.0,
+         "tool_use_detail": [{"name": "Bash",
+                              "input_preview": "wc -l ~/dotfiles/zshrc.sh"}]},
+    ]
+    result = sm._detect_file_reaccesses(turns)
+    assert result["reaccessed_count"] == 1
+    assert result["details"][0]["path"] == "~/dotfiles/zshrc.sh"
+
+
+# --- P1.4 — total_reaccess_cost must use marginal-per-tool-call attribution
+
+def test_detect_file_reaccesses_cost_uses_marginal_per_tool_attribution():
+    """P1.4 regression: a turn that runs 5 tool calls but only 1 of them
+    reads the re-accessed path must contribute 1/5 of its turn cost, not
+    the full turn cost. The old detector summed the entire turn cost for
+    any turn that touched the path, over-attributing waste massively
+    (e.g. Session 112 attributed $1.11 = 54% of cost on 1 Bash arg).
+    """
+    turns = [
+        {
+            "index": 0, "_ctx_seg": 0, "cost_usd": 1.00,
+            "tool_use_detail": [
+                {"name": "Read", "input_preview": "/repo/foo.py"},
+                {"name": "Bash", "input_preview": "ls /etc"},
+                {"name": "Bash", "input_preview": "echo hi"},
+                {"name": "Bash", "input_preview": "true"},
+                {"name": "Bash", "input_preview": "false"},
+            ],
+        },
+        {
+            "index": 1, "_ctx_seg": 0, "cost_usd": 0.0,
+            "tool_use_detail": [{"name": "Read", "input_preview": "/repo/foo.py"}],
+        },
+    ]
+    result = sm._detect_file_reaccesses(turns)
+    detail = next(d for d in result["details"] if d["path"] == "/repo/foo.py")
+    # Turn 0: 1 of 5 tool calls hit the path → 1/5 × $1.00 = $0.20
+    # Turn 1: 1 of 1, $0.00 → $0.00
+    assert detail["cost_usd"] == pytest.approx(0.20, abs=1e-6)
+    assert result["total_reaccess_cost"] == pytest.approx(0.20, abs=1e-6)
+
+
+def test_detect_file_reaccesses_cost_singleton_turns_unchanged():
+    """When every tool call in every relevant turn reads the path, the
+    sum of turn costs is preserved (no over-attribution to fix here)."""
+    turns = [
+        {
+            "index": 0, "_ctx_seg": 0, "cost_usd": 0.50,
+            "tool_use_detail": [{"name": "Read", "input_preview": "/repo/foo.py"}],
+        },
+        {
+            "index": 1, "_ctx_seg": 0, "cost_usd": 0.30,
+            "tool_use_detail": [{"name": "Read", "input_preview": "/repo/foo.py"}],
+        },
+    ]
+    result = sm._detect_file_reaccesses(turns)
+    detail = next(d for d in result["details"] if d["path"] == "/repo/foo.py")
+    assert detail["cost_usd"] == pytest.approx(0.80, abs=1e-6)
+
+
+def test_detect_file_reaccesses_cost_multiple_path_reads_in_same_turn():
+    """A turn that reads the path multiple times scales by
+    (path_reads / total_tool_calls), not 1.0 nor path_reads alone."""
+    turns = [
+        {
+            "index": 0, "_ctx_seg": 0, "cost_usd": 1.00,
+            "tool_use_detail": [
+                {"name": "Read", "input_preview": "/repo/foo.py"},
+                {"name": "Read", "input_preview": "/repo/foo.py"},
+                {"name": "Bash", "input_preview": "true"},
+                {"name": "Bash", "input_preview": "false"},
+            ],
+        },
+        {
+            "index": 1, "_ctx_seg": 0, "cost_usd": 0.0,
+            "tool_use_detail": [{"name": "Read", "input_preview": "/repo/foo.py"}],
+        },
+    ]
+    result = sm._detect_file_reaccesses(turns)
+    detail = next(d for d in result["details"] if d["path"] == "/repo/foo.py")
+    # Turn 0: 2 of 4 tool calls hit the path → 2/4 × $1.00 = $0.50
+    assert detail["cost_usd"] == pytest.approx(0.50, abs=1e-6)
+
+
+def test_detect_file_reaccesses_cost_two_paths_share_turn_proportionally():
+    """Two re-read paths sharing the same multi-tool turn each get their
+    own proportional slice; the sum across paths is bounded by the turn
+    cost (the previous bug double-counted the full turn cost per path)."""
+    turns = [
+        {
+            "index": 0, "_ctx_seg": 0, "cost_usd": 1.00,
+            "tool_use_detail": [
+                {"name": "Read", "input_preview": "/repo/a.py"},
+                {"name": "Read", "input_preview": "/repo/b.py"},
+                {"name": "Bash", "input_preview": "true"},
+                {"name": "Bash", "input_preview": "false"},
+            ],
+        },
+        {
+            "index": 1, "_ctx_seg": 0, "cost_usd": 0.0,
+            "tool_use_detail": [
+                {"name": "Read", "input_preview": "/repo/a.py"},
+                {"name": "Read", "input_preview": "/repo/b.py"},
+            ],
+        },
+    ]
+    result = sm._detect_file_reaccesses(turns)
+    a = next(d for d in result["details"] if d["path"] == "/repo/a.py")
+    b = next(d for d in result["details"] if d["path"] == "/repo/b.py")
+    # Each path: 1/4 × $1.00 = $0.25
+    assert a["cost_usd"] == pytest.approx(0.25, abs=1e-6)
+    assert b["cost_usd"] == pytest.approx(0.25, abs=1e-6)
+    # Sum of path costs ≤ turn cost (was 2×$1.00 = $2.00 under old bug)
+    assert result["total_reaccess_cost"] == pytest.approx(0.50, abs=1e-6)

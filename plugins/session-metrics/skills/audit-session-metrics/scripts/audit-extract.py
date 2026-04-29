@@ -31,10 +31,43 @@ from collections import Counter
 from datetime import datetime
 from typing import Any
 
-# Opus 4.7 input rate per 1M tokens — used for cache_break impact estimates.
-# Kept as a constant rather than read from references/pricing.md to keep this
-# script standalone.
-OPUS_INPUT_RATE_PER_M = 5.00
+# Per-model input rates ($/M tokens) — used for cache_break impact and idle-gap
+# rebuild cost estimates. Substring-matched (first hit wins; order matters,
+# longest-most-specific first). Kept embedded rather than reading
+# references/pricing.md to keep this script standalone.
+#
+# Default fallback is the Sonnet rate ($3/M), matching session-metrics.py's
+# _DEFAULT_PRICING. Cache-break impact previously hard-coded the Opus 4.7 rate
+# ($5/M) for every turn, overstating cost by 67% on Sonnet turns and 400% on
+# Haiku turns.
+_INPUT_RATE_PER_M_BY_MODEL: tuple[tuple[str, float], ...] = (
+    ("claude-opus-4-7", 5.00),
+    ("claude-opus-4-6", 5.00),
+    ("claude-opus-4-5", 5.00),
+    ("claude-opus-4-1", 15.00),
+    ("claude-opus-4", 15.00),
+    ("claude-3-opus", 15.00),
+    ("claude-haiku-4-5", 1.00),
+    ("claude-3-5-haiku", 0.80),
+    ("claude-3-7-sonnet", 3.00),
+    ("claude-3-5-sonnet", 3.00),
+    ("claude-sonnet", 3.00),
+    ("claude-haiku", 1.00),
+    ("claude-opus", 5.00),
+)
+_DEFAULT_INPUT_RATE_PER_M = 3.00
+
+
+def _input_rate_for_model(model: str | None) -> float:
+    """Look up $/M input rate for a model id. Substring-matched against the
+    table above, falling back to Sonnet rate for unknown / missing model.
+    Synthetic markers like ``<synthetic>`` also fall through to the default."""
+    if not model:
+        return _DEFAULT_INPUT_RATE_PER_M
+    for needle, rate in _INPUT_RATE_PER_M_BY_MODEL:
+        if needle in model:
+            return rate
+    return _DEFAULT_INPUT_RATE_PER_M
 
 # Cache TTL boundary in seconds. A gap longer than this expires the 5-minute
 # ephemeral cache; the next turn pays full uncached input on whatever it
@@ -196,7 +229,8 @@ def _detect_idle_gap_cache_decay(turns: list[dict]) -> list[dict]:
                 cr = t.get("cache_read_tokens", 0) or 0
                 billable = cw + ip + cr
                 if billable > 0 and (cw / billable) > 0.5:
-                    rebuild_cost = round(cw * OPUS_INPUT_RATE_PER_M / 1_000_000, 4)
+                    rate = _input_rate_for_model(t.get("model"))
+                    rebuild_cost = round(cw * rate / 1_000_000, 4)
                     events.append({
                         "turn_index": t.get("index"),
                         "gap_minutes": round(gap_s / 60, 1),
@@ -223,7 +257,11 @@ def evaluate_triggers(data: dict, turns: list[dict]) -> list[dict]:
     if cache_breaks:
         n = len(cache_breaks)
         total_uncached = sum(cb.get("uncached", 0) for cb in cache_breaks)
-        impact = round(total_uncached * OPUS_INPUT_RATE_PER_M / 1_000_000, 2)
+        impact_raw = 0.0
+        for cb in cache_breaks:
+            cb_rate = _input_rate_for_model(cb.get("model"))
+            impact_raw += (cb.get("uncached", 0) or 0) * cb_rate / 1_000_000
+        impact = round(impact_raw, 2)
         break_pct = (n / max(totals.get("turns", 1), 1)) * 100
         suggested = "medium"
         downgrade_reason = None
@@ -232,6 +270,25 @@ def evaluate_triggers(data: dict, turns: list[dict]) -> list[dict]:
             downgrade_reason = (
                 f"{n} break(s) in {totals.get('turns', 0)} turns ({break_pct:.1f}%) — "
                 "below typical concern threshold"
+            )
+        models_in_breaks = sorted({
+            cb.get("model") for cb in cache_breaks if cb.get("model")
+        })
+        if len(models_in_breaks) == 1:
+            m = models_in_breaks[0]
+            impact_basis = (
+                f"{total_uncached:,} uncached tokens × "
+                f"${_input_rate_for_model(m):.2f}/M ({m} input rate)"
+            )
+        elif models_in_breaks:
+            impact_basis = (
+                f"{total_uncached:,} uncached tokens × per-break input rate "
+                f"(mixed models: {', '.join(models_in_breaks)})"
+            )
+        else:
+            impact_basis = (
+                f"{total_uncached:,} uncached tokens × "
+                f"${_DEFAULT_INPUT_RATE_PER_M:.2f}/M (default fallback rate)"
             )
         fired.append({
             "metric": "cache_break",
@@ -244,9 +301,7 @@ def evaluate_triggers(data: dict, turns: list[dict]) -> list[dict]:
                 "count": n,
             },
             "estimated_impact_usd": impact,
-            "impact_basis": (
-                f"{total_uncached:,} uncached tokens × ${OPUS_INPUT_RATE_PER_M:.2f}/M (Opus input rate)"
-            ),
+            "impact_basis": impact_basis,
         })
 
     # top_turn_share — top single turn > 30% of cost
@@ -703,14 +758,18 @@ def top_expensive_turns(turns: list[dict], cache_breaks: list[dict]) -> list[dic
 
 def detailed_candidates(data: dict, turns: list[dict]) -> dict:
     """Pre-compute scans that detailed mode needs but quick mode skips."""
-    # File re-reads (>2 reads of same path)
+    # File re-reads (>2 reads of same path).
+    # The session-metrics export schema stores the path as `input_preview`
+    # (a string), not a structured `input.file_path` dict — for Read/Edit/Write
+    # tools, _summarise_tool_input emits the raw path. Reading `input.file_path`
+    # silently always returned None, so file_re_reads was always [].
     read_counts: Counter[str] = Counter()
     read_indices: dict[str, list[int]] = {}
     for t in turns:
         for d in t.get("tool_use_detail", []) or []:
             if d.get("name") == "Read":
-                fp = (d.get("input") or {}).get("file_path")
-                if fp:
+                fp = d.get("input_preview")
+                if isinstance(fp, str) and fp:
                     read_counts[fp] += 1
                     read_indices.setdefault(fp, []).append(t.get("index"))
     re_reads = sorted(

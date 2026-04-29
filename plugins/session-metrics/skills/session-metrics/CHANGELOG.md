@@ -5,6 +5,30 @@ Versions match the `plugin.json` / `marketplace.json` version field.
 
 ---
 
+## v1.33.0 — 2026-04-29
+
+### Correctness — P1 audit-pipeline fixes (Sessions 113–116)
+
+Four correctness fixes in the `audit-session-metrics` and `session-metrics` audit pipelines, batched together so users get a single coherent release rather than four point-bumps. No schema change. No flag change. The HTML/JSON exports look the same; the underlying numbers are now right.
+
+**P1.1 — `file_re_reads` detector reads `input_preview`** (Session 113).
+`audit-extract.py:710-715` previously looked up `tool_use_detail` entries via `d["input"]["file_path"]`, but the export schema only carries `input_preview` (a string from `_summarise_tool_input`). The dict access silently returned `None` on every `Read`, so `detailed_candidates.file_re_reads` was always `[]` regardless of how many times the same path was re-read. Detector now reads `input_preview` directly. Verified end-to-end against a 328-turn export — surfaced 9 real re-read paths where the old detector returned `[]`. (Codex novel finding from Session 112.)
+
+**P1.2 — Per-model input rate for `cache_break` and `idle_gap_cache_decay` impact** (Session 114).
+The audit pipeline used a hardcoded `OPUS_INPUT_RATE_PER_M = 5.00` to convert uncached / cache-write tokens into dollars regardless of which model the turn actually ran on, overstating Sonnet by 67% and Haiku by 400%. Replaced with `_INPUT_RATE_PER_M_BY_MODEL` (substring-priority table covering Opus 4.5/4.6/4.7 / Opus 4.0/4.1 / Sonnet 3.x/4.x / Haiku 4.5 / Haiku 3.5) plus an `_input_rate_for_model` helper. `_detect_idle_gap_cache_decay` now reads the turn's `model`; the cache_break trigger sums per-break impact at each break's own model rate and emits a model-aware `impact_basis` (mixed-model variant when breaks span models). Verified end-to-end on a mixed Opus + Haiku export: cache_break impact $1.28 → $0.86 (33% overstatement removed).
+
+**P1.3 — `_BASH_PATH_RE` requires leading-dot or start-of-arg boundary** (Session 115).
+The bash-branch path regex previously allowed *zero* leading dots (`\.{0,2}/`), so a longer string like `cat .claude/skills/foo.py` would yield the substring `/skills/foo.py`. In the re-read detector, that fragment formed its own bucket separate from the legitimate full-path access, silently merging same-suffix files across different project subtrees. Anchored the regex to a start-of-arg boundary via leading `(?<![\w.])` and split the previously combined `\.{0,2}/` alternative into two explicit branches: `\.{1,2}/...` (dot-relative) and `/...` (absolute). Trade-off: `.name/...` style hidden-dir paths in Bash commands no longer contribute to the bash-branch detector at all; net coverage preserved on realistic workloads because the same files are also accessed through Read/Edit/Write (absolute paths, separate detector branch). Verified end-to-end: reaccessed-path count dropped 29 (polluted) → 23 (clean), top-10 free of phantom fragments.
+
+**P1.4 — Marginal-cost attribution in `_detect_file_reaccesses`** (Session 116).
+The detector previously summed each path's `cost_usd` as the entire turn cost for every turn that touched the path — a single Bash arg in a 10-tool turn would charge that path 100% of the turn cost, and two re-read paths sharing one turn would each be charged 100%, so `total_reaccess_cost` could exceed the underlying session cost. Session 112's audit attributed $1.11 (54% of session cost) to file_reaccesses on a single Bash arg. Fix: weight each turn's contribution by `path_reads_in_turn / total_tool_calls_in_turn`. Total contribution per turn is now bounded by the turn cost. Verified end-to-end on a 328-turn export: `total_reaccess_cost` $24.70 → $22.80 (46.3% → 42.7%), largest per-path drop $4.81 → $3.51.
+
+### Tests
+
+12 new regression tests covering the four P1 fixes (4 for P1.1+P1.2 in `audit_extract`, 8 for P1.3+P1.4 in `_detect_file_reaccesses`). 612 total tests pass (1 skipped, pre-existing).
+
+---
+
 ## v1.32.0 — 2026-04-29
 
 ### Feature — project-scope and instance-scope audit support in `audit-session-metrics`

@@ -2035,8 +2035,13 @@ def _detect_file_reaccesses(turns: list[dict]) -> dict:
         r"ini|env|lock"
     )
     # (?!\w) prevents matching .c inside .claude, .go inside .golang, etc.
+    # Leading (?<![\w.]) anchors the path token to a start-of-arg boundary,
+    # so ``cat .claude/skills/foo.py`` no longer extracts ``/skills/foo.py``
+    # (which would silently merge same-suffix files across projects).
     _BASH_PATH_RE = _re.compile(
-        r"(?:\.{0,2}/[\w.\-/]+\.(?:" + _EXT_GROUP + r")(?!\w)"
+        r"(?<![\w.])(?:"
+        r"\.{1,2}/[\w.\-/]+\.(?:" + _EXT_GROUP + r")(?!\w)"
+        r"|/[\w.\-/]+\.(?:" + _EXT_GROUP + r")(?!\w)"
         r"|~/[\w.\-/]+\.(?:py|js|ts|json|yaml|yml|md|sh|txt)(?!\w))"
     )
     # For Read/Edit/Write, filter out directory paths (no extension = not a file)
@@ -2106,6 +2111,39 @@ def _detect_file_reaccesses(turns: list[dict]) -> dict:
     }
     turn_idx_set: dict[str, set[int]] = {p: set(v) for p, v in all_path_turns.items()}
 
+    # Marginal-cost attribution (P1.4): the previous implementation summed
+    # the entire turn cost for any turn that touched a re-read path, which
+    # over-attributed waste when a turn ran 5+ tool calls but only one of
+    # them hit the path. Weight per-turn contribution by
+    # ``path_reads_in_turn / total_tool_calls_in_turn`` so a single Bash arg
+    # in a 10-tool turn contributes 10% of the turn cost, not 100%.
+    turn_cost_by_idx: dict[int, float] = {}
+    turn_total_tools_by_idx: dict[int, int] = {}
+    for t in turns:
+        if t.get("is_resume_marker"):
+            continue
+        idx = t.get("index", -1)
+        turn_cost_by_idx[idx] = float(t.get("cost_usd", 0.0))
+        turn_total_tools_by_idx[idx] = len(t.get("tool_use_detail", []))
+
+    path_count_per_turn: dict[tuple[str, int], int] = defaultdict(int)
+    for (p, _seg), idx_list in seg_turns.items():
+        for idx in idx_list:
+            path_count_per_turn[(p, idx)] += 1
+
+    def _path_cost(p: str) -> float:
+        total = 0.0
+        for idx in turn_idx_set[p]:
+            denom = turn_total_tools_by_idx.get(idx, 0)
+            if denom <= 0:
+                continue
+            total += (
+                turn_cost_by_idx.get(idx, 0.0)
+                * path_count_per_turn.get((p, idx), 0)
+                / denom
+            )
+        return total
+
     details = sorted(
         [
             {
@@ -2113,10 +2151,7 @@ def _detect_file_reaccesses(turns: list[dict]) -> dict:
                 "count":      len(all_path_turns[p]),
                 "first_turn": min(all_path_turns[p]),
                 "cross_ctx":  p in cross_only_paths,
-                "cost_usd":   sum(
-                    t.get("cost_usd", 0.0) for t in turns
-                    if t.get("index") in turn_idx_set[p]
-                ),
+                "cost_usd":   _path_cost(p),
             }
             for p in all_reaccessed
         ],
