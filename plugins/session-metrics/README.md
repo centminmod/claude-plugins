@@ -318,6 +318,7 @@ through natural language — no slash commands to memorise:
 | *"am I tracking toward the weekly session cap?"* | 5-hour session blocks, trailing 7/14/30-day counters. |
 | *"show me cache hit rate"* | Cache-read share, estimated savings vs a hypothetical no-cache run. |
 | *"list all sessions in this project"* | Session-ID + user-turn-count + timestamp per session, newest first. |
+| *"export this session safely for sharing"* | JSON export with prompts redacted, self-cost suppressed, and files chmod'd to 0600 (`--export-share-safe`). |
 
 The full flag reference for power users is in
 [`skills/session-metrics/SKILL.md`](skills/session-metrics/SKILL.md).
@@ -334,8 +335,15 @@ subscription auth) and prints a confirmation gate first. It's there
 for API-billed users who want a cheap tokenizer smoke test, not for
 subscription users (who should use `--compare-run`).
 
-A parse cache lives at `~/.cache/session-metrics/parse/`. Delete that
-directory or pass `--no-cache` to bypass.
+**Sharing exports safely.** Pass `--export-share-safe` when handing a
+JSON export to a colleague — it redacts freeform prompt and response text,
+suppresses the self-cost meta-metric, and chmods every written file to
+`0600`. The underlying flags are also available individually:
+`--redact-user-prompts` (JSON exports only) and `--no-self-cost`.
+
+A parse cache lives at `~/.cache/session-metrics/parse/`. The cache is
+self-managed: stale blobs are pruned on write and in a daily background
+sweep. Pass `--no-cache` to skip the cache entirely.
 
 ---
 
