@@ -3,6 +3,14 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.40.0 — 2026-04-30
+
+### Skill version embedded in all exports
+
+`_SKILL_VERSION = "1.40.0"` added to `session-metrics.py`. Every export now surfaces the skill version that generated it: HTML meta line appends `· skill v1.40.0`; Markdown `Generated:` line appends `|  Skill: v1.40.0`; JSON export gains a top-level `"skill_version"` field; CSV exports prepend a comment row `# Session Metrics skill v1.40.0, <generated_at>, <mode>`. `_SKILL_VERSION` must match `plugin.json` / `marketplace.json` and is bumped whenever those bump. CLAUDE.md sync-procedure updated with the instruction.
+
+---
+
 ## v1.39.0 — 2026-04-30
 
 ### Cache hygiene — daily lazy global prune

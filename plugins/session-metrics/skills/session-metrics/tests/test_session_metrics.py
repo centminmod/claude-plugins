@@ -326,7 +326,7 @@ def test_has_1h_cache_false_on_legacy_only():
 def test_csv_has_ttl_columns():
     r = _build_fixture_report()
     csv_out = sm.render_csv(r)
-    header = csv_out.splitlines()[0]
+    header = csv_out.splitlines()[1]  # [0] is the skill-version comment row
     assert "cache_write_5m_tokens" in header
     assert "cache_write_1h_tokens" in header
     assert "cache_write_ttl" in header
@@ -721,7 +721,7 @@ def test_has_content_blocks_helpers_detect_fixture():
 def test_csv_has_content_block_columns():
     r = _build_fixture_report()
     csv_out = sm.render_csv(r)
-    header = csv_out.splitlines()[0]
+    header = csv_out.splitlines()[1]  # [0] is the skill-version comment row
     for col in ("thinking_blocks", "tool_use_blocks", "text_blocks",
                  "tool_result_blocks", "image_blocks"):
         assert col in header
@@ -7169,7 +7169,7 @@ def test_render_csv_instance_has_project_slug_column(instance_env):
     run = next(iter(
         (tmp_path / "exports" / "session-metrics" / "instance").iterdir()))
     content = (run / "index.csv").read_text(encoding="utf-8")
-    header = content.splitlines()[0]
+    header = content.splitlines()[1]  # [0] is the skill-version comment row
     assert header.startswith("project_slug,")
     # Two per-session data rows — filter to rows whose first column looks
     # like a project slug (starts with "-"), which skips the "# TOTALS" /

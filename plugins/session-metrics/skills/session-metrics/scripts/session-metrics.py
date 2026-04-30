@@ -55,6 +55,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # on disk (~9 MB → ~19 MB per typical session); acceptable for a developer-tool
 # cache. Version bump invalidates every existing user blob exactly once.
 _SCRIPT_VERSION = "1.1.0"
+_SKILL_VERSION  = "1.40.0"  # embedded in every export; bump when plugin version bumps
 
 # ---------------------------------------------------------------------------
 # Pricing table  (USD per million tokens)
@@ -3792,6 +3793,7 @@ def _build_report(
         s["subtotal"].pop("_tool_name_counts", None)
     report = {
         "generated_at":    datetime.now(timezone.utc).isoformat(),
+        "skill_version":   _SKILL_VERSION,
         "mode":            mode,
         "slug":            slug,
         "tz_offset_hours": tz_offset_hours,
@@ -4420,6 +4422,8 @@ def render_csv(report: dict) -> str:
         return _render_instance_csv(report)
     out = io.StringIO()
     w = csv_mod.writer(out)
+    w.writerow([f"# Session Metrics skill v{report.get('skill_version', '?')}",
+                report.get("generated_at", ""), report.get("mode", "")])
     w.writerow(["session_id", "turn", "timestamp", "model", "speed",
                 "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
                 "cache_write_5m_tokens", "cache_write_1h_tokens", "cache_write_ttl",
@@ -4635,10 +4639,11 @@ def render_md(report: dict) -> str:
     mode = report["mode"]
     tz_offset = report.get("tz_offset_hours", 0.0)
     generated = _fmt_generated_at(report)
+    skill_version = report.get("skill_version", "?")
 
     p(f"# Session Metrics — {slug}")
     p()
-    p(f"Generated: {generated}  |  Mode: {mode}")
+    p(f"Generated: {generated}  |  Mode: {mode}  |  Skill: v{skill_version}")
     p()
 
     # Summary cards
@@ -7962,6 +7967,7 @@ def render_html(report: dict, variant: str = "single",
     totals = report["totals"]
     mode = report["mode"]
     generated = _fmt_generated_at(report)
+    skill_version = report.get("skill_version", "?")
     sessions = report["sessions"]
 
     # ---- Chart data --------------------------------------------------------
@@ -9214,7 +9220,7 @@ document.querySelectorAll('tr.session-header[data-toggle]').forEach(function (hd
 <header class="page-header">
   <h1>Session Metrics — {slug}{title_suffix}</h1>
   <p class="meta">Generated {generated} &nbsp;·&nbsp; Mode: {mode} &nbsp;·&nbsp;
-  {len(sessions)} session{'s' if len(sessions) != 1 else ''}, {totals['turns']:,} turns</p>
+  {len(sessions)} session{'s' if len(sessions) != 1 else ''}, {totals['turns']:,} turns &nbsp;·&nbsp; skill v{skill_version}</p>
 </header>
 {summary_cards_html}
 {usage_insights_html}
@@ -9840,6 +9846,7 @@ def _build_instance_report(
 
     report = {
         "generated_at":     datetime.now(timezone.utc).isoformat(),
+        "skill_version":    _SKILL_VERSION,
         "mode":             "instance",
         "slug":             "all-projects",
         "projects_dir":     str(projects_dir),
@@ -10190,6 +10197,8 @@ def _render_instance_csv(report: dict) -> str:
     rows give a CSV that's pivotable in Excel without being unwieldy."""
     out = io.StringIO()
     w = csv_mod.writer(out)
+    w.writerow([f"# Session Metrics skill v{report.get('skill_version', '?')}",
+                report.get("generated_at", ""), report.get("mode", "")])
     w.writerow([
         "project_slug", "session_id", "first_ts", "last_ts",
         "duration_seconds", "turn_count",
@@ -10259,11 +10268,12 @@ def _render_instance_md(report: dict) -> str:
     models = report.get("models", {})
     tz_label = report.get("tz_label", "UTC")
     generated = _fmt_generated_at(report)
+    skill_version = report.get("skill_version", "?")
 
     p(f"# Session Metrics — all projects")
     p()
     p(f"Generated: {generated}  |  Mode: instance  |  "
-      f"Scanning: `{report.get('projects_dir', '?')}`")
+      f"Scanning: `{report.get('projects_dir', '?')}`  |  Skill: v{skill_version}")
     p()
 
     # Summary cards
@@ -10423,6 +10433,7 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
     tz_label = report.get("tz_label", "UTC")
     tz_offset = report.get("tz_offset_hours", 0.0)
     generated = _fmt_generated_at(report)
+    skill_version = report.get("skill_version", "?")
     projects_dir = html_mod.escape(str(report.get("projects_dir", "?")))
     drilldown_slugs = report.get("_drilldown_slugs") or set()
 
@@ -10659,7 +10670,7 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
   <p class="meta">Generated {generated} &nbsp;·&nbsp; Scanning: <code>{projects_dir}</code>
    &nbsp;·&nbsp; {report.get("project_count", 0)} projects,
    {report.get("session_count", 0)} sessions,
-   {totals.get("turns", 0):,} turns</p>
+   {totals.get("turns", 0):,} turns &nbsp;·&nbsp; skill v{skill_version}</p>
 </header>
 {summary_cards_html}
 {daily_cost_rail_html}
