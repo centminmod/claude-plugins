@@ -34,6 +34,7 @@ import csv as csv_mod
 import functools
 import hashlib
 import html as html_mod
+import importlib.util as _ilu
 import io
 import json
 import os
@@ -171,6 +172,61 @@ def _print_run_advisories() -> None:
 
 
 atexit.register(_print_run_advisories)
+
+
+# ---------------------------------------------------------------------------
+# Leaf module loader — siblings in the same scripts/ directory.
+# Uses spec_from_file_location (matching _load_compare_module pattern) so
+# sys.path is never mutated globally. Each module is registered in sys.modules
+# so cross-sibling imports (e.g. _user_prompt importing from _dt) resolve.
+# Modules are loaded in dependency order: _dt before _user_prompt.
+# ---------------------------------------------------------------------------
+
+def _load_leaf(name: str):
+    if name in sys.modules:
+        return sys.modules[name]
+    _here = Path(__file__).resolve().parent
+    spec = _ilu.spec_from_file_location(name, _here / f"{name}.py")
+    mod = _ilu.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_dt_m = _load_leaf("_dt")
+_parse_iso_dt = _dt_m._parse_iso_dt
+del _dt_m
+
+_tz_m = _load_leaf("_tz")
+_local_tz_offset  = _tz_m._local_tz_offset
+_local_tz_label   = _tz_m._local_tz_label
+_parse_peak_hours = _tz_m._parse_peak_hours
+_build_peak       = _tz_m._build_peak
+_resolve_tz       = _tz_m._resolve_tz
+del _tz_m
+
+_up_m = _load_leaf("_user_prompt")
+_is_user_prompt          = _up_m._is_user_prompt
+_extract_user_timestamps = _up_m._extract_user_timestamps
+del _up_m
+
+_je_m = _load_leaf("_json_export")
+_tod_for_json            = _je_m._tod_for_json
+_REDACTED_TURN_FIELDS    = _je_m._REDACTED_TURN_FIELDS
+_REDACTED_PLACEHOLDER    = _je_m._REDACTED_PLACEHOLDER
+_redact_turns_for_json   = _je_m._redact_turns_for_json
+render_json              = _je_m.render_json
+_render_instance_json    = _je_m._render_instance_json
+del _je_m
+
+_tod_m = _load_leaf("_time_of_day")
+_TOD_PERIODS               = _tod_m._TOD_PERIODS
+_bucket_time_of_day        = _tod_m._bucket_time_of_day
+_build_hour_of_day         = _tod_m._build_hour_of_day
+_build_weekday_hour_matrix = _tod_m._build_weekday_hour_matrix
+_build_time_of_day         = _tod_m._build_time_of_day
+_is_off_peak_local         = _tod_m._is_off_peak_local
+del _tod_m
 
 
 def _pricing_for(model: str) -> dict[str, float]:
@@ -912,352 +968,6 @@ def _summarise_tool_input(name: str, tool_input) -> str:
     except (TypeError, ValueError):
         return ""
     return j[:160] + ("\u2026" if len(j) > 160 else "")
-
-
-# ---------------------------------------------------------------------------
-# Time-of-day analysis
-# ---------------------------------------------------------------------------
-
-_TOD_PERIODS = (
-    ("night",     0,  6),   # 00:00–05:59
-    ("morning",   6, 12),   # 06:00–11:59
-    ("afternoon", 12, 18),  # 12:00–17:59
-    ("evening",   18, 24),  # 18:00–23:59
-)
-
-
-def _parse_iso_dt(ts: str) -> datetime | None:
-    """Parse an ISO-8601 timestamp to a tz-aware ``datetime``; ``None`` on failure.
-
-    Catches the union of error types historically swallowed at every call
-    site so each caller's existing safety net is preserved unchanged.
-    """
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except (ValueError, AttributeError, TypeError, OSError):
-        return None
-
-
-def _is_user_prompt(entry: dict) -> bool:
-    """Return True for genuine user-typed prompts only.
-
-    Claude Code's JSONL records three kinds of ``type == "user"`` entry:
-    - real user messages typed by the human (what we want to count)
-    - tool_result entries auto-generated after every tool call (inflates counts)
-    - system-injected meta entries (``isMeta``)
-
-    A user-typed message has ``message.content`` that is either a plain
-    string, or a list containing at least one ``text`` or ``image`` block
-    (never only ``tool_result`` blocks). Sampling real JSONLs showed both
-    shapes in the wild; the original schema doc listed only the list shape.
-    """
-    if entry.get("type") != "user":
-        return False
-    if entry.get("isMeta"):
-        return False
-    msg = entry.get("message") or {}
-    content = msg.get("content")
-    if isinstance(content, str):
-        return bool(content.strip())
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            t = block.get("type")
-            if t == "text" or t == "image":
-                return True
-        return False
-    return False
-
-
-def _extract_user_timestamps(
-    entries: list[dict], include_sidechain: bool = False,
-) -> list[int]:
-    """Extract UTC epoch-seconds for every genuine user prompt.
-
-    Uses ``_is_user_prompt`` to exclude tool_result and meta entries, which
-    the original implementation wrongly counted as user activity. By default,
-    also excludes ``isSidechain`` (subagent) entries; pass
-    ``include_sidechain=True`` when the caller wants them folded in (matches
-    the ``--include-subagents`` CLI flag).
-
-    Returns:
-        Sorted list of integer timestamps (seconds since Unix epoch, UTC).
-        Malformed or missing timestamps are silently skipped.
-    """
-    timestamps: list[int] = []
-    for entry in entries:
-        if not _is_user_prompt(entry):
-            continue
-        if entry.get("isSidechain") and not include_sidechain:
-            continue
-        dt = _parse_iso_dt(entry.get("timestamp", ""))
-        if dt is None:
-            continue
-        try:
-            timestamps.append(int(dt.timestamp()))
-        except (OSError, OverflowError):
-            continue
-    timestamps.sort()
-    return timestamps
-
-
-def _bucket_time_of_day(epoch_secs: list[int], offset_hours: float = 0) -> dict[str, int]:
-    """Bucket UTC epoch-second timestamps into four time-of-day periods.
-
-    Uses pure integer arithmetic for performance — no datetime objects are
-    allocated in the hot loop.  Python's ``%`` operator always returns a
-    non-negative result when the divisor is positive, so no extra guard is
-    needed server-side (the JS counterpart uses a double-modulo idiom).
-
-    Args:
-        epoch_secs: Sorted list of UTC epoch-seconds (from
-            ``_extract_user_timestamps``).
-        offset_hours: UTC offset for the display timezone, e.g. ``-8`` for
-            PT or ``10`` for Brisbane.  Accepts float for half-hour offsets
-            (e.g. ``5.5`` for IST).
-
-    Returns:
-        Dict with keys ``night``, ``morning``, ``afternoon``, ``evening``,
-        and ``total`` — each an integer count of user messages in that period.
-    """
-    offset_sec = int(offset_hours * 3600)
-    counts = {key: 0 for key, _, _ in _TOD_PERIODS}
-    for epoch in epoch_secs:
-        local_hour = ((epoch + offset_sec) % 86400) // 3600
-        for key, start, end in _TOD_PERIODS:
-            if start <= local_hour < end:
-                counts[key] += 1
-                break
-    counts["total"] = sum(counts[k] for k, _, _ in _TOD_PERIODS)
-    return counts
-
-
-def _build_hour_of_day(epoch_secs: list[int], offset_hours: float = 0.0) -> dict:
-    """Build 24-bucket hour-of-day counts from user timestamps.
-
-    Returns ``{"hours": [24 ints], "total": int, "offset_hours": float}``.
-    ``hours[0]`` is 00:00-00:59 in the display tz; ``hours[23]`` is 23:00-23:59.
-    """
-    offset_sec = int(offset_hours * 3600)
-    hours = [0] * 24
-    for e in epoch_secs:
-        h = ((e + offset_sec) % 86400) // 3600
-        hours[h] += 1
-    return {"hours": hours, "total": sum(hours), "offset_hours": offset_hours}
-
-
-def _build_weekday_hour_matrix(epoch_secs: list[int], offset_hours: float = 0.0) -> dict:
-    """Build a 7x24 weekday-by-hour activity matrix in the display tz.
-
-    Row 0 is Monday (matches ``datetime.weekday()``); row 6 is Sunday.
-    1970-01-01 was a Thursday (weekday=3), so a day count since the UTC
-    epoch maps to weekday via ``(days + 3) % 7``. Python's floor-div gives
-    correct day counts for negative operands, so a negative ``offset_hours``
-    on a near-epoch timestamp still produces a valid weekday.
-    """
-    offset_sec = int(offset_hours * 3600)
-    matrix = [[0] * 24 for _ in range(7)]
-    for e in epoch_secs:
-        local = e + offset_sec
-        days = local // 86400
-        weekday = (days + 3) % 7
-        hour = (local % 86400) // 3600
-        matrix[weekday][hour] += 1
-    row_totals = [sum(row) for row in matrix]
-    col_totals = [sum(matrix[r][h] for r in range(7)) for h in range(24)]
-    return {
-        "matrix":       matrix,
-        "row_totals":   row_totals,
-        "col_totals":   col_totals,
-        "total":        sum(row_totals),
-        "offset_hours": offset_hours,
-    }
-
-
-def _build_time_of_day(epoch_secs: list[int], offset_hours: float = 0.0) -> dict:
-    """Build the ``time_of_day`` report section from user timestamps.
-
-    Args:
-        epoch_secs: Sorted UTC epoch-seconds for genuine user prompts.
-        offset_hours: Display-timezone offset applied to the ``buckets``,
-            ``hour_of_day``, and ``weekday_hour`` views (for static exports).
-            The raw ``epoch_secs`` array is preserved so HTML client-side JS
-            can re-bucket to any tz.
-
-    Returns:
-        Dict with ``epoch_secs``, ``message_count``, ``buckets`` (4-period),
-        ``hour_of_day`` (24-bucket), ``weekday_hour`` (7x24 matrix), and
-        ``offset_hours``.
-    """
-    return {
-        "epoch_secs":    epoch_secs,
-        "message_count": len(epoch_secs),
-        "buckets":       _bucket_time_of_day(epoch_secs, offset_hours=offset_hours),
-        "hour_of_day":   _build_hour_of_day(epoch_secs, offset_hours=offset_hours),
-        "weekday_hour":  _build_weekday_hour_matrix(epoch_secs, offset_hours=offset_hours),
-        "offset_hours":  offset_hours,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Timezone helpers (Step 5)
-# ---------------------------------------------------------------------------
-
-def _local_tz_offset() -> float:
-    """Detect the system timezone offset in hours (float, supports :30/:45).
-
-    Returns 0.0 on failure (e.g. no TZ info available).
-    """
-    try:
-        delta = datetime.now().astimezone().utcoffset()
-        if delta is None:
-            return 0.0
-        return delta.total_seconds() / 3600.0
-    except Exception:
-        return 0.0
-
-
-def _local_tz_label() -> str:
-    """Detect the system timezone IANA name, best-effort.
-
-    Returns a string like ``"Australia/Brisbane"`` or falls back to a
-    ``"UTC+10"``-style label if the name isn't available.
-    """
-    try:
-        name = datetime.now().astimezone().tzname()
-        if name:
-            return name
-    except Exception:
-        pass
-    off = _local_tz_offset()
-    sign = "+" if off >= 0 else "-"
-    return f"UTC{sign}{abs(off):g}"
-
-
-def _parse_peak_hours(value: str) -> tuple[int, int]:
-    """Parse ``--peak-hours "5-11"`` into ``(start, end)`` with end exclusive.
-
-    Accepts ``H-H`` or ``HH-HH`` with 0 <= start <= 23 and 1 <= end <= 24.
-    Wrap-around (end <= start) is rejected; split it across two flags if
-    genuinely needed (rare case; keeping v1 simple).
-    """
-    m = re.match(r"^\s*(\d{1,2})\s*-\s*(\d{1,2})\s*$", value or "")
-    if not m:
-        raise argparse.ArgumentTypeError(
-            f"invalid peak-hours {value!r} (expected H-H, e.g. '5-11')"
-        )
-    start, end = int(m.group(1)), int(m.group(2))
-    if not (0 <= start < end <= 24):
-        raise argparse.ArgumentTypeError(
-            f"invalid peak-hours {value!r} (need 0 <= start < end <= 24)"
-        )
-    return (start, end)
-
-
-def _build_peak(peak_hours: tuple[int, int] | None,
-                peak_tz: str | None,
-                strict: bool = False) -> dict | None:
-    """Build a ``peak`` section from CLI inputs, resolving the peak tz offset.
-
-    Returns None when ``peak_hours`` is not set. Defaults ``peak_tz`` to
-    ``America/Los_Angeles`` (where the "peak hours" terminology originates
-    in community reports) when only ``peak_hours`` is provided.
-
-    When ``strict`` is True and the IANA zone can't be resolved (e.g. on
-    Windows without the ``tzdata`` pip package), raises ``SystemExit``
-    with an actionable message instead of warning and falling back to UTC.
-    """
-    if peak_hours is None:
-        return None
-    tz_name = peak_tz or "America/Los_Angeles"
-    try:
-        zi = ZoneInfo(tz_name)
-        delta = datetime.now(zi).utcoffset()
-        off = delta.total_seconds() / 3600.0 if delta else 0.0
-    except ZoneInfoNotFoundError:
-        msg = (
-            f"ZoneInfo not found for peak-tz {tz_name!r}. "
-            "On Windows, install the 'tzdata' package "
-            "(pip install tzdata) for IANA tz support."
-        )
-        if strict:
-            print(f"[error] {msg}", file=sys.stderr)
-            raise SystemExit(2)
-        print(f"[warn] {msg} Falling back to UTC.", file=sys.stderr)
-        off, tz_name = 0.0, "UTC"
-    start, end = peak_hours
-    return {
-        "start":           start,
-        "end":             end,
-        "tz_offset_hours": off,
-        "tz_label":        tz_name,
-        "note":            "unofficial \u2014 community-reported",
-    }
-
-
-def _resolve_tz(tz_name: str | None, utc_offset: float | None,
-                strict: bool = False) -> tuple[float, str]:
-    """Resolve the display timezone from CLI/env inputs.
-
-    Priority: ``tz_name`` (IANA, DST-aware) > ``utc_offset`` (fixed float) >
-    local system tz.  Returns ``(offset_hours, label)``.
-
-    **Contract — fixed scalar offset, by design.** With an IANA name, the
-    offset returned is the *current* UTC offset captured once at parse time.
-    Historical hour-of-day buckets in static exports (text / JSON / CSV / MD
-    tables, and the Highcharts-rendered PNG) use this single scalar offset
-    applied uniformly across every event — they do **not** reflect per-event
-    DST (a spring-forward event in March and a summer event in July are
-    bucketed against the same offset).
-
-    This is intentional and historically stable. Static-export consumers
-    expect one tz label per report, not per-event astimezone() jitter. Any
-    switch to per-event ``ZoneInfo`` math here would perturb every existing
-    report — treat as a breaking change if ever proposed.
-
-    The HTML client's uPlot / Chart.js / Highcharts / hour-of-day /
-    punchcard / time-of-day widgets use the **same fixed scalar offset**
-    as the static path: the emitted JavaScript bucketizes events with
-    ``(epoch + offset_seconds) % 86400`` arithmetic, not ``Intl.DateTimeFormat``.
-    Static and client-side bucketing agree by design. A previous revision
-    of this docstring claimed per-event DST via ``Intl.DateTimeFormat``;
-    that was never implemented — the claim was aspirational and has been
-    corrected to match the code.
-
-    When ``strict`` is True and the IANA zone can't be resolved (e.g. on
-    Windows without the ``tzdata`` pip package), raises ``SystemExit``
-    with an actionable message instead of warning and falling back to UTC.
-
-    See ``test_hour_of_day_dst_boundary_uses_fixed_offset`` for the
-    behaviour-lock regression test.
-    """
-    if tz_name:
-        try:
-            zi = ZoneInfo(tz_name)
-            now = datetime.now(zi)
-            delta = now.utcoffset()
-            off = delta.total_seconds() / 3600.0 if delta else 0.0
-            return off, tz_name
-        except ZoneInfoNotFoundError:
-            msg = (
-                f"ZoneInfo not found for tz {tz_name!r}. "
-                "On Windows, install the 'tzdata' package "
-                "(pip install tzdata) for IANA tz support."
-            )
-            if strict:
-                print(f"[error] {msg}", file=sys.stderr)
-                raise SystemExit(2)
-            print(f"[warn] {msg} Falling back to UTC.", file=sys.stderr)
-            return 0.0, "UTC"
-    if utc_offset is not None:
-        sign = "+" if utc_offset >= 0 else "-"
-        return utc_offset, f"UTC{sign}{abs(utc_offset):g}"
-    return _local_tz_offset(), _local_tz_label()
-
-
 # ---------------------------------------------------------------------------
 # 5-hour session blocks (rate-limit debugging)
 # ---------------------------------------------------------------------------
@@ -3196,20 +2906,6 @@ def _turn_total_input(turn: dict) -> int:
     return (turn.get("input_tokens", 0)
             + turn.get("cache_read_tokens", 0)
             + turn.get("cache_write_tokens", 0))
-
-
-def _is_off_peak_local(epoch_utc: int, tz_offset_hours: float) -> bool:
-    """True iff the local-time hour is outside 09:00–18:00 on a weekday,
-    OR the local day is Saturday/Sunday. Calibrated against a 9-to-6
-    Mon–Fri baseline; ~58% of hours in a 24/7 distribution are off-peak."""
-    if not epoch_utc:
-        return False
-    local = datetime.fromtimestamp(epoch_utc + int(tz_offset_hours * 3600), tz=timezone.utc)
-    if local.weekday() >= 5:  # Sat / Sun
-        return True
-    return local.hour < 9 or local.hour >= 18
-
-
 def _model_family(model_id: str) -> str:
     """Coarse family bucket from a model id like `claude-opus-4-7`."""
     m = (model_id or "").lower()
@@ -4324,91 +4020,6 @@ def render_text(report: dict) -> str:
                     session_blocks=report.get("session_blocks"),
                     block_summary=report.get("block_summary")))
     return out.getvalue()
-
-
-def _tod_for_json(tod: dict) -> dict:
-    """Convert a ``time_of_day`` section for JSON export.
-
-    Replaces internal ``epoch_secs`` (integer list) with human-readable
-    ``utc_timestamps`` (ISO-8601 strings).  The conversion is O(n) but only
-    runs once per export — no deep-copy of the full report is needed.
-    """
-    return {
-        "utc_timestamps": [
-            datetime.fromtimestamp(e, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            for e in tod.get("epoch_secs", [])
-        ],
-        "message_count": tod.get("message_count", 0),
-        "buckets":       tod.get("buckets", {}),
-        "hour_of_day":   tod.get("hour_of_day", {}),
-        "weekday_hour":  tod.get("weekday_hour", {}),
-        "offset_hours":  tod.get("offset_hours", 0.0),
-    }
-
-
-# Fields redacted from JSON exports under ``--redact-user-prompts``. These
-# carry freeform user / assistant text that may contain PII; ``slash_command``
-# and tool input previews are canonical / structured and stay visible so the
-# export remains useful for cost analysis.
-_REDACTED_TURN_FIELDS = (
-    "prompt_text", "prompt_snippet",
-    "assistant_text", "assistant_snippet",
-)
-_REDACTED_PLACEHOLDER = "[redacted]"
-
-
-def _redact_turns_for_json(sessions: list[dict]) -> list[dict]:
-    """Return a shallow copy of ``sessions`` with freeform prompt/assistant
-    text replaced by ``[redacted]`` on every turn. Empty fields stay empty so
-    downstream filters (``if t.get("prompt_text"):``) keep their meaning."""
-    out = []
-    for s in sessions:
-        new_turns = []
-        for t in s.get("turns", []):
-            redacted = {**t}
-            for fld in _REDACTED_TURN_FIELDS:
-                if redacted.get(fld):
-                    redacted[fld] = _REDACTED_PLACEHOLDER
-            new_turns.append(redacted)
-        out.append({**s, "turns": new_turns})
-    return out
-
-
-def render_json(report: dict, *, redact_user_prompts: bool = False) -> str:
-    """Render the full report as indented JSON.
-
-    Internal ``epoch_secs`` lists in ``time_of_day`` sections are converted to
-    ISO-8601 ``utc_timestamps`` for human readability.  The transform uses a
-    shallow copy of the report — session turns, subtotals, and model dicts are
-    shared by reference to avoid copying ~thousands of turn record dicts.
-
-    ``redact_user_prompts`` masks ``prompt_text`` / ``prompt_snippet`` and
-    ``assistant_text`` / ``assistant_snippet`` on every turn with
-    ``[redacted]`` so the JSON is safe to share publicly. Tool inputs,
-    slash-command names, and structured cost / token fields stay visible.
-    Instance-scope JSON has no per-turn records, so the flag is a no-op
-    there.
-    """
-    if report.get("mode") == "compare":
-        return sys.modules["session_metrics_compare"].render_compare_json(report)
-    if report.get("mode") == "instance":
-        return _render_instance_json(report)
-    # Shallow-transform: only replace time_of_day sections
-    export = {**report}
-    if "time_of_day" in export:
-        export["time_of_day"] = _tod_for_json(export["time_of_day"])
-    if "sessions" in export:
-        sessions = export["sessions"]
-        if redact_user_prompts:
-            sessions = _redact_turns_for_json(sessions)
-        export["sessions"] = [
-            {**s, "time_of_day": _tod_for_json(s["time_of_day"])}
-            if "time_of_day" in s else s
-            for s in sessions
-        ]
-    return json.dumps(export, indent=2)
-
-
 def render_csv(report: dict) -> str:
     """Render turn-level CSV with an appended time-of-day summary section.
 
@@ -10173,24 +9784,6 @@ def _render_instance_text(report: dict) -> str:
             p(f"  {name:<44}  {turns:>6} turns  ${cost:>9.4f}")
         p("")
     return out.getvalue()
-
-
-def _render_instance_json(report: dict) -> str:
-    """Serialise the full instance report as indented JSON.
-
-    Per-turn records are never retained at instance scope so the JSON
-    stays bounded even for users with hundreds of sessions — only
-    per-session summaries, per-project summaries, and cross-project
-    aggregates appear.
-    """
-    export = {k: v for k, v in report.items()
-              if not k.startswith("_")}  # drop transient _drilldown_slugs etc.
-    # Convert time_of_day epoch lists to human-readable timestamps
-    if "time_of_day" in export:
-        export["time_of_day"] = _tod_for_json(export["time_of_day"])
-    return json.dumps(export, indent=2, default=str)
-
-
 def _render_instance_csv(report: dict) -> str:
     """One row per session across all projects, with a ``project_slug``
     column. Per-turn rows would explode at instance scale; per-session

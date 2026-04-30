@@ -1081,6 +1081,7 @@ def _raise_zoneinfo_missing(*_):
 def test_resolve_tz_missing_warns_and_falls_back(monkeypatch, capsys):
     """Default: ZoneInfo miss warns to stderr and returns (0.0, 'UTC')."""
     monkeypatch.setattr(sm, "ZoneInfo", _raise_zoneinfo_missing)
+    monkeypatch.setattr(sys.modules["_tz"], "ZoneInfo", _raise_zoneinfo_missing)
     off, label = sm._resolve_tz("America/Los_Angeles", None)
     assert off == 0.0
     assert label == "UTC"
@@ -1093,6 +1094,7 @@ def test_resolve_tz_missing_warns_and_falls_back(monkeypatch, capsys):
 def test_resolve_tz_strict_raises_on_missing(monkeypatch, capsys):
     """--strict-tz: ZoneInfo miss raises SystemExit with actionable hint."""
     monkeypatch.setattr(sm, "ZoneInfo", _raise_zoneinfo_missing)
+    monkeypatch.setattr(sys.modules["_tz"], "ZoneInfo", _raise_zoneinfo_missing)
     with pytest.raises(SystemExit) as excinfo:
         sm._resolve_tz("Europe/Berlin", None, strict=True)
     assert excinfo.value.code == 2
@@ -1103,6 +1105,7 @@ def test_resolve_tz_strict_raises_on_missing(monkeypatch, capsys):
 
 def test_build_peak_missing_warns_and_falls_back(monkeypatch, capsys):
     monkeypatch.setattr(sm, "ZoneInfo", _raise_zoneinfo_missing)
+    monkeypatch.setattr(sys.modules["_tz"], "ZoneInfo", _raise_zoneinfo_missing)
     p = sm._build_peak((9, 17), "America/Los_Angeles")
     assert p is not None
     assert p["tz_label"] == "UTC"
@@ -1114,6 +1117,7 @@ def test_build_peak_missing_warns_and_falls_back(monkeypatch, capsys):
 
 def test_build_peak_strict_raises_on_missing(monkeypatch, capsys):
     monkeypatch.setattr(sm, "ZoneInfo", _raise_zoneinfo_missing)
+    monkeypatch.setattr(sys.modules["_tz"], "ZoneInfo", _raise_zoneinfo_missing)
     with pytest.raises(SystemExit) as excinfo:
         sm._build_peak((9, 17), "America/Los_Angeles", strict=True)
     assert excinfo.value.code == 2
