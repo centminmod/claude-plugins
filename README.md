@@ -1,6 +1,7 @@
 # centminmod / claude-plugins
 
-Site: <https://ai.georgeliu.com/p/my-claude-code-plugin-marketplace>
+Site: <https://ai.georgeliu.com/p/claude-plugins>
+Article: <https://ai.georgeliu.com/p/my-claude-code-plugin-marketplace>
 
 A personal Claude Code plugin marketplace. Each plugin is an independent, standalone unit that can be installed into any Claude Code project with a single command.
 
