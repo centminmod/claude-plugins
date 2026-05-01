@@ -321,14 +321,19 @@ cache-break suffix on top turns) carry over unchanged.
 
 ## Final step (write order)
 
+> **IMPORTANT — use the Write tool directly. Do NOT generate a Python script to
+> produce the JSON or markdown.** Creating an intermediate script adds unnecessary
+> failure modes (syntax errors, f-string escaping, exec failures) and is never
+> required. Steps 3–6 below are performed by the AI itself using the Write tool.
+
 1. Run `scripts/audit-extract.py <input-json> --mode detailed` once.
 2. Read the Phase 2 config files (CLAUDE.md / settings / `.claudeignore`).
-3. Populate the full JSON object in memory (up to 16 findings,
-   `quick_wins`, `structural_fixes`, `estimated_savings`).
-4. Write the JSON sidecar to
+3. Populate the full JSON object in memory (in the AI's own context — up to 16
+   findings, `quick_wins`, `structural_fixes`, `estimated_savings`).
+4. Call the **Write tool** to write the JSON sidecar to
    `<project>/exports/session-metrics/audit_<id8>_<ts>_detailed.json`.
-5. Render to markdown using the template.
-6. Write the markdown copy to
+5. Render to markdown using the template (in the AI's own context).
+6. Call the **Write tool** to write the markdown copy to
    `<project>/exports/session-metrics/audit_<id8>_<ts>_detailed.md`.
 7. Print the same markdown content inline (without the H1 heading).
 8. Print two stderr-style lines:

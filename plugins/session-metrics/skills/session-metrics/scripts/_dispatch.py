@@ -13,6 +13,14 @@ from pathlib import Path
 _CACHE_BREAK_DEFAULT_THRESHOLD = 100_000  # mirrors monolith constant; used in defaults
 _EXTENSIONS = {"text": "txt", "json": "json", "csv": "csv", "md": "md", "html": "html"}
 
+# Exported names accessed by session-metrics.py via _load_leaf(); listed here so
+# static analysers don't flag them as unreachable private functions.
+__all__ = [
+    "_run_single_session", "_run_project_cost", "_run_all_projects",
+    "_dispatch_instance", "_render_instance_text", "_render_instance_csv",
+    "_render_instance_md", "_render_instance_html",
+]
+
 
 def _sm():
     """Return the session_metrics module (deferred — fully loaded by call time)."""
@@ -864,7 +872,7 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
         subagents_included=bool(report.get("include_subagents", False)))
     inst_cache_breaks_html = _sm()._build_cache_breaks_html(
         report.get("cache_breaks", []) or [],
-        int(report.get("cache_break_threshold", _CACHE_BREAK_DEFAULT_THRESHOLD)),
+        int(report.get("cache_break_threshold", _sm()._CACHE_BREAK_DEFAULT_THRESHOLD)),
     )
     # v1.26.0: instance-scope coverage + within-session split.
     inst_attribution_coverage_html = _sm()._build_attribution_coverage_html(

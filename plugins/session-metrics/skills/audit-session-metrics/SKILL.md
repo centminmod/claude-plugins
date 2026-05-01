@@ -104,6 +104,12 @@ If `$ARGUMENTS[1]` is missing, empty, or the file does not exist, print:
    `[audit] saved → <json-path>`
    `[audit] saved → <md-path>`
 
+   **IMPORTANT:** Use the **Write tool** directly for steps 3 and 5.
+   Do NOT generate a Python script (e.g. writing to `/tmp/audit_synthesis.py`
+   and executing it) — this adds unnecessary failure modes (syntax errors,
+   f-string escaping) and is never required. Build the JSON in the AI's own
+   context; call Write. Render the markdown in context; call Write again.
+
 ## Tone
 
 - **Direct and specific.** Cite the exact ratio, dollar figure, or turn

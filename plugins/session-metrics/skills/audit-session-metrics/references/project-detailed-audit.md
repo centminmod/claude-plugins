@@ -111,6 +111,11 @@ Same three artefacts as project quick, with `_detailed` suffix:
 - `exports/session-metrics/audit_<id8>_<ts>_detailed.md`
 - Inline markdown (without H1).
 
+> **IMPORTANT — use the Write tool directly. Do NOT generate a Python script to
+> produce the JSON or markdown.** Build the JSON in the AI's own context, call the
+> Write tool, render the markdown in context, call the Write tool again. No
+> intermediate script needed or permitted.
+
 ## Finding cap
 
 Same rules as project quick: negative cap 7, positive cap 3, `"other"` forbidden.

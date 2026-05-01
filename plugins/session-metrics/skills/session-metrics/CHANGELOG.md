@@ -3,6 +3,24 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.40.1 — 2026-05-01
+
+### Post-split bug fixes and import cleanup
+
+Three bugs found by systematic audit of the 13-module monolith split (Sessions 129–132) and corrected in Session 133.
+
+**Bug 1 — `_dispatch.py` cache-break threshold fallback.** `_CACHE_BREAK_DEFAULT_THRESHOLD` in the HTML-render path was a locally-defined constant that ceased to exist in `_dispatch.py` after the split; the value was the same as `_sm()._CACHE_BREAK_DEFAULT_THRESHOLD` so it silently read the right number, but would have drifted if the default ever changed. Fixed to route through `_sm()`.
+
+**Bug 2/3 — `_charts.py` vendor-dir and allow-unverified constants.** `_VENDOR_CHARTS_DIR` and `_ALLOW_UNVERIFIED_CHARTS` were copied into `_charts.py` as seed variables (unnecessary duplicates of the bindings already owned by `session-metrics.py`). All reads inside `_charts.py` now route through `_sm()`. The four tests that patched the now-removed module-local attributes were updated to patch only `sm.*` (sufficient since all paths go through `_sm()`).
+
+**Import cleanup.** Nine imports moved entirely into leaf modules during the split (`io`, `json`, `os`, `pickle`, `time`, `ThreadPoolExecutor`, `datetime`, `timedelta`, `timezone`) removed from `session-metrics.py`. Three imports retained as module-level attributes for test monkeypatching via `sm.*`: `secrets`, `ZoneInfo`, `ZoneInfoNotFoundError`.
+
+**Audit-skill playbook reinforcement.** `SKILL.md` and all five playbook references in `audit-session-metrics` now carry an explicit guard prohibiting intermediate Python synthesis scripts; the Write tool must be used directly to produce JSON/markdown artefacts.
+
+653 tests pass, 1 skipped.
+
+---
+
 ## v1.40.0 — 2026-04-30
 
 ### Skill version embedded in all exports

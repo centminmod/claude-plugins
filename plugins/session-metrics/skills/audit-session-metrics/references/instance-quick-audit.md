@@ -140,10 +140,14 @@ at 3. `"other"` enum forbidden.
 
 ## Final step (write order)
 
+> **IMPORTANT — use the Write tool directly. Do NOT generate a Python script to
+> produce the JSON or markdown.** Creating an intermediate script adds unnecessary
+> failure modes. Steps 2–5 are performed by the AI itself using the Write tool.
+
 1. Run `scripts/audit-extract.py <input-json> --mode quick` once.
-2. Build the audit JSON using digest values.
-3. Write JSON sidecar to `exports/session-metrics/audit_<id8>_<ts>_quick.json`.
-4. Render to markdown using the template.
-5. Write markdown copy to `exports/session-metrics/audit_<id8>_<ts>_quick.md`.
+2. Build the audit JSON using digest values (in the AI's own context).
+3. Call the **Write tool** to write JSON sidecar to `exports/session-metrics/audit_<id8>_<ts>_quick.json`.
+4. Render to markdown using the template (in the AI's own context).
+5. Call the **Write tool** to write markdown copy to `exports/session-metrics/audit_<id8>_<ts>_quick.md`.
 6. Print the same markdown inline (without the H1 heading).
 7. Print two `[audit] saved → <path>` lines.

@@ -3,7 +3,6 @@ import functools
 import hashlib
 import json
 import sys
-from pathlib import Path
 
 
 def _sm():
@@ -224,14 +223,8 @@ def _build_chart_html(
 #   - "chartjs"    — 2D stacked bar + line combo (MIT). Familiar API.
 #   - "none"       — emit the detail page with no chart at all.
 
-_VENDOR_CHARTS_DIR = Path(__file__).parent / "vendor" / "charts"
-
-# When True, vendor-chart SHA mismatches / missing manifest entries / missing
-# files degrade to a stderr warning (and the chart silently drops). When
-# False (default), they raise :class:`RuntimeError` so a tampered or
-# corrupted install fails loudly instead of shipping unverified JS to the
-# browser. Flipped by ``--allow-unverified-charts``.
-_ALLOW_UNVERIFIED_CHARTS = False
+# _VENDOR_CHARTS_DIR and _ALLOW_UNVERIFIED_CHARTS are defined in session-metrics.py
+# (not here) and accessed at runtime via _sm(). All reads in this module use _sm().
 
 
 class VendorChartVerificationError(RuntimeError):
@@ -256,7 +249,7 @@ def _load_chart_manifest() -> dict:
     Cached for the process lifetime — callers (``_read_vendor_files`` and
     ``_maybe_warn_chart_license``) only read from the returned dict.
     """
-    mpath = _VENDOR_CHARTS_DIR / "manifest.json"
+    mpath = _sm()._VENDOR_CHARTS_DIR / "manifest.json"
     if not mpath.exists():
         return {"libraries": {}}
     try:
@@ -279,14 +272,14 @@ def _read_vendor_files(library: str, suffix: str) -> str:
     if not lib_entry:
         _chart_verification_failure(
             f"chart library {library!r} not in vendor manifest at "
-            f"{_VENDOR_CHARTS_DIR / 'manifest.json'}"
+            f"{_sm()._VENDOR_CHARTS_DIR / 'manifest.json'}"
         )
         return ""
     parts: list[str] = []
     for f in lib_entry.get("files", []):
         if not f["path"].endswith(suffix):
             continue
-        path = _VENDOR_CHARTS_DIR / f["path"]
+        path = _sm()._VENDOR_CHARTS_DIR / f["path"]
         if not path.exists():
             _chart_verification_failure(f"vendor file missing: {path}")
             continue

@@ -315,12 +315,18 @@ already shows context above the audit).
 
 ## Final step (write order)
 
+> **IMPORTANT — use the Write tool directly. Do NOT generate a Python script to
+> produce the JSON or markdown.** Creating an intermediate script (e.g. writing
+> to `/tmp/audit_synthesis.py` and then executing it) adds unnecessary failure
+> modes (syntax errors, f-string escaping, exec failures) and is never required.
+> Steps 2–5 below are performed by the AI itself using the Write tool.
+
 1. Run `scripts/audit-extract.py <input-json> --mode quick` once.
-2. Build the audit JSON object using the digest values.
-3. Write the JSON sidecar to
+2. Build the audit JSON object using the digest values (in the AI's own context).
+3. Call the **Write tool** to write the JSON sidecar to
    `<project>/exports/session-metrics/audit_<id8>_<ts>_quick.json`.
-4. Render to markdown using the template.
-5. Write the markdown copy to
+4. Render to markdown using the template (in the AI's own context).
+5. Call the **Write tool** to write the markdown copy to
    `<project>/exports/session-metrics/audit_<id8>_<ts>_quick.md`.
 6. Print the same markdown content inline (without the H1 heading).
 7. Print two stderr-style lines:

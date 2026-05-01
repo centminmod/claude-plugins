@@ -1675,7 +1675,6 @@ def test_read_vendor_js_returns_real_payload_and_hash_matches():
 def test_read_vendor_js_unknown_library_raises(monkeypatch):
     """Post-H6 fail-closed: an unknown library raises rather than degrading."""
     monkeypatch.setattr(sm, "_ALLOW_UNVERIFIED_CHARTS", False)
-    monkeypatch.setattr(sys.modules["_charts"], "_ALLOW_UNVERIFIED_CHARTS", False)
     with pytest.raises(sm.VendorChartVerificationError, match="not in vendor manifest"):
         sm._read_vendor_js("not-a-library")
 
@@ -1683,7 +1682,6 @@ def test_read_vendor_js_unknown_library_raises(monkeypatch):
 def test_read_vendor_js_unknown_library_warn_with_override(monkeypatch, capsys):
     """With --allow-unverified-charts the failure degrades to a stderr warning."""
     monkeypatch.setattr(sm, "_ALLOW_UNVERIFIED_CHARTS", True)
-    monkeypatch.setattr(sys.modules["_charts"], "_ALLOW_UNVERIFIED_CHARTS", True)
     payload = sm._read_vendor_js("not-a-library")
     assert payload == ""
     err = capsys.readouterr().err
@@ -1712,9 +1710,7 @@ def test_read_vendor_js_sha_mismatch_raises(tmp_path, monkeypatch):
     }
     (fake_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     monkeypatch.setattr(sm, "_VENDOR_CHARTS_DIR", fake_root)
-    monkeypatch.setattr(sys.modules["_charts"], "_VENDOR_CHARTS_DIR", fake_root)
     monkeypatch.setattr(sm, "_ALLOW_UNVERIFIED_CHARTS", False)
-    monkeypatch.setattr(sys.modules["_charts"], "_ALLOW_UNVERIFIED_CHARTS", False)
     sm._load_chart_manifest.cache_clear()
     try:
         with pytest.raises(sm.VendorChartVerificationError, match="SHA-256 mismatch"):
@@ -1742,9 +1738,7 @@ def test_read_vendor_js_sha_mismatch_warns_with_override(tmp_path, monkeypatch, 
     }
     (fake_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     monkeypatch.setattr(sm, "_VENDOR_CHARTS_DIR", fake_root)
-    monkeypatch.setattr(sys.modules["_charts"], "_VENDOR_CHARTS_DIR", fake_root)
     monkeypatch.setattr(sm, "_ALLOW_UNVERIFIED_CHARTS", True)
-    monkeypatch.setattr(sys.modules["_charts"], "_ALLOW_UNVERIFIED_CHARTS", True)
     sm._load_chart_manifest.cache_clear()
     try:
         payload = sm._read_vendor_js("mylib")

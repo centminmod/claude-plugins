@@ -27,27 +27,13 @@ Environment variables (all optional — CLI flags take precedence):
   CLAUDE_PROJECTS_DIR     Override ~/.claude/projects (default: ~/.claude/projects)
 """
 
-import argparse
 import atexit
-import bisect
-import csv as csv_mod
-import functools
-import hashlib
-import html as html_mod
 import importlib.util as _ilu
-import io
-import json
-import os
-import pickle
 import re
-import secrets
+import secrets  # accessed as sm.secrets by tests; actual use is in _data.py
 import sys
-import time
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
-from difflib import SequenceMatcher
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # accessed as sm.ZoneInfo / sm.ZoneInfoNotFoundError by tests
 
 # Bump when the parsed-entries shape changes — invalidates old parse caches.
 # 1.1.0 (2026-04-30): cache format switched from gzip+JSON to pickle protocol 5.
@@ -56,7 +42,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # on disk (~9 MB → ~19 MB per typical session); acceptable for a developer-tool
 # cache. Version bump invalidates every existing user blob exactly once.
 _SCRIPT_VERSION = "1.1.0"
-_SKILL_VERSION  = "1.40.0"  # embedded in every export; bump when plugin version bumps
+_SKILL_VERSION  = "1.40.1"  # embedded in every export; bump when plugin version bumps
 
 # ---------------------------------------------------------------------------
 # Pricing table  (USD per million tokens)
@@ -192,6 +178,7 @@ def _load_leaf(name: str):
         return sys.modules[name]
     _here = Path(__file__).resolve().parent
     spec = _ilu.spec_from_file_location(name, _here / f"{name}.py")
+    assert spec is not None and spec.loader is not None, f"Cannot locate leaf module {name!r}"
     mod = _ilu.module_from_spec(spec)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
@@ -265,8 +252,8 @@ del _an_m
 
 _ch_m = _load_leaf("_charts")
 _CHART_PAGE                   = _ch_m._CHART_PAGE
-_VENDOR_CHARTS_DIR            = _ch_m._VENDOR_CHARTS_DIR
-_ALLOW_UNVERIFIED_CHARTS      = _ch_m._ALLOW_UNVERIFIED_CHARTS
+_VENDOR_CHARTS_DIR            = Path(_ch_m.__file__ or __file__).resolve().parent / "vendor" / "charts"
+_ALLOW_UNVERIFIED_CHARTS      = False
 VendorChartVerificationError  = _ch_m.VendorChartVerificationError
 _chart_verification_failure   = _ch_m._chart_verification_failure
 _load_chart_manifest          = _ch_m._load_chart_manifest

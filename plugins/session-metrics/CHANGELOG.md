@@ -3,6 +3,24 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.40.1 — 2026-05-01
+
+### Post-split bug fixes and import cleanup
+
+Three bugs corrected in the 13-module monolith split.
+
+**Bug 1 — `_dispatch.py` cache-break threshold fallback.** `_CACHE_BREAK_DEFAULT_THRESHOLD` in the HTML-render path was a locally-defined constant that would have drifted if the default ever changed. Fixed to route through `_sm()`.
+
+**Bug 2/3 — `_charts.py` vendor-dir and allow-unverified constants.** `_VENDOR_CHARTS_DIR` and `_ALLOW_UNVERIFIED_CHARTS` were unnecessary duplicates in `_charts.py`. All reads now route through `_sm()`.
+
+**Import cleanup.** Nine imports moved entirely into leaf modules during the split removed from `session-metrics.py`. Three retained as module-level attributes for test monkeypatching: `secrets`, `ZoneInfo`, `ZoneInfoNotFoundError`.
+
+**Audit-skill playbook reinforcement.** `SKILL.md` and all five playbook references in `audit-session-metrics` now carry an explicit guard prohibiting intermediate Python synthesis scripts.
+
+653 tests pass, 1 skipped.
+
+---
+
 ## v1.40.0 — 2026-04-30
 
 ### Skill version embedded in all exports
