@@ -1,0 +1,1398 @@
+"""Data loading, parsing, and analysis layer for session-metrics."""
+import bisect
+import hashlib
+import json
+import os
+import pickle
+import re
+import secrets
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
+from pathlib import Path
+
+
+def _sm():
+    return sys.modules["session_metrics"]
+
+
+def _pricing_for(model: str) -> dict[str, float]:
+    if model in _sm()._PRICING:
+        return _sm()._PRICING[model]
+    # Regex patterns before prefix sweep so specific variants (e.g. glm-5-turbo)
+    # aren't swallowed by a shorter prefix (e.g. glm-5).
+    for pattern, rates in _sm()._PRICING_PATTERNS:
+        if pattern.search(model):
+            return rates
+    for prefix, rates in _sm()._PRICING.items():
+        if model.startswith(prefix):
+            return rates
+    _sm()._UNKNOWN_MODELS_SEEN.add(model)
+    return _sm()._DEFAULT_PRICING
+
+
+# ---------------------------------------------------------------------------
+# JSONL parsing
+# ---------------------------------------------------------------------------
+
+def _parse_jsonl(path: Path) -> list[dict]:
+    entries = []
+    skipped = 0
+    first_err: str | None = None
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                skipped += 1
+                if first_err is None:
+                    first_err = f"line {lineno}: {exc}"
+    if skipped:
+        suffix = f" (first: {first_err})" if first_err else ""
+        print(f"[warn] {path.name}: {skipped} malformed line{'s' if skipped != 1 else ''} skipped{suffix}",
+              file=sys.stderr)
+    return entries
+
+
+def _parse_cache_dir() -> Path:
+    """Return the directory for serialized parse-cache blobs."""
+    return Path.home() / ".cache" / "session-metrics" / "parse"
+
+
+def _parse_cache_key(path: Path, mtime_ns: int) -> str:
+    """Build a stable cache-key filename from path hash, stem, mtime, and ver.
+
+    An 8-hex-char SHA1 of the resolved absolute path disambiguates two JSONLs
+    that share a UUID stem (e.g. identical filenames in sibling project dirs).
+    Using ``mtime_ns`` (nanoseconds since epoch) means a touched JSONL always
+    invalidates the cache. Bumping ``_sm()._SCRIPT_VERSION`` invalidates every
+    existing blob — safe default when the parser shape changes.
+    """
+    try:
+        abs_path = str(path.resolve())
+    except OSError:
+        abs_path = str(path)
+    path_hash = hashlib.sha1(abs_path.encode("utf-8")).hexdigest()[:8]
+    return f"{path.stem}__{path_hash}__{mtime_ns}__{_sm()._SCRIPT_VERSION}.pkl"
+
+
+def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
+    """Return parsed entries from ``path``, using a pickle cache on disk.
+
+    Cache format is ``pickle`` protocol 5 (stdlib, no compression). Bench
+    measured -67% cold / -18% warm vs the prior gzip+JSON cache because
+    pickle skips JSON's UTF-8 encode/decode and gzip's compression cost
+    on this workload (~5k+ Python dicts of mixed strings/ints/floats).
+    Trade-off: cache files are ~2× larger on disk (no compression).
+
+    Cache invalidation is automatic on (a) JSONL mtime change and
+    (b) ``_sm()._SCRIPT_VERSION`` bump. On I/O errors the cache is silently
+    skipped — correctness first, speed second. Trust model: single-user-
+    local; pickle of the script's own writes is safe.
+    """
+    if not use_cache:
+        return _parse_jsonl(path)
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        return _parse_jsonl(path)
+
+    cache_dir = _sm()._parse_cache_dir()
+    cache_path = cache_dir / _sm()._parse_cache_key(path, mtime_ns)
+    try:
+        with open(cache_path, "rb") as fh:
+            return pickle.load(fh)
+    except FileNotFoundError:
+        pass
+    except (OSError, pickle.UnpicklingError, EOFError):
+        # Corrupt or unreadable — fall through to fresh parse.
+        pass
+
+    entries = _parse_jsonl(path)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Write atomically so a crash mid-write doesn't leave a corrupt cache.
+        # Randomize the tmp suffix with pid + 4 bytes of entropy so two
+        # concurrent writers on the same cache_path never collide on the
+        # same tmp file (POSIX os.replace is atomic, but two writers racing
+        # on the same tmp could interleave bytes prior to replace()).
+        tmp = cache_path.with_suffix(
+            f"{cache_path.suffix}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        )
+        with open(tmp, "wb") as fh:
+            pickle.dump(entries, fh, protocol=5)
+        tmp.replace(cache_path)
+    except OSError:
+        # Non-fatal — the parse already succeeded.
+        pass
+    else:
+        # Prune stranded blobs for the same source file (same stem + path_hash)
+        # that were left behind by an mtime_ns bump or a _sm()._SCRIPT_VERSION change.
+        # Only runs on cache miss (post-successful write) — no latency on warm hits.
+        try:
+            try:
+                _abs = str(path.resolve())
+            except OSError:
+                _abs = str(path)
+            _ph = hashlib.sha1(_abs.encode("utf-8")).hexdigest()[:8]
+            _prefix = f"{path.stem}__{_ph}__"
+            for _stale in cache_dir.glob(f"{_prefix}*"):
+                if _stale.name != cache_path.name:
+                    try:
+                        _stale.unlink()
+                    except OSError:
+                        pass  # racing writer / file vanished between glob and unlink
+        except OSError:
+            pass  # non-fatal — the write already succeeded
+    return entries
+
+
+def _prune_cache_global(cache_dir: Path) -> None:
+    """Lazy global prune of the parse-cache directory.
+
+    Throttled to at most once per 24 hours via a sentinel file so it runs
+    silently on every normal invocation without per-run overhead.
+
+    Deletion criteria for each *.pkl blob:
+    1. Orphaned — the UUID stem matches no JSONL under _projects_dir()
+       (deleted project, renamed slug, migrated machine).
+    2. Inactive session — source JSONL mtime > 60 days (session closed)
+       AND blob mtime > 30 days (not recently cold-parsed).
+    3. Stale blob — blob mtime > 30 days even when the session is still
+       active-ish (JSONL mtime <= 60 days).  One cold re-parse (~0.3 s)
+       is cheaper than keeping blobs that warm-cache hits never refresh.
+
+    The 30 d / 60 d split prevents deleting blobs that are being served
+    on warm hits daily for an ongoing project: if the JSONL is young,
+    we keep the blob even when it hasn't been written in a month.
+
+    All I/O errors are silenced — the prune must never surface to the user
+    or interrupt the main parse path.
+    """
+    sentinel = cache_dir / ".prune_last_run"
+    now = time.time()
+    _24h = 86_400.0
+    _30d = 30 * _24h
+    _60d = 60 * _24h
+
+    try:
+        if sentinel.exists() and (now - sentinel.stat().st_mtime) < _24h:
+            return
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+    except OSError:
+        return
+
+    # Single glob pass — build UUID→path index for all live JSONLs.
+    jsonl_by_stem: dict[str, Path] = {}
+    try:
+        projects_root = _sm()._projects_dir()
+        for _j in projects_root.glob("*/*.jsonl"):
+            jsonl_by_stem[_j.stem] = _j
+        for _j in projects_root.glob("*/subagents/*.jsonl"):
+            jsonl_by_stem[_j.stem] = _j
+    except OSError:
+        return  # can't scan — skip this cycle
+
+    try:
+        blobs = list(cache_dir.glob("*.pkl"))
+    except OSError:
+        return
+
+    for _blob in blobs:
+        try:
+            stem = _blob.name.split("__", 1)[0]
+            blob_age = now - _blob.stat().st_mtime
+            _jsonl = jsonl_by_stem.get(stem)
+
+            if _jsonl is None:
+                _blob.unlink()  # orphaned — source JSONL gone
+                continue
+
+            if blob_age <= _30d:
+                continue  # recently written — keep unconditionally
+
+            try:
+                jsonl_age = now - _jsonl.stat().st_mtime
+            except OSError:
+                _blob.unlink()  # can't stat JSONL — treat as orphaned
+                continue
+
+            if jsonl_age > _60d:
+                _blob.unlink()  # session inactive for 60+ days
+        except OSError:
+            pass  # file vanished between glob and unlink — harmless
+
+
+_CONTENT_LETTERS = (
+    ("thinking",            "T"),
+    ("tool_use",            "u"),
+    ("text",                "x"),
+    ("tool_result",         "r"),
+    ("image",               "i"),
+    ("server_tool_use",     "v"),
+    ("advisor_tool_result", "R"),
+)
+
+
+_BLOCK_WINDOW_SEC = 5 * 3600
+
+
+def _parse_iso_epoch(ts: str) -> int:
+    """Parse an ISO-8601 timestamp to UTC epoch seconds; 0 on failure."""
+    dt = _sm()._parse_iso_dt(ts)
+    if dt is None:
+        return 0
+    try:
+        return int(dt.timestamp())
+    except (OSError, OverflowError):
+        return 0
+
+
+def _build_session_blocks(
+    sessions_raw: list[tuple[str, list[dict], list[int]]],
+) -> list[dict]:
+    """Group all events into 5-hour blocks anchored at each block's first event.
+
+    A block starts when an event arrives more than 5 hours after the previous
+    block's anchor.  Events are the union of filtered user prompts and
+    assistant-turn timestamps across every session in the project — this
+    matches what Anthropic's rate-limit window sees (users can ``/clear``
+    mid-block and the window keeps running).
+
+    Each block records: anchor and last timestamps, elapsed minutes, turn
+    count, user-message count, per-bucket token totals, USD cost, model mix,
+    and which session IDs touched the block.
+    """
+    events: list[tuple[int, str, str, dict | None]] = []
+    for session_id, raw_turns, user_ts in sessions_raw:
+        for u in user_ts:
+            events.append((u, "user", session_id, None))
+        for t in raw_turns:
+            e = _parse_iso_epoch(t.get("timestamp", ""))
+            if e:
+                events.append((e, "turn", session_id, t))
+    events.sort(key=lambda x: x[0])
+
+    blocks: list[dict] = []
+    for epoch, kind, sid, turn in events:
+        if not blocks or (epoch - blocks[-1]["anchor_epoch"]) >= _BLOCK_WINDOW_SEC:
+            blocks.append({
+                "anchor_epoch":     epoch,
+                "last_epoch":       epoch,
+                "turn_count":       0,
+                "user_msg_count":   0,
+                "input":            0,
+                "output":           0,
+                "cache_read":       0,
+                "cache_write":      0,
+                "cost_usd":         0.0,
+                "models":           {},
+                "sessions_touched": set(),
+            })
+        b = blocks[-1]
+        b["last_epoch"] = epoch
+        b["sessions_touched"].add(sid)
+        if kind == "user":
+            b["user_msg_count"] += 1
+        else:
+            assert turn is not None  # user events carry None; assistant turns carry a dict
+            msg   = turn["message"]
+            u     = msg["usage"]
+            model = msg.get("model", "unknown")
+            b["turn_count"]  += 1
+            b["input"]       += u.get("input_tokens", 0)
+            b["output"]      += u.get("output_tokens", 0)
+            b["cache_read"]  += u.get("cache_read_input_tokens", 0)
+            b["cache_write"] += u.get("cache_creation_input_tokens", 0)
+            b["cost_usd"]    += _sm()._cost(u, model)
+            b["models"][model] = b["models"].get(model, 0) + 1
+
+    for b in blocks:
+        b["sessions_touched"] = sorted(b["sessions_touched"])
+        b["elapsed_min"]      = (b["last_epoch"] - b["anchor_epoch"]) / 60.0
+        b["anchor_iso"]       = datetime.fromtimestamp(
+            b["anchor_epoch"], tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        b["last_iso"]         = datetime.fromtimestamp(
+            b["last_epoch"],   tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return blocks
+
+
+def _build_weekly_rollup(
+    sessions_out: list[dict],
+    sessions_raw: list[tuple[str, list[dict], list[int]]],
+    session_blocks: list[dict],
+    now_epoch: int | None = None,
+) -> dict:
+    """Compare the trailing 7 days against the prior 7 days.
+
+    Uses **deduped** assistant turns from ``sessions_out`` (match the report's
+    cost/token totals) and filtered user prompts from ``sessions_raw``.
+    Block counts use each block's anchor epoch — a block "belongs" to the
+    window its first event lands in.
+
+    Returns ``{"trailing_7d": {...}, "prior_7d": {...}, "has_data": bool,
+    "now_epoch": int}``. When ``prior_7d`` has zero turns, callers should
+    render deltas as "new period" rather than infinite percentage.
+    """
+    if now_epoch is None:
+        now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+    cutoff7  = now_epoch - 7  * 86400
+    cutoff14 = now_epoch - 14 * 86400
+
+    user_ts_all = sorted(ts for _, _, uts in sessions_raw for ts in uts)
+    turns_with_epoch: list[tuple[int, dict]] = []
+    for s in sessions_out:
+        for t in s["turns"]:
+            e = _parse_iso_epoch(t.get("timestamp", ""))
+            if e:
+                turns_with_epoch.append((e, t))
+
+    def bucket(start: int, end: int) -> dict:
+        b = {
+            "turns": 0, "user_prompts": 0, "cost": 0.0,
+            "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+            "blocks": 0,
+        }
+        for u in user_ts_all:
+            if start <= u < end:
+                b["user_prompts"] += 1
+        for e, t in turns_with_epoch:
+            if start <= e < end:
+                b["turns"]       += 1
+                b["input"]       += t["input_tokens"]
+                b["output"]      += t["output_tokens"]
+                b["cache_read"]  += t["cache_read_tokens"]
+                b["cache_write"] += t["cache_write_tokens"]
+                b["cost"]        += t["cost_usd"]
+        for blk in session_blocks:
+            if start <= blk["anchor_epoch"] < end:
+                b["blocks"] += 1
+        total_in = b["input"] + b["cache_read"] + b["cache_write"]
+        b["cache_hit_pct"] = 100 * b["cache_read"] / max(1, total_in)
+        return b
+
+    trailing = bucket(cutoff7, now_epoch)
+    prior    = bucket(cutoff14, cutoff7)
+    return {
+        "now_epoch":   now_epoch,
+        "trailing_7d": trailing,
+        "prior_7d":    prior,
+        "has_data":    (trailing["turns"] + prior["turns"]) > 0,
+    }
+
+
+def _weekly_block_counts(blocks: list[dict], now_epoch: int | None = None) -> dict:
+    """Count blocks active (``last_epoch`` >= cutoff) in trailing windows.
+
+    ``now_epoch`` is the upper bound for the window; defaults to current UTC.
+    Returns counts for the trailing 7/14/30 days plus the grand total, which
+    answers "am I tracking toward a weekly cap" at a glance.
+    """
+    if now_epoch is None:
+        now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+
+    def cnt(days: int) -> int:
+        cutoff = now_epoch - days * 86400
+        return sum(1 for b in blocks if b["last_epoch"] >= cutoff)
+
+    return {
+        "trailing_7":  cnt(7),
+        "trailing_14": cnt(14),
+        "trailing_30": cnt(30),
+        "total":       len(blocks),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Data model — build structured report from raw turns
+# ---------------------------------------------------------------------------
+
+def _totals_from_turns(turn_records: list[dict]) -> dict:
+    t = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+         "cache_write_5m": 0, "cache_write_1h": 0, "extra_1h_cost": 0.0,
+         "cost": 0.0, "no_cache_cost": 0.0, "turns": len(turn_records),
+         "advisor_call_count": 0, "advisor_cost_usd": 0.0}
+    content_block_totals = {"thinking": 0, "tool_use": 0, "text": 0,
+                            "tool_result": 0, "image": 0,
+                            "server_tool_use": 0, "advisor_tool_result": 0}
+    thinking_turn_count = 0
+    name_counts: dict[str, int] = {}
+    for r in turn_records:
+        t["input"]        += r["input_tokens"]
+        t["output"]       += r["output_tokens"]
+        t["cache_read"]   += r["cache_read_tokens"]
+        t["cache_write"]  += r["cache_write_tokens"]
+        t["cache_write_5m"] += r.get("cache_write_5m_tokens", 0)
+        t["cache_write_1h"] += r.get("cache_write_1h_tokens", 0)
+        t["cost"]              += r["cost_usd"]
+        t["no_cache_cost"]     += r["no_cache_cost_usd"]
+        t["advisor_call_count"] += r.get("advisor_calls", 0)
+        t["advisor_cost_usd"]   += r.get("advisor_cost_usd", 0.0)
+        # Extra cost paid for opting into the 1h TTL tier (vs pricing those
+        # same tokens at the 5m rate). Meaningful only when cache_write_1h > 0.
+        tokens_1h = r.get("cache_write_1h_tokens", 0)
+        if tokens_1h:
+            rates = _pricing_for(r["model"])
+            t["extra_1h_cost"] += tokens_1h * (rates["cache_write_1h"] - rates["cache_write"]) / 1_000_000
+        cb = r.get("content_blocks") or {}
+        for k in content_block_totals:
+            content_block_totals[k] += cb.get(k, 0)
+        if cb.get("thinking", 0) > 0:
+            thinking_turn_count += 1
+        for name in r.get("tool_use_names", []) or []:
+            name_counts[name] = name_counts.get(name, 0) + 1
+    n_turns = len(turn_records)
+    t["total"] = t["input"] + t["output"] + t["cache_read"] + t["cache_write"]
+    t["total_input"] = t["input"] + t["cache_read"] + t["cache_write"]
+    t["cache_savings"] = t["no_cache_cost"] - t["cost"]
+    t["cache_hit_pct"] = 100 * t["cache_read"] / max(1, t["total_input"])
+    t["content_blocks"] = content_block_totals
+    t["thinking_turn_count"] = thinking_turn_count
+    t["thinking_turn_pct"] = (
+        100 * thinking_turn_count / n_turns if n_turns else 0.0
+    )
+    t["tool_call_total"] = content_block_totals["tool_use"]
+    t["tool_call_avg_per_turn"] = (
+        content_block_totals["tool_use"] / n_turns if n_turns else 0.0
+    )
+    # Stable ordering: count desc, then name asc so ties are deterministic.
+    ranked = sorted(name_counts.items(), key=lambda x: (-x[1], x[0]))
+    t["tool_names_top3"] = [name for name, _ in ranked[:3]]
+    # Internal field carried so `_add_totals` (P4.4) can fold per-session
+    # subtotals into a project-wide total without re-iterating turns. Stripped
+    # off the top-level project totals + each session subtotal in
+    # `_build_report` after the reduce so it never lands in JSON exports.
+    t["_tool_name_counts"] = name_counts
+    return t
+
+
+def _add_totals(a: dict, b: dict) -> dict:
+    """Pairwise sum two `_totals_from_turns` outputs into a new total dict.
+
+    Used by `_build_report` (P4.4) to fold per-session subtotals into the
+    project-wide total without a second linear pass over every turn record.
+    Re-derives the computed fields (`total`, `total_input`, `cache_savings`,
+    `cache_hit_pct`, `thinking_turn_pct`, `tool_call_total`,
+    `tool_call_avg_per_turn`, `tool_names_top3`) from the merged additive
+    state so the output is byte-equivalent to running `_totals_from_turns`
+    over the concatenation of the two source turn lists.
+    """
+    out: dict = {
+        "input":               a["input"]               + b["input"],
+        "output":              a["output"]              + b["output"],
+        "cache_read":          a["cache_read"]          + b["cache_read"],
+        "cache_write":         a["cache_write"]         + b["cache_write"],
+        "cache_write_5m":      a["cache_write_5m"]      + b["cache_write_5m"],
+        "cache_write_1h":      a["cache_write_1h"]      + b["cache_write_1h"],
+        "extra_1h_cost":       a["extra_1h_cost"]       + b["extra_1h_cost"],
+        "cost":                a["cost"]                + b["cost"],
+        "no_cache_cost":       a["no_cache_cost"]       + b["no_cache_cost"],
+        "turns":               a["turns"]               + b["turns"],
+        "advisor_call_count":  a["advisor_call_count"]  + b["advisor_call_count"],
+        "advisor_cost_usd":    a["advisor_cost_usd"]    + b["advisor_cost_usd"],
+        "thinking_turn_count": a["thinking_turn_count"] + b["thinking_turn_count"],
+    }
+    cb_a = a.get("content_blocks") or {}
+    cb_b = b.get("content_blocks") or {}
+    cb: dict[str, int] = {}
+    for k in set(cb_a) | set(cb_b):
+        cb[k] = int(cb_a.get(k, 0)) + int(cb_b.get(k, 0))
+    out["content_blocks"] = cb
+    nc_a = a.get("_tool_name_counts") or {}
+    nc_b = b.get("_tool_name_counts") or {}
+    nc: dict[str, int] = dict(nc_a)
+    for k, v in nc_b.items():
+        nc[k] = nc.get(k, 0) + v
+    out["_tool_name_counts"] = nc
+    out["total"]         = out["input"] + out["output"] + out["cache_read"] + out["cache_write"]
+    out["total_input"]   = out["input"] + out["cache_read"] + out["cache_write"]
+    out["cache_savings"] = out["no_cache_cost"] - out["cost"]
+    out["cache_hit_pct"] = 100 * out["cache_read"] / max(1, out["total_input"])
+    n = out["turns"]
+    out["thinking_turn_pct"]      = 100 * out["thinking_turn_count"] / n if n else 0.0
+    out["tool_call_total"]        = cb.get("tool_use", 0)
+    out["tool_call_avg_per_turn"] = out["tool_call_total"] / n if n else 0.0
+    ranked = sorted(nc.items(), key=lambda x: (-x[1], x[0]))
+    out["tool_names_top3"] = [name for name, _ in ranked[:3]]
+    return out
+
+
+def _model_breakdown(turn_records: list[dict]) -> dict[str, dict]:
+    """Per-model summary keyed by model id.
+
+    Returns ``{model_id: {"turns": int, "cost_usd": float}}``. The richer
+    shape (vs. the prior plain ``{model_id: int}``) matches what
+    ``_aggregate_models`` already produces at instance scope, so renderers
+    and audit-extract see the same shape regardless of mode. Cost-share
+    surfaces as a column in the Models table and as ``cost_pct`` in the
+    audit baseline (P2.1 — turn share alone hides the long-tail expensive
+    model: 22% turns can be 37% cost).
+    """
+    out: dict[str, dict] = {}
+    for r in turn_records:
+        m = out.setdefault(r["model"], {"turns": 0, "cost_usd": 0.0})
+        m["turns"] += 1
+        m["cost_usd"] += float(r.get("cost_usd", 0.0))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase-A aggregators (v1.6.0) — inspired by Anthropic's session-report skill.
+# Three new cross-cutting breakdowns the existing renderers did not expose:
+#   1. ``cache_breaks``    — single turns above a configurable uncached+cache-
+#                             create threshold, with ±2 user-prompt context.
+#   2. ``by_skill``        — per-skill/slash-command aggregation (sticky
+#                             attribution to the most recent slash-prefixed
+#                             user prompt, overridden turn-locally by Skill
+#                             tool_use blocks).
+#   3. ``by_subagent_type``— per-subagent-type table (spawn count from
+#                             Agent/Task tool_use `input.subagent_type` +
+#                             actual consumed tokens when --include-subagents
+#                             tags each sidechain turn with its resolved
+#                             subagent_type).
+# These are computed once per report build and attached at both the per-
+# session level (session dict) and the report level (aggregated across the
+# report's sessions). The instance-mode builder then aggregates across
+# projects on top.
+# ---------------------------------------------------------------------------
+
+
+# Cache-break threshold: any single turn with
+# ``input_tokens + cache_write_tokens > CACHE_BREAK_THRESHOLD`` is flagged.
+# Matches the Anthropic session-report default (100k uncached). Override via
+# ``--cache-break-threshold`` on the CLI.
+_CACHE_BREAK_DEFAULT_THRESHOLD = 100_000
+
+
+def _detect_cache_breaks(session: dict,
+                          threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
+                          context_radius: int = 2) -> list[dict]:
+    """Flag turns whose uncached+cache-create token spend exceeds ``threshold``.
+
+    "Cache break" = the cached prompt context was evicted or not reused, so
+    the model had to re-ingest a large block of uncached tokens. Surfacing
+    these lets users trace *which* turn lost the cache (vs. a summary cache-
+    hit% which doesn't name events).
+
+    Returns a list of dicts in descending-uncached order, each with:
+        session_id, turn_index, timestamp, timestamp_fmt,
+        uncached (input + cache_write), total_tokens, cache_break_pct,
+        prompt_snippet, slash_command, model,
+        context: [{ts, text, slash, here: bool}] — ±2 user prompts around
+                 the flagged turn, ordered chronologically.
+    """
+    turns = session.get("turns") or []
+    if not turns:
+        return []
+    # Build an ordered list of user-prompt records from the turn stream.
+    # A "user prompt" here is the non-empty ``prompt_text`` of a turn — i.e.
+    # the genuine typed input that triggered this turn (or the first turn
+    # of a tool-use chain rooted in that prompt). Adjacent turns sharing
+    # the same prompt reference are deduped so the ±2 window scopes to
+    # distinct user actions, not tool-loop continuations.
+    prompts: list[dict] = []
+    last_text: str | None = None
+    for t in turns:
+        if t.get("is_resume_marker"):
+            continue
+        txt = (t.get("prompt_text") or "").strip()
+        if not txt or txt == last_text:
+            continue
+        prompts.append({
+            "ts":    t.get("timestamp", ""),
+            "ts_fmt": t.get("timestamp_fmt", ""),
+            "text":   t.get("prompt_snippet") or txt[:240],
+            "slash":  t.get("slash_command", ""),
+            "turn_index": t.get("index"),
+        })
+        last_text = txt
+    # Precompute prompt turn-indices once for bisect (P4.2). prompts is
+    # built by walking turns in chronological order, so this list is
+    # monotonically non-decreasing — required for bisect_right. Parser
+    # invariant: every prompt has an integer turn_index.
+    prompt_indices: list[int] = [p["turn_index"] for p in prompts]
+    # Detect flagged turns, attach context window.
+    breaks: list[dict] = []
+    for t in turns:
+        if t.get("is_resume_marker"):
+            continue
+        uncached = int(t.get("input_tokens", 0)) + int(t.get("cache_write_tokens", 0))
+        if uncached <= threshold:
+            continue
+        t["is_cache_break"] = True   # mutate in-place; used by HTML inline badge
+        total = int(t.get("total_tokens", 0))
+        pct = (100.0 * uncached / total) if total else 0.0
+        # Locate this turn's position in the prompt stream — match by
+        # turn_index >= prompt.turn_index. The closest prompt whose
+        # turn_index <= flagged turn's index is "this turn's" prompt; its
+        # ±context_radius neighbours form the context window.
+        ti = t.get("index")
+        anchor = bisect.bisect_right(prompt_indices, ti) - 1 if ti is not None else -1
+        ctx: list[dict] = []
+        if anchor >= 0:
+            lo = max(0, anchor - context_radius)
+            hi = min(len(prompts), anchor + context_radius + 1)
+            for i in range(lo, hi):
+                p = prompts[i]
+                ctx.append({
+                    "ts":    p["ts_fmt"] or p["ts"],
+                    "text":  p["text"],
+                    "slash": p["slash"],
+                    "here":  (i == anchor),
+                })
+        breaks.append({
+            "session_id":     session.get("session_id", ""),
+            "turn_index":     t.get("index"),
+            "timestamp":      t.get("timestamp", ""),
+            "timestamp_fmt":  t.get("timestamp_fmt", ""),
+            "uncached":       uncached,
+            "total_tokens":   total,
+            "cache_break_pct": round(pct, 1),
+            "prompt_snippet": t.get("prompt_snippet", ""),
+            "slash_command":  t.get("slash_command", ""),
+            "model":          t.get("model", ""),
+            "context":        ctx,
+        })
+    breaks.sort(key=lambda b: -b["uncached"])
+    return breaks
+
+
+# ---------------------------------------------------------------------------
+# Token-waste classification (v1.8.0)
+# ---------------------------------------------------------------------------
+# 9-category taxonomy from Jock Reeves "Token Waste Management" (2026).
+# Four categories (cache_read, cache_write, reasoning, subagent_overhead)
+# were already tracked; this block adds the remaining five plus per-turn
+# labelling and cross-session detection helpers.
+
+_TURN_CHARACTER_LABELS: dict[str, str] = {
+    "subagent_overhead": "Subagent Dispatch",
+    "paste_bomb":        "Paste-Bomb Prompt",
+    "reasoning":         "Extended Thinking",
+    "cache_read":        "Cache-Heavy",
+    "cache_write":       "Cache Payload",
+    "file_reread":       "Inefficient File Access",
+    "oververbose_edit":  "Verbose Response",
+    "retry_error":       "Retry Attempt",
+    "dead_end":          "Stuck/Truncated",
+    "productive":        "Productive",
+}
+_RISK_CATEGORIES: frozenset[str] = frozenset(
+    {"retry_error", "dead_end", "oververbose_edit", "file_reread", "paste_bomb"}
+)
+# Paste-bomb threshold (P2.2): a user prompt > 5 000 characters is treated
+# as a single waste category regardless of downstream effects (thinking,
+# tool fan-out, cache write). Matches the threshold the audit-extract
+# detailed scan already uses for its `paste_bombs` finding so the two
+# detectors agree on what counts as a paste bomb.
+_PASTE_BOMB_CHARS: int = 5_000
+
+# File-reaccess detector regexes (P4.1: hoisted to module scope so they
+# compile once at import-time rather than on every `_detect_file_reaccesses`
+# call). See the function docstring for usage. The `(?<![\w.])` start-of-arg
+# boundary is intentional — keeps `cat .claude/skills/foo.py` from matching
+# `/skills/foo.py` mid-string and silently merging same-suffix files across
+# projects.
+_EXT_GROUP: str = (
+    r"py|js|ts|mjs|jsx|tsx|json|yaml|yml|toml|sh|bash|zsh|txt|csv|md|"
+    r"html|htm|css|scss|rs|go|rb|php|java|c|cpp|h|sql|xml|cfg|conf|log|"
+    r"ini|env|lock"
+)
+_BASH_PATH_RE: re.Pattern[str] = re.compile(
+    r"(?<![\w.])(?:"
+    r"\.{1,2}/[\w.\-/]+\.(?:" + _EXT_GROUP + r")(?!\w)"
+    r"|/[\w.\-/]+\.(?:" + _EXT_GROUP + r")(?!\w)"
+    r"|~/[\w.\-/]+\.(?:py|js|ts|json|yaml|yml|md|sh|txt)(?!\w))"
+)
+# For Read/Edit/Write, filter out directory paths (no extension = not a file).
+_READ_EXT_RE: re.Pattern[str] = re.compile(r"\.(?:" + _EXT_GROUP + r")$")
+
+
+def _analyze_stop_reasons(turns: list[dict]) -> dict:
+    """Aggregate stop_reason distribution across real (non-resume) turns."""
+    counts: dict[str, int] = {}
+    real = [t for t in turns if not t.get("is_resume_marker")]
+    for t in real:
+        r = t.get("stop_reason") or "unknown"
+        counts[r] = counts.get(r, 0) + 1
+    total = max(len(real), 1)
+    return {
+        "distribution": counts,
+        "max_tokens_count": counts.get("max_tokens", 0),
+        "max_tokens_pct":   counts.get("max_tokens", 0) / total * 100,
+        "end_turn_pct":     counts.get("end_turn",   0) / total * 100,
+        "tool_use_pct":     counts.get("tool_use",   0) / total * 100,
+    }
+
+
+def _detect_retry_chains(turns: list[dict], threshold: float = 0.80) -> dict:
+    """Detect retry patterns within a single session's turn list.
+
+    Compares consecutive user-prompt turns using SequenceMatcher. Call once
+    per session (not on a cross-session flat list) to avoid false positives
+    at session boundaries.
+    """
+    def _tok(text: str) -> list[str]:
+        return re.findall(r"\w+", text.lower())
+
+    prompted = [t for t in turns
+                if not t.get("is_resume_marker") and (t.get("prompt_text") or "").strip()]
+
+    chains: list[dict] = []
+    processed: set[int] = set()
+
+    for i in range(len(prompted) - 1):
+        if i in processed:
+            continue
+        a_text = prompted[i]["prompt_text"]
+        a_toks = _tok(a_text)
+        chain = [prompted[i]["index"]]
+        j = i + 1
+        while j < len(prompted):
+            b_text = prompted[j]["prompt_text"]
+            if a_text == b_text or SequenceMatcher(None, a_toks, _tok(b_text)).ratio() >= threshold:
+                chain.append(prompted[j]["index"])
+                processed.add(j)
+                a_toks = _tok(b_text)
+                a_text = b_text
+                j += 1
+            else:
+                break
+        if len(chain) >= 2:
+            cost = sum(t.get("cost_usd", 0.0) for t in turns if t.get("index") in set(chain))
+            chains.append({"turn_indices": chain, "length": len(chain), "cost_usd": cost})
+
+    total_cost = sum(t.get("cost_usd", 0.0) for t in turns)
+    retry_cost = sum(c["cost_usd"] for c in chains)
+    return {
+        "chains":          chains,
+        "chain_count":     len(chains),
+        "retry_cost_pct":  retry_cost / total_cost * 100 if total_cost else 0.0,
+    }
+
+
+def _assign_context_segments(turns: list[dict]) -> None:
+    """Annotate each turn with ``_ctx_seg`` (int).
+
+    A new segment starts when the model changes between consecutive real turns
+    or when a resume marker is encountered. Resume markers themselves get the
+    segment ID of the gap (not counted in file-reaccess logic since they are
+    skipped there anyway).
+
+    This is used by ``_detect_file_reaccesses`` to distinguish avoidable
+    same-context re-reads (risk) from expected cross-context re-reads (e.g.
+    a subagent spawned with a fresh context, or a resumed session).
+    """
+    seg = 0
+    prev_model: str | None = None
+    for t in turns:
+        if t.get("is_resume_marker"):
+            seg += 1
+            t["_ctx_seg"] = seg
+            prev_model = None
+            continue
+        mdl = t.get("model", "")
+        if prev_model is not None and mdl != prev_model:
+            seg += 1
+        t["_ctx_seg"] = seg
+        prev_model = mdl
+
+
+def _detect_file_reaccesses(turns: list[dict]) -> dict:
+    """Identify files accessed 2+ times across the provided turn list.
+
+    For Read/Edit/Write tools, input_preview IS the file path (produced by
+    _summarise_tool_input). For Bash, a regex extracts path-like substrings
+    with a known-extension allowlist (prevents hidden dirs like ``.claude``
+    from being matched as files).
+
+    Uses ``_ctx_seg`` annotations (set by ``_assign_context_segments``) to
+    distinguish two re-access kinds:
+
+    - **Same-segment**: the same context reads a file 2+ times → avoidable,
+      flagged as risk in ``_turn_to_paths``.
+    - **Cross-segment only**: a file accessed in different model-context
+      segments (subagent boundary or session resume) → expected, not risk,
+      in ``_turn_to_paths_ctx``.
+
+    Callers must strip ``_turn_to_paths`` and ``_turn_to_paths_ctx`` before
+    JSON serialisation.
+    """
+    from collections import defaultdict
+
+    # (path, seg) → list of turn indices that accessed path in that segment
+    seg_turns: dict[tuple[str, int], list[int]] = defaultdict(list)
+    # path → set of segments that touched it
+    path_segs: dict[str, set[int]] = defaultdict(set)
+
+    for t in turns:
+        if t.get("is_resume_marker"):
+            continue
+        idx = t.get("index", -1)
+        seg = t.get("_ctx_seg", 0)
+        for tool in t.get("tool_use_detail", []):
+            name    = tool.get("name", "")
+            preview = tool.get("input_preview", "")
+            if name in ("Read", "Edit", "Write") and preview and _READ_EXT_RE.search(preview):
+                seg_turns[(preview, seg)].append(idx)
+                path_segs[preview].add(seg)
+            elif name == "Bash":
+                for path in _BASH_PATH_RE.findall(preview):
+                    seg_turns[(path, seg)].append(idx)
+                    path_segs[path].add(seg)
+
+    # Classify paths into same-segment re-reads (risk) vs cross-only (expected)
+    same_seg_paths: set[str] = set()
+    cross_only_paths: set[str] = set()
+    for path, segs in path_segs.items():
+        # Does any single segment have 2+ accesses?
+        has_same_seg = any(len(seg_turns[(path, s)]) >= 2 for s in segs)
+        total_accesses = sum(len(seg_turns[(path, s)]) for s in segs)
+        if total_accesses < 2:
+            continue
+        if has_same_seg:
+            same_seg_paths.add(path)
+        else:
+            cross_only_paths.add(path)
+
+    # Build per-turn path lookup dicts.
+    # Only RE-reads are flagged (skip the first access in each segment).
+    turn_to_paths: dict[int, set[str]] = defaultdict(set)
+    for path in same_seg_paths:
+        for seg in path_segs[path]:
+            # Sort so the chronologically first turn in this segment is skipped
+            for idx in sorted(seg_turns[(path, seg)])[1:]:
+                turn_to_paths[idx].add(path)
+
+    # For cross-context paths, skip the earliest segment (the original read);
+    # flag only the later-segment accesses as informational re-reads.
+    turn_to_paths_ctx: dict[int, set[str]] = defaultdict(set)
+    for path in cross_only_paths:
+        min_seg = min(path_segs[path])
+        for seg in path_segs[path]:
+            if seg == min_seg:
+                continue  # original read; not a re-read
+            for idx in seg_turns[(path, seg)]:
+                if idx not in turn_to_paths:
+                    turn_to_paths_ctx[idx].add(path)
+
+    all_reaccessed = same_seg_paths | cross_only_paths
+    # Flatten all turn indices per path for cost/detail purposes
+    all_path_turns: dict[str, list[int]] = {
+        p: [i for s in path_segs[p] for i in seg_turns[(p, s)]]
+        for p in all_reaccessed
+    }
+    turn_idx_set: dict[str, set[int]] = {p: set(v) for p, v in all_path_turns.items()}
+
+    # Marginal-cost attribution (P1.4): the previous implementation summed
+    # the entire turn cost for any turn that touched a re-read path, which
+    # over-attributed waste when a turn ran 5+ tool calls but only one of
+    # them hit the path. Weight per-turn contribution by
+    # ``path_reads_in_turn / total_tool_calls_in_turn`` so a single Bash arg
+    # in a 10-tool turn contributes 10% of the turn cost, not 100%.
+    turn_cost_by_idx: dict[int, float] = {}
+    turn_total_tools_by_idx: dict[int, int] = {}
+    for t in turns:
+        if t.get("is_resume_marker"):
+            continue
+        idx = t.get("index", -1)
+        turn_cost_by_idx[idx] = float(t.get("cost_usd", 0.0))
+        turn_total_tools_by_idx[idx] = len(t.get("tool_use_detail", []))
+
+    path_count_per_turn: dict[tuple[str, int], int] = defaultdict(int)
+    for (p, _), idx_list in seg_turns.items():
+        for idx in idx_list:
+            path_count_per_turn[(p, idx)] += 1
+
+    def _path_cost(p: str) -> float:
+        total = 0.0
+        for idx in turn_idx_set[p]:
+            denom = turn_total_tools_by_idx.get(idx, 0)
+            if denom <= 0:
+                continue
+            total += (
+                turn_cost_by_idx.get(idx, 0.0)
+                * path_count_per_turn.get((p, idx), 0)
+                / denom
+            )
+        return total
+
+    details = sorted(
+        [
+            {
+                "path":       p,
+                "count":      len(all_path_turns[p]),
+                "first_turn": min(all_path_turns[p]),
+                "cross_ctx":  p in cross_only_paths,
+                "cost_usd":   _path_cost(p),
+            }
+            for p in all_reaccessed
+        ],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:10]
+
+    return {
+        "reaccessed_count":      len(all_reaccessed),
+        "details":               details,
+        "total_reaccess_cost":   sum(float(d["cost_usd"]) for d in details),
+        "_turn_to_paths":        dict(turn_to_paths),      # risk; strip before export
+        "_turn_to_paths_ctx":    dict(turn_to_paths_ctx),  # expected; strip before export
+    }
+
+
+def _detect_verbose_edits(turns: list[dict], output_threshold: int = 800) -> dict:
+    """Flag Edit turns with output_tokens above threshold.
+
+    The original ratio heuristic (output/input) is not computable from
+    turn records (input_preview is summarised). This proxy — high output
+    on an Edit turn — catches genuine over-verbosity without needing raw
+    tool input. Threshold of 800 is calibrated for Sonnet/Opus; adjust via
+    the parameter if model mix shifts.
+    """
+    verbose = []
+    for t in turns:
+        if t.get("is_resume_marker"):
+            continue
+        if "Edit" not in (t.get("tool_use_names") or []):
+            continue
+        if t.get("output_tokens", 0) > output_threshold:
+            verbose.append({
+                "turn_index":    t["index"],
+                "output_tokens": t["output_tokens"],
+                "cost_usd":      t.get("cost_usd", 0.0),
+            })
+    verbose.sort(key=lambda x: x["output_tokens"], reverse=True)
+    return {
+        "verbose_count": len(verbose),
+        "details":       verbose[:10],
+        "total_cost":    sum(v["cost_usd"] for v in verbose),
+    }
+
+
+def _classify_turn(turn: dict, retry_idx: set[int],
+                   reaccess_idx: set[int], verbose_idx: set[int]) -> str:
+    """Assign a single waste category to a turn (priority waterfall).
+
+    Order: subagent_overhead > paste_bomb > reasoning > cache_read >
+           cache_write > file_reread > oververbose_edit > retry_error >
+           dead_end > productive
+
+    paste_bomb fires above reasoning so a turn with a >5 KB pasted prompt
+    that also triggers thinking surfaces as a paste-bomb (the actionable
+    user behaviour) rather than as reasoning (the downstream effect).
+    """
+    names    = turn.get("tool_use_names") or []
+    idx      = turn.get("index", -1)
+    cb       = turn.get("content_blocks") or {}
+    cr       = int(turn.get("cache_read_tokens", 0))
+    cw       = int(turn.get("cache_write_tokens", 0))
+    inp      = int(turn.get("input_tokens", 0))
+    total_in = inp + cr
+
+    if "Agent" in names or "Task" in names:
+        return "subagent_overhead"
+    if len(turn.get("prompt_text") or "") > _PASTE_BOMB_CHARS:
+        return "paste_bomb"
+    if cb.get("thinking", 0) > 0:
+        return "reasoning"
+    if cr > 100_000 and total_in > 0 and cr / total_in > 0.5:
+        return "cache_read"
+    if cw > 100_000:
+        return "cache_write"
+    if idx in reaccess_idx:
+        return "file_reread"
+    if idx in verbose_idx:
+        return "oververbose_edit"
+    if idx in retry_idx:
+        return "retry_error"
+    if turn.get("stop_reason") == "max_tokens":
+        return "dead_end"
+    return "productive"
+
+
+def _build_waste_analysis(sessions: list[dict]) -> dict:
+    """Orchestrate all waste-detection passes and per-turn classification.
+
+    ``sessions`` must already have ``_attribute_subagent_tokens`` and
+    ``_detect_cache_breaks`` applied (both mutate turn dicts in place).
+
+    Modifies turn dicts in place, adding:
+        turn_character       str  — technical key
+        turn_character_label str  — display label
+        turn_risk            bool — True for inherently wasteful categories
+
+    Returns the top-level waste_analysis dict (stripped of internal keys).
+    """
+    from collections import Counter
+
+    all_turns = [t for s in sessions for t in s.get("turns", [])]
+
+    # Annotate context segments before detection (model-switch = new context)
+    _assign_context_segments(all_turns)
+
+    # Retry: per-session to avoid cross-session false matches
+    all_chains: list[dict] = []
+    for s in sessions:
+        r = _detect_retry_chains(s.get("turns", []))
+        all_chains.extend(r["chains"])
+    total_cost = sum(t.get("cost_usd", 0.0) for t in all_turns)
+    retry_cost = sum(c["cost_usd"] for c in all_chains)
+    retry_result = {
+        "chains":         all_chains,
+        "chain_count":    len(all_chains),
+        "retry_cost_pct": retry_cost / total_cost * 100 if total_cost else 0.0,
+    }
+
+    # File re-access, verbose edits, stop reasons: cross-session is valid
+    stop_reasons    = _analyze_stop_reasons(all_turns)
+    reaccess_result = _detect_file_reaccesses(all_turns)
+    verbose_result  = _detect_verbose_edits(all_turns)
+
+    # Build O(1) lookup sets for classifier
+    retry_idx           = {i for c in retry_result["chains"] for i in c["turn_indices"]}
+    reaccess_idx        = set(reaccess_result["_turn_to_paths"].keys())
+    cross_ctx_reaccess_idx = set(reaccess_result["_turn_to_paths_ctx"].keys())
+    verbose_idx         = {v["turn_index"] for v in verbose_result["details"]}
+
+    # Classify and annotate every turn in place
+    distribution: Counter = Counter()
+    for t in all_turns:
+        if t.get("is_resume_marker"):
+            t["turn_character"]       = "productive"
+            t["turn_character_label"] = _TURN_CHARACTER_LABELS["productive"]
+            t["turn_risk"]            = False
+            t["reread_cross_ctx"]     = False
+            continue
+        idx  = t.get("index", -1)
+        char = _classify_turn(t, retry_idx, reaccess_idx, verbose_idx)
+        # Cross-context re-reads: same classification, but not a risk signal
+        if char != "file_reread" and idx in cross_ctx_reaccess_idx:
+            char = "file_reread"
+        cross_ctx = idx in cross_ctx_reaccess_idx and idx not in reaccess_idx
+        t["turn_character"]       = char
+        t["turn_character_label"] = _TURN_CHARACTER_LABELS[char]
+        t["turn_risk"]            = char in _RISK_CATEGORIES and not cross_ctx
+        t["reread_cross_ctx"]     = cross_ctx
+        if char == "file_reread":
+            paths_map = (reaccess_result["_turn_to_paths_ctx"]
+                         if cross_ctx else reaccess_result["_turn_to_paths"])
+            t["reaccessed_paths"] = sorted(
+                paths_map.get(idx, set())
+            )
+        distribution[char] += 1
+
+    _STRIP = {"_turn_to_paths", "_turn_to_paths_ctx"}
+    reaccess_out = {k: v for k, v in reaccess_result.items() if k not in _STRIP}
+
+    return {
+        "stop_reasons":    stop_reasons,
+        "retry_chains":    retry_result,
+        "file_reaccesses": reaccess_out,
+        "verbose_edits":   verbose_result,
+        "distribution":    dict(distribution),
+    }
+
+
+def _empty_skill_row(name: str) -> dict:
+    return {
+        "name":             name,
+        "invocations":      0,
+        "turns_attributed": 0,
+        "input":            0,
+        "output":           0,
+        "cache_read":       0,
+        "cache_write":      0,
+        "total_tokens":     0,
+        "cost_usd":         0.0,
+        "pct_total_cost":   0.0,
+        "cache_hit_pct":    0.0,
+        "session_count":    0,
+        "_sessions":        set(),  # stripped before return
+    }
+
+
+def _accumulate_bucket(row: dict, t: dict) -> None:
+    row["input"]        += int(t.get("input_tokens", 0))
+    row["output"]       += int(t.get("output_tokens", 0))
+    row["cache_read"]   += int(t.get("cache_read_tokens", 0))
+    row["cache_write"]  += int(t.get("cache_write_tokens", 0))
+    row["total_tokens"] += int(t.get("total_tokens", 0))
+    row["cost_usd"]     += float(t.get("cost_usd", 0.0))
+    row["turns_attributed"] += 1
+
+
+def _finalise_skill_rows(rows: dict, total_cost: float) -> list[dict]:
+    """Compute derived fields (pct_total_cost, cache_hit_pct) and drop the
+    internal ``_sessions`` set; return a list ordered by cost descending."""
+    out: list[dict] = []
+    for _, row in rows.items():
+        row = dict(row)
+        row["session_count"] = len(row.pop("_sessions", set()) or set())
+        total_input_side = (row["input"] + row["cache_read"] + row["cache_write"]) or 1
+        row["cache_hit_pct"] = round(100.0 * row["cache_read"] / total_input_side, 1)
+        row["pct_total_cost"] = (
+            round(100.0 * row["cost_usd"] / total_cost, 2) if total_cost else 0.0
+        )
+        out.append(row)
+    out.sort(key=lambda r: -r["cost_usd"])
+    return out
+
+
+def _build_by_skill(sessions: list[dict], total_cost: float) -> list[dict]:
+    """Aggregate per-turn tokens/cost by the active skill or slash command.
+
+    Attribution model (matches Anthropic's analyze-sessions.mjs approach):
+      - A user prompt with a leading slash-command (``/foo``) sets the
+        "current skill" to ``foo`` for that prompt and every follow-up
+        assistant turn driven by it (tool-use loops count).
+      - A new user prompt *without* a slash-command clears the current
+        skill (subsequent turns are un-attributed).
+      - A ``Skill`` tool_use block inside any turn overrides attribution
+        for *that turn only* to the invoked skill name (``input.skill``).
+      - Turns without any signal are simply not attributed (they still
+        count toward the report's ``totals`` but not any skill row).
+
+    Boundary detection between user prompts: we use ``prompt_text`` —
+    each turn carries a snapshot of the user entry that immediately
+    preceded its first occurrence (``_preceding_user_content``), which
+    in a tool-use chain is either the original prompt (first turn) or
+    a ``tool_result`` entry (subsequent turns). Only text-bearing prompts
+    contribute a non-empty ``prompt_text``; tool_result-only content
+    flattens to "". The boundary heuristic fires when ``prompt_text``
+    becomes non-empty and differs from the previous prompt we tracked.
+    """
+    rows: dict[str, dict] = {}
+    for session in sessions:
+        sid = session.get("session_id", "")
+        current_skill: str | None = None
+        last_prompt_text: str = ""
+        for t in session.get("turns", []) or []:
+            if t.get("is_resume_marker"):
+                continue
+            prompt_text = (t.get("prompt_text") or "").strip()
+            boundary_hit = bool(prompt_text) and prompt_text != last_prompt_text
+            if boundary_hit:
+                last_prompt_text = prompt_text
+                raw_slash = t.get("slash_command") or ""
+                # Strip the leading "/" so slash commands key-match Skill-tool
+                # invocations (e.g. "/session-metrics" slash ↔ "session-metrics"
+                # Skill tool-use invocation are merged into one row). This
+                # matches Anthropic session-report's convention.
+                new_skill = raw_slash.lstrip("/") if raw_slash else ""
+                current_skill = new_skill or None
+                if new_skill:
+                    rows.setdefault(new_skill, _empty_skill_row(new_skill))["invocations"] += 1
+            # Turn-scope override: Skill tool-use invocation attributes this
+            # turn to the invoked skill name regardless of current_skill.
+            invoked = t.get("skill_invocations") or []
+            if invoked:
+                skill_here = invoked[0]
+                row = rows.setdefault(skill_here, _empty_skill_row(skill_here))
+                _accumulate_bucket(row, t)
+                row["_sessions"].add(sid)
+                row["invocations"] += len(invoked)
+            elif current_skill:
+                row = rows.setdefault(current_skill, _empty_skill_row(current_skill))
+                _accumulate_bucket(row, t)
+                row["_sessions"].add(sid)
+    return _finalise_skill_rows(rows, total_cost)
+
+
+# Skill-name aliases that all attribute back to "session-metrics" for the
+# self-cost meta-metric. The user's slash-command name and the marketplace
+# plugin namespace both surface in the by_skill aggregation; map them here
+# so the meta-metric stays correct regardless of how the skill was invoked.
+_SELF_COST_SKILL_NAMES = frozenset({
+    "session-metrics",
+    "session-metrics:session-metrics",
+})
+
+
+def _summarize_self_cost(by_skill: list[dict]) -> dict:
+    """Return the running-total cost of session-metrics' own prior turns.
+
+    The current invocation's tokens are not yet written to the JSONL when
+    the script reads it, so this metric is intentionally a "prior turns
+    in this session" figure — first-ever invocation correctly reports
+    zero. Surfaces as a stderr line, an HTML KPI card, and a top-level
+    JSON key so users can audit the cost of their own observability
+    tooling alongside their session work.
+    """
+    out = {
+        "turns":          0,
+        "input":          0,
+        "output":         0,
+        "cache_read":     0,
+        "cache_write":    0,
+        "total_tokens":   0,
+        "cost_usd":       0.0,
+        "matched_skill_names": [],
+        "note": "Running total of prior session-metrics turns in this "
+                "session; the current invocation is not yet written to "
+                "the JSONL when the script reads it.",
+    }
+    for row in by_skill or []:
+        name = row.get("name") or ""
+        if name not in _SELF_COST_SKILL_NAMES:
+            continue
+        out["turns"]        += int(row.get("turns_attributed", 0) or 0)
+        out["input"]        += int(row.get("input", 0) or 0)
+        out["output"]       += int(row.get("output", 0) or 0)
+        out["cache_read"]   += int(row.get("cache_read", 0) or 0)
+        out["cache_write"]  += int(row.get("cache_write", 0) or 0)
+        out["total_tokens"] += int(row.get("total_tokens", 0) or 0)
+        out["cost_usd"]     += float(row.get("cost_usd", 0.0) or 0.0)
+        out["matched_skill_names"].append(name)
+    out["cost_usd"] = round(out["cost_usd"], 6)
+    return out
+
+
+def _empty_subagent_row(name: str) -> dict:
+    return {
+        "name":             name,
+        "spawn_count":      0,   # Agent/Task tool_use in main turns
+        "turns_attributed": 0,   # subagent turns (only when --include-subagents)
+        "input":            0,
+        "output":           0,
+        "cache_read":       0,
+        "cache_write":      0,
+        "total_tokens":     0,
+        "cost_usd":         0.0,
+        "pct_total_cost":   0.0,
+        "cache_hit_pct":    0.0,
+        "avg_tokens_per_call": 0.0,
+        # v1.26.0: per-invocation fixed-cost signals. Aggregated across
+        # invocations of this subagent type (one invocation = all turns
+        # sharing a ``subagent_agent_id``).
+        "invocation_count":         0,    # distinct subagent_agent_id values seen
+        "first_turn_share_pct":     0.0,  # median(first_turn.cost / invocation total)
+        "sp_amortisation_pct":      0.0,  # % of invocations whose turn ≥2 had cache_read
+        "_sessions":        set(),
+    }
+
+
+def _finalise_subagent_rows(rows: dict, total_cost: float) -> list[dict]:
+    out: list[dict] = []
+    for _, row in rows.items():
+        row = dict(row)
+        row["session_count"] = len(row.pop("_sessions", set()) or set())
+        total_input_side = (row["input"] + row["cache_read"] + row["cache_write"]) or 1
+        row["cache_hit_pct"] = round(100.0 * row["cache_read"] / total_input_side, 1)
+        row["pct_total_cost"] = (
+            round(100.0 * row["cost_usd"] / total_cost, 2) if total_cost else 0.0
+        )
+        calls_for_avg = row["spawn_count"] or row["turns_attributed"] or 1
+        row["avg_tokens_per_call"] = round(row["total_tokens"] / calls_for_avg, 1)
+        out.append(row)
+    out.sort(key=lambda r: -(r["total_tokens"] or r["spawn_count"]))
+    return out
+
+
+def _build_by_subagent_type(sessions: list[dict], total_cost: float) -> list[dict]:
+    """Aggregate spawns + consumed tokens per subagent_type.
+
+    Two data sources per row:
+      - ``spawn_count`` from **main** turns' ``spawned_subagents`` list
+        (populated when the assistant emitted an ``Agent``/``Task`` tool_use
+        with ``input.subagent_type``). Always available.
+      - ``input``/``output``/``cache_*``/``cost_usd`` from **subagent**
+        turns (turns with ``subagent_type`` set via ``_load_session``
+        tagging). Only populated when the user ran with
+        ``--include-subagents``; without it the token columns are all zero.
+
+    The row ``name`` is the resolved subagent type string. Rows for spawn
+    events whose type wasn't observed among the loaded subagent files still
+    appear (with zero tokens) so users see the spawn signal even when the
+    subagent JSONL wasn't loaded.
+    """
+    rows: dict[str, dict] = {}
+    # v1.26.0: per-invocation grouping for fixed-cost signals. Each
+    # ``subagent_agent_id`` is one invocation; we collect its turns
+    # (in transcript order) so we can compute first-turn-share and
+    # cache-read amortisation downstream.
+    invocations: dict[str, dict] = {}
+    for session in sessions:
+        sid = session.get("session_id", "")
+        for t in session.get("turns", []) or []:
+            if t.get("is_resume_marker"):
+                continue
+            # Spawn-count contribution from main turns.
+            for st in (t.get("spawned_subagents") or []):
+                row = rows.setdefault(st, _empty_subagent_row(st))
+                row["spawn_count"] += 1
+                row["_sessions"].add(sid)
+            # Token contribution from subagent-tagged turns.
+            stype = t.get("subagent_type") or ""
+            agent_id = t.get("subagent_agent_id") or ""
+            if stype:
+                row = rows.setdefault(stype, _empty_subagent_row(stype))
+                _accumulate_bucket(row, t)
+                row["_sessions"].add(sid)
+            if agent_id:
+                inv = invocations.setdefault(
+                    agent_id, {"type": stype, "turns": []})
+                inv["turns"].append(t)
+                # Belt-and-braces: a subagent turn might have empty stype
+                # if tagging was incomplete; later overwrites win.
+                if stype and not inv["type"]:
+                    inv["type"] = stype
+    # Roll per-invocation metrics up to the type-level rows.
+    type_invocations: dict[str, list[dict]] = {}
+    for inv in invocations.values():
+        stype = inv["type"]
+        if not stype:
+            continue
+        turns_sorted = sorted(inv["turns"], key=lambda x: x.get("index", 0))
+        if not turns_sorted:
+            continue
+        first_cost = float(turns_sorted[0].get("cost_usd", 0.0))
+        total_inv_cost = sum(float(t.get("cost_usd", 0.0)) for t in turns_sorted)
+        first_share = (first_cost / total_inv_cost) if total_inv_cost > 0 else 0.0
+        # SP amortisation: any turn beyond the first read from cache.
+        # Single-turn invocations cannot amortise (denominator-only).
+        sp_amortised = any(
+            int(t.get("cache_read_tokens", 0)) > 0 for t in turns_sorted[1:]
+        )
+        type_invocations.setdefault(stype, []).append({
+            "first_share":   first_share,
+            "sp_amortised":  sp_amortised,
+            "turn_count":    len(turns_sorted),
+        })
+    for stype, inv_list in type_invocations.items():
+        row = rows.get(stype)
+        if not row or not inv_list:
+            continue
+        shares_sorted = sorted(i["first_share"] for i in inv_list)
+        n = len(shares_sorted)
+        if n % 2 == 1:
+            median_share = shares_sorted[n // 2]
+        else:
+            median_share = 0.5 * (shares_sorted[n // 2 - 1] + shares_sorted[n // 2])
+        amort_count = sum(1 for i in inv_list if i["sp_amortised"])
+        row["invocation_count"]     = n
+        row["first_turn_share_pct"] = round(100.0 * median_share, 1)
+        row["sp_amortisation_pct"]  = round(100.0 * amort_count / n, 1)
+    return _finalise_subagent_rows(rows, total_cost)
+
+
+# ---------------------------------------------------------------------------
+# v1.26.0: subagent share + within-session split + attribution coverage
+# ---------------------------------------------------------------------------
+#
+# These helpers all derive from data the parser already records on each turn
+# (``attributed_subagent_*`` fields, ``cost_usd``, ``tool_use_ids``,
+# ``spawned_subagents``, ``subagent_agent_id``) plus ``subagent_attribution_summary``
+# already attached to the report. No new per-turn fields, no parser changes,
+# no ``_sm()._SCRIPT_VERSION`` bump.
+
+# ---------------------------------------------------------------------------
+# Output dispatch
+# ---------------------------------------------------------------------------
+
