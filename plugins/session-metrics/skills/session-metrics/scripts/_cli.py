@@ -46,7 +46,8 @@ def _validate_slug(value: str) -> str:
 # precedence over $CLAUDE_PROJECTS_DIR so users running multiple Claude
 # Code installs (e.g. one at ~/.claude, another under $CLAUDE_CONFIG_DIR)
 # can point the tool at whichever projects dir they want in a single run.
-_PROJECTS_DIR_OVERRIDE: Path | None = None
+# Canonical attribute lives on the orchestrator (session-metrics.py); reads
+# and writes here go through ``_sm()._PROJECTS_DIR_OVERRIDE``.
 
 
 def _projects_dir() -> Path:
@@ -587,7 +588,6 @@ def _load_compare_module():
     if "session_metrics_compare" in sys.modules:
         return sys.modules["session_metrics_compare"]
     sys.modules.setdefault("session_metrics", _sm())
-    import importlib.util
     here = Path(__file__).resolve().parent
     spec = importlib.util.spec_from_file_location(
         "session_metrics_compare", here / "session_metrics_compare.py")

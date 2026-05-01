@@ -3,6 +3,22 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.40.2 — 2026-05-01
+
+### Post-split audit-2 cleanup (P1 + P1b + P2)
+
+Second-pass audit of the 13-module split caught three follow-ups the first audit missed. LSP `findReferences` + Pyright diagnostics surfaced two; the third was already flagged as a latent maintenance trap.
+
+**P1 — `_PROJECTS_DIR_OVERRIDE` dead-seed elimination.** `_cli.py:49` had a leaf-level seed even though every read/write already routed through `_sm()._PROJECTS_DIR_OVERRIDE`. Same shape as the v1.40.1 Bug 2/3 fix for `_VENDOR_CHARTS_DIR` / `_ALLOW_UNVERIFIED_CHARTS`. Leaf seed deleted; canonical attr now defined directly on the orchestrator beside the other two.
+
+**P1b — drop two unused imports.** `_data.py` collapsed `from datetime import datetime, timedelta, timezone` (timedelta unused). `_cli.py` dropped a redundant function-local `import importlib.util` shadowing the top-level import.
+
+**P2 — collapse the `_CACHE_BREAK_DEFAULT_THRESHOLD = 100_000` triplicate.** Three identical literals in `_data.py`, `_dispatch.py`, `_report.py` (default-arg seeds, intentionally retained in v1.40.0 because Python evaluates `def fn(x=_NAME)` at def-time). New `_constants.py` zero-dep sibling leaf holds the single canonical literal. Orchestrator loads it first via `_load_leaf("_constants")` and keeps the module-level alias for runtime reads + tests.
+
+No behaviour change. 653 tests pass, 1 skipped.
+
+---
+
 ## v1.40.1 — 2026-05-01
 
 ### Post-split bug fixes and import cleanup

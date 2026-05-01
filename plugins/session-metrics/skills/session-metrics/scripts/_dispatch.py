@@ -10,7 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-_CACHE_BREAK_DEFAULT_THRESHOLD = 100_000  # mirrors monolith constant; used in defaults
+from _constants import _CACHE_BREAK_DEFAULT_THRESHOLD
+
 _EXTENSIONS = {"text": "txt", "json": "json", "csv": "csv", "md": "md", "html": "html"}
 
 # Exported names accessed by session-metrics.py via _load_leaf(); listed here so

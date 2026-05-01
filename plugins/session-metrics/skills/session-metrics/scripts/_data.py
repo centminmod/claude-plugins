@@ -8,9 +8,11 @@ import re
 import secrets
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
+
+from _constants import _CACHE_BREAK_DEFAULT_THRESHOLD
 
 
 def _sm():
@@ -561,13 +563,6 @@ def _model_breakdown(turn_records: list[dict]) -> dict[str, dict]:
 # report's sessions). The instance-mode builder then aggregates across
 # projects on top.
 # ---------------------------------------------------------------------------
-
-
-# Cache-break threshold: any single turn with
-# ``input_tokens + cache_write_tokens > CACHE_BREAK_THRESHOLD`` is flagged.
-# Matches the Anthropic session-report default (100k uncached). Override via
-# ``--cache-break-threshold`` on the CLI.
-_CACHE_BREAK_DEFAULT_THRESHOLD = 100_000
 
 
 def _detect_cache_breaks(session: dict,

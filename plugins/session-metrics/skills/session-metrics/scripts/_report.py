@@ -4,8 +4,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-
-_CACHE_BREAK_DEFAULT_THRESHOLD = 100_000
+from _constants import _CACHE_BREAK_DEFAULT_THRESHOLD
 
 
 def _sm():

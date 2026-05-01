@@ -42,7 +42,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # accessed as sm.ZoneInfo 
 # on disk (~9 MB → ~19 MB per typical session); acceptable for a developer-tool
 # cache. Version bump invalidates every existing user blob exactly once.
 _SCRIPT_VERSION = "1.1.0"
-_SKILL_VERSION  = "1.40.1"  # embedded in every export; bump when plugin version bumps
+_SKILL_VERSION  = "1.40.2"  # embedded in every export; bump when plugin version bumps
 
 # ---------------------------------------------------------------------------
 # Pricing table  (USD per million tokens)
@@ -185,6 +185,12 @@ def _load_leaf(name: str):
     return mod
 
 
+# Load _constants first — leaves that need def-time literals
+# (``def fn(x: int = _NAME)``) import from it at their own load time.
+_co_m = _load_leaf("_constants")
+_CACHE_BREAK_DEFAULT_THRESHOLD = _co_m._CACHE_BREAK_DEFAULT_THRESHOLD
+del _co_m
+
 _dt_m = _load_leaf("_dt")
 _parse_iso_dt = _dt_m._parse_iso_dt
 del _dt_m
@@ -254,6 +260,7 @@ _ch_m = _load_leaf("_charts")
 _CHART_PAGE                   = _ch_m._CHART_PAGE
 _VENDOR_CHARTS_DIR            = Path(_ch_m.__file__ or __file__).resolve().parent / "vendor" / "charts"
 _ALLOW_UNVERIFIED_CHARTS      = False
+_PROJECTS_DIR_OVERRIDE: Path | None = None
 VendorChartVerificationError  = _ch_m.VendorChartVerificationError
 _chart_verification_failure   = _ch_m._chart_verification_failure
 _load_chart_manifest          = _ch_m._load_chart_manifest
@@ -330,7 +337,6 @@ del _mr_m
 _cl_m = _load_leaf("_cli")
 _SESSION_RE                     = _cl_m._SESSION_RE
 _SLUG_RE                        = _cl_m._SLUG_RE
-_PROJECTS_DIR_OVERRIDE          = _cl_m._PROJECTS_DIR_OVERRIDE
 _validate_session_id            = _cl_m._validate_session_id
 _validate_slug                  = _cl_m._validate_slug
 _projects_dir                   = _cl_m._projects_dir
@@ -436,7 +442,6 @@ _weekly_block_counts        = _da_m._weekly_block_counts
 _totals_from_turns          = _da_m._totals_from_turns
 _add_totals                 = _da_m._add_totals
 _model_breakdown            = _da_m._model_breakdown
-_CACHE_BREAK_DEFAULT_THRESHOLD = _da_m._CACHE_BREAK_DEFAULT_THRESHOLD
 _detect_cache_breaks        = _da_m._detect_cache_breaks
 _TURN_CHARACTER_LABELS      = _da_m._TURN_CHARACTER_LABELS
 _RISK_CATEGORIES            = _da_m._RISK_CATEGORIES
