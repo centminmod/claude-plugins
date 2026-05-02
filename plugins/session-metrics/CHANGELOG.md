@@ -3,6 +3,20 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.1 — 2026-05-02
+
+### Internal: ruff hygiene cleanup (no behaviour change)
+
+Silenced the 22 pre-existing ruff errors across the four v1.41.0-modified files. No behaviour change, no interface change, no export-format change. Patch bump is for **export traceability** — `_SKILL_VERSION` is embedded in every export, so leaving the version unchanged after byte-level skill changes would make exports indistinguishable from the prior set.
+
+**4 documented re-imports pinned with `# noqa: F401` + `# noqa: I001`** at `session-metrics.py:30,33,36`. Tests patch them via `sm.secrets`, `sm.ZoneInfo`, `sm.ZoneInfoNotFoundError`; `ruff check --fix` would delete them and break 7+ tests.
+
+**15 cosmetic auto-fixes**: 8 × `timezone.utc` → `datetime.UTC` (UP017) and 7 × redundant `f` prefix removal (F541).
+
+**3 SIM105 — split treatment**: 2 × `try/except: pass` → `with contextlib.suppress(...)` in `_cli.py` (where comments live above the try); 1 × `# noqa: SIM105` in `_data.py:192` where the on-`pass` comment is locality-dependent.
+
+**Tests**: 684 passed, 1 skipped (unchanged from v1.41.0 baseline).
+
 ## v1.41.0 — 2026-05-02
 
 ### Audit-driven correctness + ergonomic batch
