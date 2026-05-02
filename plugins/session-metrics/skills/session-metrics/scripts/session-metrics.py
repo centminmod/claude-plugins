@@ -42,7 +42,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # accessed as sm.ZoneInfo 
 # on disk (~9 MB → ~19 MB per typical session); acceptable for a developer-tool
 # cache. Version bump invalidates every existing user blob exactly once.
 _SCRIPT_VERSION = "1.1.0"
-_SKILL_VERSION  = "1.40.2"  # embedded in every export; bump when plugin version bumps
+_SKILL_VERSION  = "1.41.0"  # embedded in every export; bump when plugin version bumps
 
 # ---------------------------------------------------------------------------
 # Pricing table  (USD per million tokens)
@@ -113,24 +113,39 @@ _DEFAULT_PRICING = {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_w
 # Regex patterns for flexible model-ID matching — checked between exact match and prefix
 # sweep. re.search so partial IDs (no provider prefix, date suffixes, :tag qualifiers)
 # still resolve. More-specific patterns must come first within each family.
+#
+# Boundary policy (v1.41.0):
+#   * Numeric-suffix families (gpt-5.5, qwen3.6, mimo-v2.5, kimi-k2.6,
+#     minimax-m2.7) carry ``(?!\d)`` so a model with one extra trailing digit
+#     (e.g. ``gpt-5.55``, ``qwen3.60``) falls through to default Sonnet rates
+#     instead of being mispriced as the shorter version.
+#   * Provider/model separators use the class ``[-_/.]`` rather than a bare
+#     ``.`` (which matched any character, including letters): keeps OpenRouter
+#     dotted IDs (``deepseek.v4-flash``) compatible while blocking arbitrary
+#     letter substitutions (``deepseekXv4Yflash``).
+#   * Suffix tokens (``pro``, ``flash``, ``plus``) carry ``\b`` so
+#     ``pro\b`` does not glue to other words.
+#   * Within a family, the more-expensive variant (e.g. pro) is declared
+#     first; this is a pricing-policy choice, not a regex bug — a hypothetical
+#     ``deepseek-v4-flash-pro`` would price as pro by design.
 _PRICING_PATTERNS: list[tuple[re.Pattern[str], dict[str, float]]] = [
     # OpenAI GPT-5.5 — Pro before base
-    (re.compile(r"gpt-5\.5.*pro",           re.I), _PRICING["openai/gpt-5.5-pro"]),
-    (re.compile(r"gpt-5\.5",                re.I), _PRICING["openai/gpt-5.5"]),
+    (re.compile(r"gpt-5\.5(?!\d).*pro\b",            re.I), _PRICING["openai/gpt-5.5-pro"]),
+    (re.compile(r"gpt-5\.5(?!\d)",                   re.I), _PRICING["openai/gpt-5.5"]),
     # DeepSeek V4 (separator between provider prefix and v4 may vary)
-    (re.compile(r"deepseek.v4.*pro",        re.I), _PRICING["deepseek/deepseek-v4-pro"]),
-    (re.compile(r"deepseek.v4.*flash",      re.I), _PRICING["deepseek/deepseek-v4-flash"]),
+    (re.compile(r"deepseek[-_/.]v4[-_/.].*pro\b",    re.I), _PRICING["deepseek/deepseek-v4-pro"]),
+    (re.compile(r"deepseek[-_/.]v4[-_/.].*flash\b",  re.I), _PRICING["deepseek/deepseek-v4-flash"]),
     # Xiaomi MiMo V2.5 — Pro before base
-    (re.compile(r"mimo.v2\.5.*pro",         re.I), _PRICING["xiaomi/mimo-v2.5-pro"]),
-    (re.compile(r"mimo.v2\.5",              re.I), _PRICING["xiaomi/mimo-v2.5"]),
+    (re.compile(r"mimo[-_/.]v2\.5(?!\d).*pro\b",     re.I), _PRICING["xiaomi/mimo-v2.5-pro"]),
+    (re.compile(r"mimo[-_/.]v2\.5(?!\d)",            re.I), _PRICING["xiaomi/mimo-v2.5"]),
     # Moonshot Kimi K2.6
-    (re.compile(r"kimi.k2\.6",              re.I), _PRICING["moonshotai/kimi-k2.6"]),
+    (re.compile(r"kimi[-_/.]k2\.6(?!\d)",            re.I), _PRICING["moonshotai/kimi-k2.6"]),
     # Qwen 3.6 Plus
-    (re.compile(r"qwen3\.6.*plus",          re.I), _PRICING["qwen/qwen3.6-plus"]),
+    (re.compile(r"qwen3\.6(?!\d).*plus\b",           re.I), _PRICING["qwen/qwen3.6-plus"]),
     # MiniMax M2.7
-    (re.compile(r"minimax.m2\.7",           re.I), _PRICING["minimax/minimax-m2.7"]),
+    (re.compile(r"minimax[-_/.]m2\.7(?!\d)",         re.I), _PRICING["minimax/minimax-m2.7"]),
     # GLM-5-Turbo before the bare glm-5 prefix entry
-    (re.compile(r"glm-5-turbo",             re.I), _PRICING["z-ai/glm-5-turbo"]),
+    (re.compile(r"glm-5-turbo\b",                    re.I), _PRICING["z-ai/glm-5-turbo"]),
 ]
 
 # Module-level advisory state — populated during parsing, printed via atexit.
@@ -178,7 +193,10 @@ def _load_leaf(name: str):
         return sys.modules[name]
     _here = Path(__file__).resolve().parent
     spec = _ilu.spec_from_file_location(name, _here / f"{name}.py")
-    assert spec is not None and spec.loader is not None, f"Cannot locate leaf module {name!r}"
+    if spec is None or spec.loader is None:
+        print(f"[error] Cannot locate leaf module {name!r} next to "
+              f"session-metrics.py", file=sys.stderr)
+        sys.exit(1)
     mod = _ilu.module_from_spec(spec)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
@@ -261,6 +279,11 @@ _CHART_PAGE                   = _ch_m._CHART_PAGE
 _VENDOR_CHARTS_DIR            = Path(_ch_m.__file__ or __file__).resolve().parent / "vendor" / "charts"
 _ALLOW_UNVERIFIED_CHARTS      = False
 _PROJECTS_DIR_OVERRIDE: Path | None = None
+# v1.41.0: parse-cache and export directories are operator-overridable so
+# users with multiple Claude Code installs (CI, ephemeral envs, shared boxes)
+# can redirect each independently. Resolution order: --flag > env var > default.
+_CACHE_DIR_OVERRIDE:    Path | None = None
+_EXPORT_DIR_OVERRIDE:   Path | None = None
 VendorChartVerificationError  = _ch_m.VendorChartVerificationError
 _chart_verification_failure   = _ch_m._chart_verification_failure
 _load_chart_manifest          = _ch_m._load_chart_manifest

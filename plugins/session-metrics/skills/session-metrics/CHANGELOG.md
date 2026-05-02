@@ -3,6 +3,33 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.0 — 2026-05-02
+
+### Audit-driven correctness + ergonomic batch
+
+DeepSeek V4 Pro audit (re-validated by Codex GPT-5.5 + code-searcher) surfaced six actionable findings; six rejections were already correct.
+
+**P0-A — `assert` → explicit error/exit at `session-metrics.py:_load_leaf`.** Under `python -O` the assert was stripped and a missing leaf module crashed cryptically. Now mirrors `_cli.py:_load_compare_module`'s explicit `if/print/sys.exit(1)` pattern.
+
+**P0-B — `_PRICING_PATTERNS` regex hardening (behaviour change).** Three fixes:
+- Numeric-suffix families (`gpt-5.5`, `qwen3.6`, `mimo-v2.5`, `kimi-k2.6`, `minimax-m2.7`) carry `(?!\d)` — extra-digit IDs (`gpt-5.55`) fall through to default rates.
+- Provider/model separators switched from bare `.` to `[-_/.]` — `deepseekXv4Yflash` no longer satisfies `deepseek.v4.*flash`.
+- Suffix tokens (`pro`, `flash`, `plus`) anchored with `\b`.
+
+**Behaviour-impact note**: model names that previously over-matched the looser regex now route to default Sonnet rates. Re-run historical reports for accurate before/after.
+
+**P1-A — `_parse_jsonl` defensive `isinstance(dict)` filter.** A stray non-dict line that parsed as valid JSON would `AttributeError` at `_extract_turns`. Now skipped via the same warn path as malformed JSON.
+
+**P1-B — `--cache-dir` flag + `CLAUDE_SESSION_METRICS_CACHE_DIR` env var.** Parse-cache directory gains operator override; same precedence shape as `--projects-dir` (flag > env > default).
+
+**P1-C — `--export-dir` flag + `CLAUDE_SESSION_METRICS_EXPORT_DIR` env var.** Export directory gains the same override shape; `_instance_export_root` flows through automatically.
+
+**P2-A — `@functools.lru_cache(maxsize=128)` on `_pricing_for`.** Removes the redundant three-tier resolution `_cost`/`_no_cache_cost`/`_advisor_info` each performed per turn. Idempotent set side-effect preserved; tests gain an autouse `_clear_pricing_cache` fixture.
+
+`SKILL.md` and `references/pricing.md` updated for parity with the new regex + flags. **684 passed, 1 skipped.**
+
+---
+
 ## v1.40.2 — 2026-05-01
 
 ### Post-split audit-2 cleanup (P1 + P1b + P2)

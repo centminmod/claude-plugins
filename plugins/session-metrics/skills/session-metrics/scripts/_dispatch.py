@@ -29,6 +29,23 @@ def _sm():
 
 
 def _export_dir() -> Path:
+    """Return the directory exports are written to.
+
+    Resolution order (v1.41.0):
+      1. ``--export-dir`` CLI flag (sets ``_sm()._EXPORT_DIR_OVERRIDE``)
+      2. ``CLAUDE_SESSION_METRICS_EXPORT_DIR`` env var
+      3. Default ``<cwd>/exports/session-metrics``
+
+    Mirrors the ``--cache-dir`` / ``--projects-dir`` precedence pattern.
+    ``_instance_export_root`` already calls this helper, so the override
+    flows through to the dated subfolder under ``<root>/instance/...``
+    automatically.
+    """
+    if _sm()._EXPORT_DIR_OVERRIDE is not None:
+        return _sm()._EXPORT_DIR_OVERRIDE
+    env = os.environ.get("CLAUDE_SESSION_METRICS_EXPORT_DIR")
+    if env:
+        return Path(env).expanduser()
     return Path(os.getcwd()) / "exports" / "session-metrics"
 
 

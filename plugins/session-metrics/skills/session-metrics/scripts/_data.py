@@ -1,5 +1,6 @@
 """Data loading, parsing, and analysis layer for session-metrics."""
 import bisect
+import functools
 import hashlib
 import json
 import os
@@ -19,7 +20,23 @@ def _sm():
     return sys.modules["session_metrics"]
 
 
+@functools.lru_cache(maxsize=128)
 def _pricing_for(model: str) -> dict[str, float]:
+    """Resolve a model ID to its rate dict.
+
+    Three-tier resolution: exact key match in ``_PRICING`` → regex pattern
+    sweep (``_PRICING_PATTERNS`` — more-specific variants first) → prefix
+    fallback. Unknown models add to ``_UNKNOWN_MODELS_SEEN`` and return
+    ``_DEFAULT_PRICING`` (Sonnet rates).
+
+    Cached (v1.41.0): ``functools.lru_cache(maxsize=128)`` removes the
+    redundant resolution that ``_cost`` and ``_no_cache_cost`` both
+    performed per turn. Side effect on ``_UNKNOWN_MODELS_SEEN`` only
+    fires the first time a given model name is seen — the set is
+    idempotent, so the at-exit warn surface is unchanged. Tests that
+    rely on the side effect refreshing per call must call
+    ``_pricing_for.cache_clear()`` (see autouse fixture in tests).
+    """
     if model in _sm()._PRICING:
         return _sm()._PRICING[model]
     # Regex patterns before prefix sweep so specific variants (e.g. glm-5-turbo)
@@ -48,11 +65,24 @@ def _parse_jsonl(path: Path) -> list[dict]:
             if not line:
                 continue
             try:
-                entries.append(json.loads(line))
+                parsed = json.loads(line)
             except json.JSONDecodeError as exc:
                 skipped += 1
                 if first_err is None:
                     first_err = f"line {lineno}: {exc}"
+                continue
+            # Defensive (v1.41.0): Claude Code's writer always emits JSON
+            # objects, but a corrupt/truncated/edited JSONL could land an
+            # array or scalar here. Downstream (`_extract_turns`) calls
+            # ``entry.get("type")`` directly, which would AttributeError
+            # on anything non-dict. Drop with the same skip path.
+            if not isinstance(parsed, dict):
+                skipped += 1
+                if first_err is None:
+                    first_err = (f"line {lineno}: top-level value is "
+                                 f"{type(parsed).__name__}, expected object")
+                continue
+            entries.append(parsed)
     if skipped:
         suffix = f" (first: {first_err})" if first_err else ""
         print(f"[warn] {path.name}: {skipped} malformed line{'s' if skipped != 1 else ''} skipped{suffix}",
@@ -61,7 +91,22 @@ def _parse_jsonl(path: Path) -> list[dict]:
 
 
 def _parse_cache_dir() -> Path:
-    """Return the directory for serialized parse-cache blobs."""
+    """Return the directory for serialized parse-cache blobs.
+
+    Resolution order (v1.41.0):
+      1. ``--cache-dir`` CLI flag (sets ``_sm()._CACHE_DIR_OVERRIDE``)
+      2. ``CLAUDE_SESSION_METRICS_CACHE_DIR`` env var
+      3. Default ``~/.cache/session-metrics/parse``
+
+    Mirrors the ``--projects-dir`` / ``CLAUDE_PROJECTS_DIR`` precedence
+    pattern in ``_cli.py:_projects_dir`` so users juggling multiple
+    installs can redirect each location independently.
+    """
+    if _sm()._CACHE_DIR_OVERRIDE is not None:
+        return _sm()._CACHE_DIR_OVERRIDE
+    env = os.environ.get("CLAUDE_SESSION_METRICS_CACHE_DIR")
+    if env:
+        return Path(env).expanduser()
     return Path.home() / ".cache" / "session-metrics" / "parse"
 
 

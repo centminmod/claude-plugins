@@ -69,6 +69,18 @@ def isolate_projects_dir(tmp_path, monkeypatch, request):
     monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(safe))
 
 
+# v1.41.0: ``_pricing_for`` is wrapped in ``functools.lru_cache``. Most tests
+# don't mind the cache (deterministic input → deterministic output), but the
+# unknown-model tests at lines ~7351–7369 monkeypatch ``_UNKNOWN_MODELS_SEEN``
+# and rely on the side effect refiring per call. Clearing the cache before
+# every test guarantees that contract holds even if a future test reuses an
+# unknown model name across cases.
+@pytest.fixture(autouse=True)
+def _clear_pricing_cache():
+    sm._pricing_for.cache_clear()
+    yield
+
+
 # --- Pricing -----------------------------------------------------------------
 
 def test_pricing_opus_4_7_explicit():
@@ -10416,3 +10428,152 @@ def test_write_output_default_does_not_chmod(tmp_path, monkeypatch):
     assert mode != 0o600
     # A reasonable sanity check — should be at least owner-readable.
     assert mode & 0o400
+
+
+# ===========================================================================
+# v1.41.0 — Audit-driven fixes (P0-B regex, P1-A parse_jsonl, P1-B/C dir overrides)
+# ===========================================================================
+
+@pytest.mark.parametrize("model,expected_input_rate", [
+    # Happy paths — exact matches and well-formed family IDs
+    ("claude-opus-4-7",                5.00),
+    ("openai/gpt-5.5",                 5.00),     # exact dict key
+    ("gpt-5.5",                        5.00),     # bare suffix via prefix sweep
+    ("openai/gpt-5.5-pro",             30.00),    # exact dict key
+    ("openai/gpt-5.5-pro:1m",          30.00),    # \b boundary handles :tag suffix
+    ("deepseek/deepseek-v4-pro",       1.74),
+    ("deepseek/deepseek-v4-flash",     0.14),
+    ("deepseek.v4-flash",              0.14),     # dotted separator preserved
+    ("xiaomi/mimo-v2.5-pro",           1.00),
+    ("xiaomi/mimo-v2.5",               0.40),
+    ("moonshotai/kimi-k2.6",           0.7448),
+    ("qwen/qwen3.6-plus",              0.325),
+    ("minimax/minimax-m2.7",           0.30),
+    ("z-ai/glm-5-turbo",               1.20),
+    # Should fall through to default Sonnet rates after the regex tightening
+    ("gpt-5.55",                       3.00),     # NOT gpt-5.5 — (?!\d)
+    ("gpt-5.55-pro",                   3.00),     # NOT gpt-5.5-pro
+    ("qwen3.60-plus",                  3.00),     # NOT qwen3.6-plus
+    ("mimo-v2.55",                     3.00),
+    ("kimi-k2.66",                     3.00),
+    ("minimax-m2.77",                  3.00),
+    ("deepseekXv4Yflash",              3.00),     # bare-`.` no longer permissive
+])
+def test_pricing_regex_boundaries_v1_41_0(model, expected_input_rate):
+    """v1.41.0: regex over-match guards (P0-B). Numeric-suffix families
+    carry (?!\\d) so one-extra-digit IDs fall through; separator class is
+    [-_/.] so non-separator letters can't satisfy the family pattern."""
+    rates = sm._pricing_for(model)
+    assert rates["input"] == expected_input_rate, (
+        f"{model}: expected input rate {expected_input_rate}, "
+        f"got {rates['input']} from {rates}"
+    )
+
+
+def test_parse_jsonl_skips_non_dict_lines(tmp_path, capsys):
+    """P1-A: a JSONL line that parses successfully but isn't an object
+    is dropped via the same skip path as malformed JSON. Without this
+    guard, downstream `_extract_turns` would AttributeError on
+    ``entry.get("type")``."""
+    bad_jsonl = tmp_path / "mixed.jsonl"
+    bad_jsonl.write_text(
+        '{"type": "user", "message": {"content": "hi"}}\n'
+        '[1, 2, 3]\n'
+        '"a stray string"\n'
+        '42\n'
+        '{"type": "user", "message": {"content": "bye"}}\n',
+        encoding="utf-8",
+    )
+    entries = sm._parse_jsonl(bad_jsonl)
+    # Only the two object-typed lines survive
+    assert len(entries) == 2
+    assert all(isinstance(e, dict) for e in entries)
+    err = capsys.readouterr().err
+    assert "3 malformed lines skipped" in err
+    assert "top-level value is" in err
+
+
+def test_parse_jsonl_happy_path_unaffected(tmp_path, capsys):
+    """P1-A regression: well-formed JSONL with only object lines still
+    parses to the full list with no warnings."""
+    good = tmp_path / "good.jsonl"
+    good.write_text(
+        '{"type": "user", "message": {"content": "hi"}}\n'
+        '{"type": "assistant", "timestamp": "2026-01-01T00:00:00Z"}\n',
+        encoding="utf-8",
+    )
+    entries = sm._parse_jsonl(good)
+    assert len(entries) == 2
+    err = capsys.readouterr().err
+    assert "skipped" not in err
+
+
+def test_parse_cache_dir_honors_override(monkeypatch, tmp_path):
+    """P1-B: ``_CACHE_DIR_OVERRIDE`` (set by --cache-dir) takes highest
+    precedence."""
+    custom = tmp_path / "custom-cache"
+    monkeypatch.setattr(sm, "_CACHE_DIR_OVERRIDE", custom)
+    monkeypatch.delenv("CLAUDE_SESSION_METRICS_CACHE_DIR", raising=False)
+    assert sm._parse_cache_dir() == custom
+
+
+def test_parse_cache_dir_honors_env_var(monkeypatch, tmp_path):
+    """P1-B: ``CLAUDE_SESSION_METRICS_CACHE_DIR`` env var fires when the
+    override attribute is unset."""
+    custom = tmp_path / "env-cache"
+    monkeypatch.setattr(sm, "_CACHE_DIR_OVERRIDE", None)
+    monkeypatch.setenv("CLAUDE_SESSION_METRICS_CACHE_DIR", str(custom))
+    assert sm._parse_cache_dir() == custom
+
+
+def test_parse_cache_dir_override_beats_env(monkeypatch, tmp_path):
+    """P1-B: --flag (override attr) wins when both override and env set."""
+    flag_dir = tmp_path / "flag-cache"
+    env_dir  = tmp_path / "env-cache"
+    monkeypatch.setattr(sm, "_CACHE_DIR_OVERRIDE", flag_dir)
+    monkeypatch.setenv("CLAUDE_SESSION_METRICS_CACHE_DIR", str(env_dir))
+    assert sm._parse_cache_dir() == flag_dir
+
+
+def test_parse_cache_dir_default_when_unset(monkeypatch):
+    """P1-B: with neither override nor env var, the historical default
+    (~/.cache/session-metrics/parse) is used."""
+    monkeypatch.setattr(sm, "_CACHE_DIR_OVERRIDE", None)
+    monkeypatch.delenv("CLAUDE_SESSION_METRICS_CACHE_DIR", raising=False)
+    assert sm._parse_cache_dir() == Path.home() / ".cache" / "session-metrics" / "parse"
+
+
+def test_export_dir_honors_override(monkeypatch, tmp_path):
+    """P1-C: ``_EXPORT_DIR_OVERRIDE`` (set by --export-dir) takes highest
+    precedence."""
+    custom = tmp_path / "custom-exports"
+    monkeypatch.setattr(sm, "_EXPORT_DIR_OVERRIDE", custom)
+    monkeypatch.delenv("CLAUDE_SESSION_METRICS_EXPORT_DIR", raising=False)
+    assert sm._export_dir() == custom
+
+
+def test_export_dir_honors_env_var(monkeypatch, tmp_path):
+    """P1-C: ``CLAUDE_SESSION_METRICS_EXPORT_DIR`` env var fires when the
+    override attribute is unset."""
+    custom = tmp_path / "env-exports"
+    monkeypatch.setattr(sm, "_EXPORT_DIR_OVERRIDE", None)
+    monkeypatch.setenv("CLAUDE_SESSION_METRICS_EXPORT_DIR", str(custom))
+    assert sm._export_dir() == custom
+
+
+def test_export_dir_override_beats_env(monkeypatch, tmp_path):
+    """P1-C: --flag (override attr) wins when both override and env set."""
+    flag_dir = tmp_path / "flag-exports"
+    env_dir  = tmp_path / "env-exports"
+    monkeypatch.setattr(sm, "_EXPORT_DIR_OVERRIDE", flag_dir)
+    monkeypatch.setenv("CLAUDE_SESSION_METRICS_EXPORT_DIR", str(env_dir))
+    assert sm._export_dir() == flag_dir
+
+
+def test_export_dir_default_when_unset(monkeypatch, tmp_path):
+    """P1-C: default lands under <cwd>/exports/session-metrics."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sm, "_EXPORT_DIR_OVERRIDE", None)
+    monkeypatch.delenv("CLAUDE_SESSION_METRICS_EXPORT_DIR", raising=False)
+    assert sm._export_dir() == tmp_path / "exports" / "session-metrics"
+

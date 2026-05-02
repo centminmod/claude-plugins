@@ -257,6 +257,18 @@ def _build_parser() -> argparse.ArgumentParser:
                         "~/.claude/projects or $CLAUDE_PROJECTS_DIR). Highest "
                         "precedence. Makes it trivial to script multi-instance "
                         "dashboards: run --all-projects once per path.")
+    p.add_argument("--cache-dir", metavar="PATH",
+                   help="Override the parse-cache directory (normally "
+                        "~/.cache/session-metrics/parse or "
+                        "$CLAUDE_SESSION_METRICS_CACHE_DIR). Highest "
+                        "precedence. Useful for CI / shared boxes / ephemeral "
+                        "envs where ~/.cache is not writable or shared.")
+    p.add_argument("--export-dir", metavar="PATH",
+                   help="Override the directory exports are written to "
+                        "(normally <cwd>/exports/session-metrics or "
+                        "$CLAUDE_SESSION_METRICS_EXPORT_DIR). Highest "
+                        "precedence. Per-project drilldowns and instance "
+                        "dashboards land in dated subfolders under this root.")
     p.add_argument("--output", "-o", nargs="+", metavar="FMT",
                    choices=["text", "json", "csv", "md", "html"],
                    help="Export formats in addition to stdout text. "
@@ -624,10 +636,15 @@ def main() -> None:
     # raise or warn on verification failures. Set before any chart code runs.
     _sm()._ALLOW_UNVERIFIED_CHARTS = bool(args.allow_unverified_charts)
     _maybe_warn_chart_license(chart_lib, formats)
-    # Apply --projects-dir override early so _projects_dir() is correct for
-    # both the global cache prune and all subsequent discovery calls.
+    # Apply --projects-dir / --cache-dir / --export-dir overrides early so
+    # the corresponding helpers (_projects_dir, _parse_cache_dir, _export_dir)
+    # see them before the global cache prune or any discovery call fires.
     if args.projects_dir:
         _sm()._PROJECTS_DIR_OVERRIDE = Path(args.projects_dir).expanduser()
+    if getattr(args, "cache_dir", None):
+        _sm()._CACHE_DIR_OVERRIDE = Path(args.cache_dir).expanduser()
+    if getattr(args, "export_dir", None):
+        _sm()._EXPORT_DIR_OVERRIDE = Path(args.export_dir).expanduser()
     if not args.no_cache:
         _sm()._prune_cache_global(_sm()._parse_cache_dir())
 

@@ -318,6 +318,32 @@ The resolved projects directory is rendered into the HTML header byline
 so output from multiple instances is self-documenting when viewed
 side-by-side.
 
+### Cache-dir and export-dir overrides (v1.41.0)
+
+Two parallel override knobs for the parse-cache and export directories.
+Same precedence shape as `--projects-dir`:
+
+| Resource | CLI flag | Env var | Default |
+|----------|----------|---------|---------|
+| Parse cache | `--cache-dir` | `CLAUDE_SESSION_METRICS_CACHE_DIR` | `~/.cache/session-metrics/parse` |
+| Exports | `--export-dir` | `CLAUDE_SESSION_METRICS_EXPORT_DIR` | `<cwd>/exports/session-metrics` |
+
+Useful when:
+- running in CI / sandboxes where `~/.cache` isn't writable
+- juggling multiple Claude Code installs and you want each to keep its own cache
+- redirecting reports to a shared / mounted directory without `cd`-ing first
+
+```bash
+# Redirect both via env vars
+CLAUDE_SESSION_METRICS_CACHE_DIR=/tmp/sm-cache \
+CLAUDE_SESSION_METRICS_EXPORT_DIR=/tmp/sm-out \
+  uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py --output html json
+
+# Or via CLI flags (highest precedence — beats env)
+uv run python ${CLAUDE_SKILL_DIR}/scripts/session-metrics.py \
+  --cache-dir /tmp/sm-cache --export-dir /tmp/sm-out --output html json
+```
+
 ## Model comparison
 
 Reached only when `$ARGUMENTS[0]` is `compare`, `compare-run`,

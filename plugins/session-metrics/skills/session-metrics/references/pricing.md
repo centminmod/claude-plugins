@@ -66,6 +66,20 @@ Source: [OpenRouter pricing](https://openrouter.ai/pricing) — snapshot 2026-04
 sweep so families with shared prefixes (e.g. `glm-5` vs `glm-5-turbo`) resolve
 correctly regardless of dict insertion order.
 
+**Boundary policy (v1.41.0)**: numeric-suffix families (gpt-5.5, qwen3.6,
+mimo-v2.5, kimi-k2.6, minimax-m2.7) carry `(?!\d)` so a model with one
+extra trailing digit (`gpt-5.55`, `qwen3.60-plus`) falls through to default
+Sonnet rates instead of being mispriced as the shorter version. Provider /
+model separators use the class `[-_/.]` (not bare `.`) so `deepseek.v4-flash`
+keeps matching while `deepseekXv4Yflash` is correctly rejected. Suffix tokens
+(`pro`, `flash`, `plus`) carry `\b` so they don't glue to longer words.
+
+> ⚠️ **Behaviour change at v1.41.0**: model names that previously
+> over-matched the looser regex (e.g. unknown `gpt-5.55-foo`) now route
+> to default Sonnet rates instead of the shorter family's rates.
+> Re-run reports for accurate before/after comparisons if you have
+> historical sessions touching such IDs.
+
 ### GLM (Z.ai)
 
 | Model ID                     | Input | Output | Regex pattern |
@@ -87,40 +101,40 @@ correctly regardless of dict insertion order.
 | Model ID                     | Input | Output | Regex pattern        |
 |------------------------------|-------|--------|----------------------|
 | `qwen3.5:9b`                 |  0.10 |   0.15 | exact                |
-| `qwen/qwen3.6-plus`          | 0.325 |   1.95 | `qwen3\.6.*plus`     |
+| `qwen/qwen3.6-plus`          | 0.325 |   1.95 | `qwen3\.6(?!\d).*plus\b` |
 
 ### OpenAI (via OpenRouter)
 
 | Model ID                     | Input  | Output  | Regex pattern        |
 |------------------------------|--------|---------|----------------------|
-| `openai/gpt-5.5-pro`         | 30.00  |  180.00 | `gpt-5\.5.*pro`      |
-| `openai/gpt-5.5`             |  5.00  |   30.00 | `gpt-5\.5`           |
+| `openai/gpt-5.5-pro`         | 30.00  |  180.00 | `gpt-5\.5(?!\d).*pro\b` |
+| `openai/gpt-5.5`             |  5.00  |   30.00 | `gpt-5\.5(?!\d)`     |
 
 ### DeepSeek V4
 
 | Model ID                        | Input | Output | Regex pattern              |
 |---------------------------------|-------|--------|----------------------------|
-| `deepseek/deepseek-v4-pro`      |  1.74 |   3.48 | `deepseek.v4.*pro`         |
-| `deepseek/deepseek-v4-flash`    |  0.14 |   0.28 | `deepseek.v4.*flash`       |
+| `deepseek/deepseek-v4-pro`      |  1.74 |   3.48 | `deepseek[-_/.]v4[-_/.].*pro\b`   |
+| `deepseek/deepseek-v4-flash`    |  0.14 |   0.28 | `deepseek[-_/.]v4[-_/.].*flash\b` |
 
 ### Xiaomi MiMo V2.5
 
 | Model ID                     | Input | Output | Regex pattern        |
 |------------------------------|-------|--------|----------------------|
-| `xiaomi/mimo-v2.5-pro`       |  1.00 |   3.00 | `mimo.v2\.5.*pro`    |
-| `xiaomi/mimo-v2.5`           |  0.40 |   2.00 | `mimo.v2\.5`         |
+| `xiaomi/mimo-v2.5-pro`       |  1.00 |   3.00 | `mimo[-_/.]v2\.5(?!\d).*pro\b` |
+| `xiaomi/mimo-v2.5`           |  0.40 |   2.00 | `mimo[-_/.]v2\.5(?!\d)`        |
 
 ### Moonshot Kimi
 
 | Model ID                     | Input  | Output | Regex pattern |
 |------------------------------|--------|--------|---------------|
-| `moonshotai/kimi-k2.6`       | 0.7448 |  4.655 | `kimi.k2\.6`  |
+| `moonshotai/kimi-k2.6`       | 0.7448 |  4.655 | `kimi[-_/.]k2\.6(?!\d)` |
 
 ### MiniMax
 
 | Model ID                     | Input | Output | Regex pattern      |
 |------------------------------|-------|--------|--------------------|
-| `minimax/minimax-m2.7`       |  0.30 |   1.20 | `minimax.m2\.7`    |
+| `minimax/minimax-m2.7`       |  0.30 |   1.20 | `minimax[-_/.]m2\.7(?!\d)` |
 
 ## Notes
 
