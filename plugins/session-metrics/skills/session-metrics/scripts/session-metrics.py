@@ -27,13 +27,13 @@ Environment variables (all optional — CLI flags take precedence):
   CLAUDE_PROJECTS_DIR     Override ~/.claude/projects (default: ~/.claude/projects)
 """
 
-import atexit
+import atexit  # noqa: I001 — block keeps `secrets`/`zoneinfo` re-imports below for sm.* test patching
 import importlib.util as _ilu
 import re
-import secrets  # accessed as sm.secrets by tests; actual use is in _data.py
+import secrets  # accessed as sm.secrets by tests; actual use is in _data.py  # noqa: F401
 import sys
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # accessed as sm.ZoneInfo / sm.ZoneInfoNotFoundError by tests
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # accessed as sm.ZoneInfo / sm.ZoneInfoNotFoundError by tests  # noqa: F401
 
 # Bump when the parsed-entries shape changes — invalidates old parse caches.
 # 1.1.0 (2026-04-30): cache format switched from gzip+JSON to pickle protocol 5.

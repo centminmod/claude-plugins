@@ -1,10 +1,11 @@
 """Session discovery, arg-parsing, and CLI entry point for session-metrics."""
 import argparse
+import contextlib
 import importlib.util
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -178,7 +179,7 @@ def _resolve_session(args) -> tuple[Path, str]:
     files = _find_jsonl_files(slug)
     if not files:
         print(f"[error] No sessions found for slug: {slug}", file=sys.stderr)
-        print(f"        Try --slug=<slug> or set CLAUDE_PROJECT_SLUG", file=sys.stderr)
+        print("        Try --slug=<slug> or set CLAUDE_PROJECT_SLUG", file=sys.stderr)
         sys.exit(1)
     return files[0], slug
 
@@ -217,7 +218,7 @@ def _list_sessions(slug: str) -> None:
     print("  " + "-" * 72)
     for p in files:
         stat = p.stat()
-        mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        mtime = datetime.fromtimestamp(stat.st_mtime, tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
         print(f"  {p.stem:<40} {mtime:<20} {stat.st_size / 1024:>6.1f}K")
 
 
@@ -666,7 +667,7 @@ def main() -> None:
             print(f"Added prompt to {_dest}")
             print("Will run automatically on every --compare-run "
                   "(ratio/token data only; no pass/fail scoring)")
-            print(f"Preview: session-metrics --compare-list-prompts")
+            print("Preview: session-metrics --compare-list-prompts")
             print(f"Remove:  session-metrics --compare-remove-prompt {_slug}")
         return
 
@@ -760,11 +761,9 @@ def main() -> None:
             print("[error] --compare-run-effort takes 0, 1, or 2 levels; "
                   f"got {len(_efforts)}", file=sys.stderr)
             sys.exit(1)
-        try:
+        with contextlib.suppress(OSError, AttributeError):
             _sm()._touch_compare_state_marker(_cwd_to_slug(str(scratch_dir.resolve()))
                                         if scratch_dir else slug)
-        except (OSError, AttributeError):
-            pass
         # --compare-run defaults to md + html artefact generation so the
         # user always gets the analysis.md scaffold + dashboard HTML
         # pair alongside the text report. Passing an explicit --output
@@ -828,10 +827,8 @@ def main() -> None:
         # that even if the compare crashes mid-way we still remember the
         # user attempted one — the whole point is to suppress spam on
         # projects where nobody's interested in a benchmark.
-        try:
+        with contextlib.suppress(OSError):
             _sm()._touch_compare_state_marker(slug)
-        except OSError:
-            pass
         smc._run_compare(
             args.compare[0], args.compare[1],
             slug=slug,

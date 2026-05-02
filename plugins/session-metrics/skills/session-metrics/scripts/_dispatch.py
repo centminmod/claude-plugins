@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from _constants import _CACHE_BREAK_DEFAULT_THRESHOLD
@@ -69,7 +69,7 @@ def _write_output(fmt: str, content: str, report: dict,
     out_dir = _export_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
     mode = report["mode"]
-    ts = explicit_ts or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = explicit_ts or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     if mode == "project":
         stem = f"project_{ts}"
     elif mode == "compare":
@@ -407,7 +407,7 @@ def _run_all_projects(formats: list[str],
 
 def _instance_export_root(now: datetime | None = None) -> Path:
     """Dated subfolder under ``exports/session-metrics/instance/`` for one run."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     stamp = now.strftime("%Y-%m-%d-%H%M%S")
     return _export_dir() / "instance" / stamp
 
@@ -504,7 +504,7 @@ def _render_instance_text(report: dict) -> str:
     generated = _sm()._fmt_generated_at(report)
 
     p("=" * 78)
-    p(f"  Claude Code — all-projects instance dashboard")
+    p("  Claude Code — all-projects instance dashboard")
     p("=" * 78)
     p(f"  Generated : {generated}")
     p(f"  Scanning  : {report.get('projects_dir', '?')}")
@@ -523,7 +523,7 @@ def _render_instance_text(report: dict) -> str:
     if projects:
         p(f"Top projects by cost (showing up to 10 of {len(projects)}):")
         p(f"  {'#':>2}  {'Slug':<42}  {'Sessions':>8}  {'Turns':>6}  {'Cost $':>10}")
-        p(f"  " + "-" * 74)
+        p("  " + "-" * 74)
         for i, proj in enumerate(projects[:10], 1):
             slug = proj["slug"]
             if len(slug) > 42:
@@ -621,7 +621,7 @@ def _render_instance_md(report: dict) -> str:
     generated = _sm()._fmt_generated_at(report)
     skill_version = report.get("skill_version", "?")
 
-    p(f"# Session Metrics — all projects")
+    p("# Session Metrics — all projects")
     p()
     p(f"Generated: {generated}  |  Mode: instance  |  "
       f"Scanning: `{report.get('projects_dir', '?')}`  |  Skill: v{skill_version}")
@@ -668,8 +668,8 @@ def _render_instance_md(report: dict) -> str:
     # Projects breakdown — sorted by cost desc (already sorted by builder)
     p("## Projects breakdown")
     p()
-    p(f"| # | Project | Friendly path | Sessions | Turns | "
-      f"First | Last | Cost $ |")
+    p("| # | Project | Friendly path | Sessions | Turns | "
+      "First | Last | Cost $ |")
     p("|--:|---------|---------------|---------:|------:|"
       "-------|------|-------:|")
     for i, proj in enumerate(projects, 1):
@@ -1095,7 +1095,7 @@ def _dispatch(report: dict, formats: list[str],
             # Split into two files. Dashboard references detail as a sibling
             # by filename-only href so file:// works without a server.
             mode = report["mode"]
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             stem = (f"project_{ts}" if mode == "project"
                     else f"session_{report['sessions'][0]['session_id'][:8]}_{ts}")
             dashboard_name = f"{stem}_dashboard.html"

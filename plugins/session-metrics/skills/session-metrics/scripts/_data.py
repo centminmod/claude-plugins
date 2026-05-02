@@ -9,7 +9,7 @@ import re
 import secrets
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -189,7 +189,7 @@ def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
             _prefix = f"{path.stem}__{_ph}__"
             for _stale in cache_dir.glob(f"{_prefix}*"):
                 if _stale.name != cache_path.name:
-                    try:
+                    try:  # noqa: SIM105 — keep inline so the on-pass comment stays anchored
                         _stale.unlink()
                     except OSError:
                         pass  # racing writer / file vanished between glob and unlink
@@ -363,9 +363,9 @@ def _build_session_blocks(
         b["sessions_touched"] = sorted(b["sessions_touched"])
         b["elapsed_min"]      = (b["last_epoch"] - b["anchor_epoch"]) / 60.0
         b["anchor_iso"]       = datetime.fromtimestamp(
-            b["anchor_epoch"], tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            b["anchor_epoch"], tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         b["last_iso"]         = datetime.fromtimestamp(
-            b["last_epoch"],   tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            b["last_epoch"],   tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     return blocks
 
 
@@ -387,7 +387,7 @@ def _build_weekly_rollup(
     render deltas as "new period" rather than infinite percentage.
     """
     if now_epoch is None:
-        now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+        now_epoch = int(datetime.now(tz=UTC).timestamp())
     cutoff7  = now_epoch - 7  * 86400
     cutoff14 = now_epoch - 14 * 86400
 
@@ -441,7 +441,7 @@ def _weekly_block_counts(blocks: list[dict], now_epoch: int | None = None) -> di
     answers "am I tracking toward a weekly cap" at a glance.
     """
     if now_epoch is None:
-        now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+        now_epoch = int(datetime.now(tz=UTC).timestamp())
 
     def cnt(days: int) -> int:
         cutoff = now_epoch - days * 86400
