@@ -3,6 +3,25 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.8 — 2026-05-03
+
+### Test-suite restructure — pricing tests split into a sibling module
+
+First slice of a multi-step split of the 10,942-line `tests/test_session_metrics.py` monolith. 21 pricing-domain tests move to a new sibling `tests/test_pricing.py` (~370 lines); the source file shrinks to 10,647 lines.
+
+**Tests moved:**
+
+- 13 `test_pricing_*` tests (Pricing block, lines 84–231 of the original)
+- 3 `test_pricing_unknown_model_*` tests
+- 1 parametrized `test_pricing_regex_boundaries_v1_41_0` (21 cases)
+- 4 audit-extract pricing-table tests (`_input_rate_for_model_table`, `_pricing_parity_forward`, `_pricing_parity_reverse`, `_bare_prefix_needles_match_documented_set`)
+
+**Module-aliasing fix.** Both files end with `_load_module("session_metrics", _SCRIPT)`, which re-execs unconditionally — whichever file pytest collects last wins the `sys.modules["session_metrics"]` slot, and leaf modules under `scripts/_*.py` use `_sm()` to fetch the canonical instance from `sys.modules` at call time. Without dedup, the loser file's `sm` reference points to a stale module and `monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())` writes silently miss. Both files now check `sys.modules.get(...)` first; whichever file pytest loads first creates the canonical instance, the other reuses it.
+
+**Cost / cache-write tests stayed put.** Per literal reading of the plan, only tests whose names contain `pricing` (plus the four audit-extract pricing-table tests) move in this slice; `test_cost_*`, `test_cache_write_split_*`, `test_no_cache_cost_*`, and the audit-extract `cache_break_*` tests stay in `test_session_metrics.py` for a future cost-domain slice.
+
+**Tests:** 705 passed, 16 skipped (unchanged — pure file-split, no count delta). Patch bump because the skill payload's `tests/` directory bytes change and `_SKILL_VERSION` is embedded in every export.
+
 ## v1.41.7 — 2026-05-03
 
 ### Tier 3 from the Session 142 audit triage plan — `_no_cache_cost` symmetry
