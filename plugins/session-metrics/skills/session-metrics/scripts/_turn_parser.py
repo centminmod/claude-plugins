@@ -534,10 +534,17 @@ def _advisor_info(u: dict, model: str) -> tuple[int, float, str | None, int, int
 
 def _no_cache_cost(u: dict, model: str) -> float:
     r = _sm()._pricing_for(model)
+    # Route the cache-creation token count via _cache_write_split for parity
+    # with _cost (which also reads through the same helper). Empirically
+    # equal today (55/55 turns per CLAUDE-activeContext.md:430-432), but
+    # reading the flat ``cache_creation_input_tokens`` field directly here
+    # would silently undercount if Anthropic ever stops populating it while
+    # keeping the nested ``cache_creation.ephemeral_*`` fields.
+    cw_5m, cw_1h = _cache_write_split(u)
     total_input = (
         u.get("input_tokens", 0)
         + u.get("cache_read_input_tokens", 0)
-        + u.get("cache_creation_input_tokens", 0)
+        + cw_5m + cw_1h
     )
     primary = (
         total_input * r["input"] / 1_000_000

@@ -3,6 +3,18 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.7 — 2026-05-03
+
+### `_no_cache_cost` symmetry — read cache-creation tokens via the same helper as `_cost`
+
+`_no_cache_cost` (`_turn_parser.py:535`) previously read the FLAT `cache_creation_input_tokens` field directly while `_cost` (line 467) routed the same data through `_cache_write_split` (which prefers nested `cache_creation.ephemeral_*` fields with a flat fallback). Empirically equal on every real-world transcript checked, but a silent future-drift risk: if Anthropic ever stops populating the flat field while keeping the nested ones, `_no_cache_cost` would silently undercount the cache-creation token portion, biasing the "savings from caching" delta downward on every turn. Routed `_no_cache_cost` through `_cache_write_split` and summed the buckets so both functions read the same source of truth.
+
+Behaviour-preserving on real-world transcripts. Existing cost suite stays green.
+
+**Tests**: 705 passed, 16 skipped (unchanged).
+
+Patch bump for export traceability — `_SKILL_VERSION` is embedded in every export so byte-level changes bump the version even when behaviour is unchanged on real-world transcripts.
+
 ## v1.41.6 — 2026-05-03
 
 ### Tier 1 doc/lint sweep — README cache-format, active-context leaf count, audit-extract bare-prefix removal

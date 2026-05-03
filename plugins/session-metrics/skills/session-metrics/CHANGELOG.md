@@ -3,6 +3,18 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.7 — 2026-05-03
+
+### Tier 3 from the Session 142 audit triage plan — `_no_cache_cost` symmetry
+
+`_no_cache_cost` (`_turn_parser.py:535`) previously read the FLAT `cache_creation_input_tokens` field directly while `_cost` (line 467) routed the same data through `_cache_write_split` (which prefers nested `cache_creation.ephemeral_*` fields with a flat fallback). Empirically equal today — 55/55 turns per CLAUDE-activeContext.md:430-432 — but a silent future-drift risk: if Anthropic ever stops populating the flat field while keeping the nested ones, `_no_cache_cost` would silently undercount the cache-creation token portion, biasing the "savings from caching" delta downward on every turn. Routed `_no_cache_cost` through `_cache_write_split` and summed the buckets so both functions read the same source of truth.
+
+Behaviour-preserving on real-world transcripts. The existing `test_no_cache_cost_includes_advisor_iterations` test (added in v1.41.4) and the broader cost suite stay green. Tier 2 (drift-guard test module) was added as part of the same audit triage but lives at the dev-repo top-level `tests/` directory and does not ship downstream — see the dev-repo CHANGELOG for those details.
+
+**Tests**: 705 passed, 16 skipped (unchanged — Tier 3 is behaviour-preserving).
+
+Patch bump for export traceability — `_SKILL_VERSION` is embedded in every export so byte-level changes bump the version even when behaviour is unchanged on real-world transcripts.
+
 ## v1.41.6 — 2026-05-03
 
 ### Tier 1 doc/lint sweep — README cache-format, active-context leaf count, audit-extract bare-prefix removal
