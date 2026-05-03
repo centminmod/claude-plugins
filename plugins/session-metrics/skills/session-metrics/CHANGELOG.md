@@ -3,6 +3,22 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.6 — 2026-05-03
+
+### Tier 1 doc/lint sweep — README cache-format, active-context leaf count, audit-extract bare-prefix removal
+
+Three small fixes from a triple-AI repo audit (Opus 4.7 + Codex GPT-5.5 + DeepSeek V4 Pro). All three correct stale or risky state without changing user-visible behaviour on real-world Anthropic models.
+
+**README cache-format wording**: said "gzipped JSON dump" but the parse-cache format switched to pickle protocol 5 in `_SCRIPT_VERSION = "1.1.0"` (2026-04-30). Replaced with "pickle protocol 5 dump … keyed on file mtime and `_SCRIPT_VERSION`".
+
+**CLAUDE-activeContext.md leaf count**: said "All 13 Graphify-derived sub-modules extracted" but the working tree now has 15 leaf modules (13 Graphify-derived + `_constants.py` + `_time_of_day.py`). Updated to current count without rewriting the historical Session 131 audit reference.
+
+**`audit-extract.py:_INPUT_RATE_PER_M_BY_MODEL` bare-prefix entry**: removed `("claude-opus-4", 15.00)`. The bare prefix substring-matched any future Opus 4 minor (e.g. hypothetical `claude-opus-4-2`) at the OLD $15/M tier — a 3× over-charge on audit impact estimates if Anthropic ever ships such a model. Mirrors the same removal made in `session-metrics.py:_PRICING` in v1.41.2. Audit-extract's substring matcher now falls through to `claude-opus` at $5/M for any future Opus 4 minor — conservative under-charge rather than the prior 3× over-charge. Real Opus 4.0 IDs (`claude-opus-4`, `claude-opus-4-YYYYMMDD`) are an inherent main-vs-audit asymmetry: the main script's anchored regex prices them at $15; audit-extract now prices them at $5. Audit impact estimates are approximate by design and the under-direction is the safer drift mode.
+
+**Tests**: 700 passed, 1 skipped (unchanged). Pricing parity tests stay green because the removed entry was never an exact key in `_PRICING` (the family-fallback regex covered it) and was never in the documented bare-prefix sentinel set `{"claude-sonnet", "claude-haiku", "claude-opus"}`.
+
+Patch bump for export traceability — `_SKILL_VERSION` is embedded in every export so byte-level changes bump the version even when behaviour is unchanged on real-world transcripts.
+
 ## v1.41.5 — 2026-05-03
 
 ### P7 (partial) from Session 138 audit — `_detect_retry_chains` perf + audit-driven plan close-out

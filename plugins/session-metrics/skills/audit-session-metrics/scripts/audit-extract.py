@@ -40,12 +40,20 @@ from typing import Any
 # _DEFAULT_PRICING. Cache-break impact previously hard-coded the Opus 4.7 rate
 # ($5/M) for every turn, overstating cost by 67% on Sonnet turns and 400% on
 # Haiku turns.
+# NOTE: the bare "claude-opus-4" prefix entry was removed (matches the
+# removal in session-metrics.py:_PRICING done in v1.41.2). Without that entry,
+# any future Opus 4 minor (e.g. claude-opus-4-2) substring-falls through to
+# the bare "claude-opus" needle below at the NEW $5/M tier — conservative
+# undercharge rather than the prior 3x overcharge ($15/M OLD tier). Real
+# Opus 4.0 IDs (claude-opus-4 / claude-opus-4-YYYYMMDD) are an inherent
+# audit-vs-main asymmetry: main script's anchored regex prices them at $15;
+# audit-extract now prices them at $5. Audit impact estimates are
+# approximate by design; the under-direction is the safer drift mode.
 _INPUT_RATE_PER_M_BY_MODEL: tuple[tuple[str, float], ...] = (
     ("claude-opus-4-7", 5.00),
     ("claude-opus-4-6", 5.00),
     ("claude-opus-4-5", 5.00),
     ("claude-opus-4-1", 15.00),
-    ("claude-opus-4", 15.00),
     ("claude-3-opus", 15.00),
     ("claude-haiku-4-5", 1.00),
     ("claude-3-5-haiku", 0.80),
