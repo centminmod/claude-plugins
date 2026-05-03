@@ -3,6 +3,24 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.3 — 2026-05-03
+
+### P2 from Session 138 audit — pricing-table parity guard between session-metrics and audit-extract
+
+Test-only patch. `audit-session-metrics/scripts/audit-extract.py` carries a hand-maintained `_INPUT_RATE_PER_M_BY_MODEL` table used to estimate cache_break and idle_gap_cache_decay impact. With no automated check, a future Anthropic price change could land in `session-metrics.py:_PRICING` while the audit-extract table silently keeps the stale rate — silently mis-estimating impact on every audit until someone notices.
+
+**Fix**: three new tests in `tests/test_session_metrics.py`:
+
+1. **Forward parity** (`test_audit_extract_pricing_parity_forward`) — every Anthropic-prefixed key in `_PRICING` must resolve to the same input rate via `audit_extract._input_rate_for_model`.
+2. **Reverse parity** (`test_audit_extract_pricing_parity_reverse`) — every entry in `_INPUT_RATE_PER_M_BY_MODEL` (excluding three documented bare-prefix catchalls) must resolve to the same input rate via `session_metrics._pricing_for`.
+3. **Bare-prefix sentinel** (`test_audit_extract_bare_prefix_needles_match_documented_set`) — keeps the documented exemption set in sync with the table; adding or removing a bare prefix without updating the exemption would silently weaken the parity guard.
+
+The bare-prefix entries (`claude-sonnet`, `claude-haiku`, `claude-opus`) are family-tier substring fallbacks for hypothetical un-versioned Anthropic IDs. Real transcripts always carry a version, so the divergence from `_DEFAULT_PRICING` is dormant; the sentinel test pins the exemption so future changes get reviewed. Non-Anthropic models (glm-*, openai/*, deepseek/*) are intentionally out of scope: cache_break / idle_gap_cache_decay never fire on them because those models lack prompt caching.
+
+**Tests**: 3 added. **695 passed, 1 skipped** (was 692 in v1.41.2).
+
+No production code changed. No behaviour, interface, or export-format change. Patch bump for export traceability.
+
 ## v1.41.2 — 2026-05-03
 
 ### P1 from Session 138 audit — wrong-model rate fallback for unknown sub-variants

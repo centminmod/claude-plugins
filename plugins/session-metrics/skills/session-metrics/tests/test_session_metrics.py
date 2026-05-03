@@ -8844,6 +8844,77 @@ def test_audit_extract_input_rate_for_model_table():
     assert ae._input_rate_for_model("gpt-5.5") == ae._DEFAULT_INPUT_RATE_PER_M
 
 
+# Bare-prefix entries in audit-extract's table that intentionally diverge
+# from session_metrics._pricing_for. Substring-matching catches real model
+# ids carrying these prefixes (e.g. "claude-opus" matches "claude-opus-4-7"),
+# but feeding the bare prefix itself to _pricing_for falls through every
+# resolution step (no exact, no regex, no startswith on a longer key, no
+# family-fallback regex without a version digit) and lands on _DEFAULT_PRICING.
+# These three entries exist as defensive family-tier fallbacks for
+# hypothetical Anthropic IDs that arrive without a version suffix; real
+# transcripts always carry a version, so the divergence is dormant.
+_AUDIT_EXTRACT_BARE_PREFIX_NEEDLES = frozenset({
+    "claude-sonnet", "claude-haiku", "claude-opus",
+})
+
+
+def test_audit_extract_pricing_parity_forward():
+    """P2 forward parity — every Anthropic-prefixed key in session-metrics'
+    ``_PRICING`` must resolve to the same input rate via audit-extract's
+    ``_input_rate_for_model``. Catches drift when a new Anthropic model
+    ships in session-metrics but is forgotten in audit-extract (silent
+    fallback to Sonnet $3/M would mis-estimate cache_break impact).
+
+    Non-Anthropic models (glm-*, openai/*, deepseek/*, etc.) are out of
+    scope: cache_break / idle_gap_cache_decay never fire on them because
+    those models lack prompt caching.
+    """
+    ae = _load_audit_extract()
+    for key, rates in sm._PRICING.items():
+        if not key.startswith("claude-"):
+            continue
+        sm_rate = rates["input"]
+        ae_rate = ae._input_rate_for_model(key)
+        assert ae_rate == sm_rate, (
+            f"pricing parity broken on {key!r}: audit-extract returns "
+            f"${ae_rate}/M, session-metrics has ${sm_rate}/M. "
+            f"Update _INPUT_RATE_PER_M_BY_MODEL in audit-extract.py."
+        )
+
+
+def test_audit_extract_pricing_parity_reverse():
+    """P2 reverse parity — every entry in audit-extract's
+    ``_INPUT_RATE_PER_M_BY_MODEL`` (excluding the documented bare-prefix
+    catchalls) must resolve to the same input rate via
+    ``session_metrics._pricing_for``. Catches drift when an Anthropic
+    rate change lands in session-metrics' ``_PRICING`` but the
+    hand-maintained audit-extract table keeps the stale value.
+    """
+    ae = _load_audit_extract()
+    for needle, audit_rate in ae._INPUT_RATE_PER_M_BY_MODEL:
+        if needle in _AUDIT_EXTRACT_BARE_PREFIX_NEEDLES:
+            continue
+        sm_rate = sm._pricing_for(needle)["input"]
+        assert sm_rate == audit_rate, (
+            f"pricing drift on {needle!r}: audit-extract has "
+            f"${audit_rate}/M but session-metrics resolves to "
+            f"${sm_rate}/M. Reconcile both tables."
+        )
+
+
+def test_audit_extract_bare_prefix_needles_match_documented_set():
+    """P2 sentinel — the documented bare-prefix needles list above must
+    stay in sync with audit-extract's table. Adding or removing a bare
+    prefix without updating ``_AUDIT_EXTRACT_BARE_PREFIX_NEEDLES`` would
+    silently weaken the parity guard."""
+    ae = _load_audit_extract()
+    actual_bare = {
+        needle for needle, _ in ae._INPUT_RATE_PER_M_BY_MODEL
+        if needle in {"claude-sonnet", "claude-haiku", "claude-opus"}
+    }
+    assert actual_bare == _AUDIT_EXTRACT_BARE_PREFIX_NEEDLES
+
+
 def test_audit_extract_cache_break_impact_uses_per_break_model():
     """P1.2 regression — cache_break impact is summed per-break with each
     break's own model rate, not the Opus rate applied to all of them.
