@@ -49,34 +49,8 @@ def _load_audit_extract():
     return _load_module("audit_extract", _AUDIT_EXTRACT)
 
 
-# Test-isolation guard — duplicate of the autouse fixture in
-# test_session_metrics.py. Both fixtures are scoped to the module they
-# are declared in (autouse only fires for tests in the same module),
-# so the duplication is necessary to keep the pricing tests insulated
-# from the user's real ``~/.claude/projects/`` directory. A future
-# slice can lift both fixtures into a shared ``tests/conftest.py``
-# once 2-3 split files exist and the duplication justifies the
-# refactor.
-@pytest.fixture(autouse=True)
-def isolate_projects_dir(tmp_path, monkeypatch, request):
-    if request.node.get_closest_marker("real_projects_dir"):
-        return
-    safe = tmp_path / "_autouse_projects"
-    safe.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(safe))
-
-
-# v1.41.0: ``_pricing_for`` is wrapped in ``functools.lru_cache``. Most
-# tests don't mind the cache (deterministic input → deterministic
-# output), but the unknown-model tests below monkeypatch
-# ``_UNKNOWN_MODELS_SEEN`` and rely on the side effect refiring per
-# call. Clearing the cache before every test guarantees that contract
-# holds even if a future test reuses an unknown model name across
-# cases.
-@pytest.fixture(autouse=True)
-def _clear_pricing_cache():
-    sm._pricing_for.cache_clear()
-    yield
+# Autouse fixtures `isolate_projects_dir` and `_clear_pricing_cache` live
+# in tests/conftest.py (lifted in v1.41.11).
 
 
 # --- Pricing -----------------------------------------------------------------

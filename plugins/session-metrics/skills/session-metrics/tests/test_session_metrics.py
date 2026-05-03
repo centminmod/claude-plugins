@@ -52,40 +52,12 @@ smc = sys.modules.get("session_metrics_compare")  or _load_module("session_metri
 # ``~/.claude/projects/``. Over many test runs that leaves hundreds of
 # pytest-named leftover directories that pollute the user's actual projects
 # catalogue.
-#
-# This autouse fixture redirects ``_projects_dir()`` to a per-test tmp dir
-# for every test in the suite by setting the ``CLAUDE_PROJECTS_DIR`` env
-# var (the public override documented for end-users). We deliberately do
-# NOT set ``_PROJECTS_DIR_OVERRIDE`` here — that takes *higher* precedence
-# than the env var and would clobber the ~30 existing tests that set
-# ``CLAUDE_PROJECTS_DIR`` themselves to point at a fixture tree. Tests
-# that later call ``monkeypatch.setenv`` override this safely (pytest's
-# monkeypatch stacks values and unwinds them in LIFO order at teardown).
-# Tests that use ``_PROJECTS_DIR_OVERRIDE`` directly (e.g. the
-# ``instance_env`` fixture) also override this because that var has
-# higher precedence inside ``_projects_dir()``.
-#
-# Tests that legitimately need to read the user's real projects dir can
-# opt out with ``@pytest.mark.real_projects_dir``.
-@pytest.fixture(autouse=True)
-def isolate_projects_dir(tmp_path, monkeypatch, request):
-    if request.node.get_closest_marker("real_projects_dir"):
-        return
-    safe = tmp_path / "_autouse_projects"
-    safe.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(safe))
-
-
-# v1.41.0: ``_pricing_for`` is wrapped in ``functools.lru_cache``. Most tests
-# don't mind the cache (deterministic input → deterministic output), but the
-# unknown-model tests at lines ~7351–7369 monkeypatch ``_UNKNOWN_MODELS_SEEN``
-# and rely on the side effect refiring per call. Clearing the cache before
-# every test guarantees that contract holds even if a future test reuses an
-# unknown model name across cases.
-@pytest.fixture(autouse=True)
-def _clear_pricing_cache():
-    sm._pricing_for.cache_clear()
-    yield
+# Autouse fixtures `isolate_projects_dir` (CLAUDE_PROJECTS_DIR redirection
+# guard, opt-out via `@pytest.mark.real_projects_dir`) and
+# `_clear_pricing_cache` (lru_cache invalidation around the v1.41.0
+# `_pricing_for` cache so `_UNKNOWN_MODELS_SEEN` monkeypatches refire) now
+# live in tests/conftest.py and apply to every test in this directory tree
+# (lifted in v1.41.11).
 
 
 # --- Cost math ---------------------------------------------------------------

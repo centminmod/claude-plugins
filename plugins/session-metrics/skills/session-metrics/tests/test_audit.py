@@ -38,22 +38,9 @@ def _load_module(name: str, path: Path):
 sm  = sys.modules.get("session_metrics") or _load_module("session_metrics", _SCRIPT)
 
 
-# Autouse fixtures duplicated from test_session_metrics.py — autouse only
-# fires for tests in the module they're declared in, so each split file
-# needs its own copy. A future slice may lift these into tests/conftest.py.
-@pytest.fixture(autouse=True)
-def isolate_projects_dir(tmp_path, monkeypatch, request):
-    if request.node.get_closest_marker("real_projects_dir"):
-        return
-    safe = tmp_path / "_autouse_projects"
-    safe.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(safe))
-
-
-@pytest.fixture(autouse=True)
-def _clear_pricing_cache():
-    sm._pricing_for.cache_clear()
-    yield
+# Autouse fixtures `isolate_projects_dir` and `_clear_pricing_cache` are
+# defined in tests/conftest.py and apply automatically to every test in
+# this directory tree (lifted in v1.41.11).
 
 
 def _build_fixture_report():

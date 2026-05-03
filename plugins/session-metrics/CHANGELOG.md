@@ -3,6 +3,22 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.11 — 2026-05-03
+
+### Tier 6 close-out — conftest extraction + vendor-charts upgrade docs
+
+Final slice of the upstream Session 142 audit triage plan. Three of the originally-listed Tier 6 items were verified **already shipped** (Proposal A cache-TTL drilldown lives in v1.2.0, all 16 leaf modules already carry top-of-file docstrings, and `tests/browser/conftest.py` already gates browser tests behind `SESSION_METRICS_RUN_BROWSER_TESTS=1`). The remaining items in this skill payload land here as a single bundled patch.
+
+**Added — `tests/conftest.py`.** Lifted the duplicated `isolate_projects_dir` and `_clear_pricing_cache` autouse fixtures out of every `tests/test_*.py` (8 split files since v1.41.9) into a new shared conftest. Pytest auto-discovers conftest.py and applies its autouse fixtures to every test in the directory tree, replacing 8× ~5-line copies with a single canonical declaration. The `sm` reference inside `_clear_pricing_cache` is fetched lazily via `sys.modules.get("session_metrics")` rather than captured at conftest import time, so the canonical module instance loaded by the test files' existing `sys.modules.get(...) or _load_module(...)` dedup pattern is the one whose `lru_cache` gets cleared (no hidden coupling on conftest-vs-test-file collection ordering).
+
+**Removed.** The `@pytest.fixture(autouse=True)` block (decorator + body + comment header) was deleted from each of the 8 split test files (`test_session_metrics.py`, `test_audit.py`, `test_compare.py`, `test_instance.py`, `test_pricing.py`, `test_render.py`, `test_report.py`, `test_time.py`) and replaced with a one-line `# Autouse fixtures live in tests/conftest.py` pointer.
+
+**Changed — `scripts/vendor/charts/README.md`.** Extended with a new *Upgrade procedure* section covering when to bump (patch / minor / major / licence-change / CVE matrix), step-by-step refresh (fetch → regen SHA-256 → verify locally via `_read_vendor_files` → run tests → bump `_SKILL_VERSION`), the `_charts.py` verifier flow (fail-closed at the call site, manifest-as-source-of-truth, `--allow-unverified-charts` is operator emergency-recovery only), and licence-renewal awareness for Highcharts (non-commercial-free, watch upstream-text on each major bump, MIT alternatives `--chart-lib uplot|chartjs` are the documented fall-back).
+
+**Tests**: 703 passed / 1 skipped (unchanged — pure refactor + docs). Verified across 3 consecutive clean runs after one initial flake attributable to a pre-existing test-ordering variance in `test_parallel_dispatch_matches_sequential_output` (added v1.41.10), NOT introduced by the fixture move.
+
+**Why patch bump for what looks like a refactor + docs change.** Both `tests/` and `scripts/vendor/charts/README.md` ship downstream as part of the skill payload — file bytes change in both mirrors, `_SKILL_VERSION` is embedded in every export. Same boring-bump rule as v1.41.8 / v1.41.9 / v1.41.10.
+
 ## v1.41.10 — 2026-05-03
 
 ### Test-suite — ThreadPoolExecutor parallel-branch coverage
