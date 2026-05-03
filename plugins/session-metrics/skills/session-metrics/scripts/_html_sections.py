@@ -53,6 +53,11 @@ def _footer_text(totals: dict, models: dict[str, dict],
         f"Cache savings vs no-cache baseline : ${totals['cache_savings']:.4f}",
         f"Cache hit ratio (read / total input): {totals['cache_hit_pct']:.1f}%",
     ]
+    if totals.get("total_cache_turns", 0) > 0:
+        lines.append(
+            f"Partial hit rate (read+write turns) : {totals['partial_hit_rate']:.1f}%  "
+            f"[{totals['partial_hit_turns']:,} of {totals['total_cache_turns']:,} cache turns]"
+        )
     if totals.get("cache_write_1h", 0) > 0:
         lines.append(
             f"Extra cost paid for 1h cache tier  : ${totals.get('extra_1h_cost', 0.0):.4f}"
@@ -270,6 +275,7 @@ def _build_weekly_rollup_html(rollup: dict) -> str:
         ("User prompts",     f"{cur['user_prompts']:,}",     f"{prev['user_prompts']:,}",     cur["user_prompts"],  prev["user_prompts"]),
         ("5h blocks",        f"{cur['blocks']:,}",           f"{prev['blocks']:,}",           cur["blocks"],        prev["blocks"]),
         ("Cache hit ratio",  f"{cur['cache_hit_pct']:.1f}%", f"{prev['cache_hit_pct']:.1f}%", cur["cache_hit_pct"], prev["cache_hit_pct"]),
+        ("Partial hit rate", f"{cur.get('partial_hit_rate', 0.0):.1f}%", f"{prev.get('partial_hit_rate', 0.0):.1f}%", cur.get("partial_hit_rate", 0.0), prev.get("partial_hit_rate", 0.0)),
     ]
     for label, cur_s, prev_s, cur_v, prev_v in metrics:
         delta, color = _fmt_delta_pct(cur_v, prev_v)
@@ -882,6 +888,113 @@ def _build_subagent_share_card_html(stats: dict) -> str:
         f'<div class="kpi-sub">{sub_main}</div>'
         f'{lower_bound_line}'
         f'</div>'
+    )
+
+
+def _build_subagent_turn_share_card_html(stats: dict) -> str:
+    """Count-basis 'Subagent share of turns' KPI card.
+
+    Pairs with the cost-basis card so users see both framings: cognitive-
+    claude-style turn ratio (sub-agent turns / total turns) plus the
+    session-metrics-native cost roll-up. Returns '' when no subagent
+    turns are present so the card auto-hides on subagent-free reports.
+    """
+    sa_turns = int(stats.get("subagent_turn_count", 0) or 0)
+    if sa_turns <= 0:
+        return ""
+    total_turns = int(stats.get("total_turn_count", 0) or 0)
+    main_turns  = int(stats.get("main_turn_count", 0) or 0)
+    pct = float(stats.get("turn_share_pct", 0.0) or 0.0)
+    title = (
+        "Share of total assistant turns that ran inside a sub-agent. "
+        "cognitive-claude-style count-basis framing — pairs with the "
+        "cost-basis 'Subagent share of cost' card."
+    )
+    return (
+        f'<div class="kpi" title="{html_mod.escape(title)}">'
+        f'<div class="kpi-label">Subagent share of turns</div>'
+        f'<div class="kpi-val">{pct:.1f}%</div>'
+        f'<div class="kpi-sub">{sa_turns:,} of {total_turns:,} turns '
+        f'&middot; main {main_turns:,}</div>'
+        f'</div>'
+    )
+
+
+def _build_window_ribbon_html(window_stats: list[dict]) -> str:
+    """Multi-window 7d / 30d / 90d / all-time comparison ribbon.
+
+    Sourced from cognitive-claude's ``cost-audit.py --verbose`` framing —
+    surfaces drift the single-window dashboard hides. Returns ``""`` when
+    every window is empty (no turns at all). One small KPI card per
+    window with cost, cache hit %, turns, sessions, and top model.
+    """
+    if not window_stats:
+        return ""
+    if all(int(w.get("turns", 0) or 0) == 0 for w in window_stats):
+        return ""
+    cards: list[str] = []
+    for w in window_stats:
+        label = html_mod.escape(str(w.get("label") or ""))
+        turns = int(w.get("turns", 0) or 0)
+        if turns == 0:
+            cards.append(
+                f'<div class="kpi" style="min-height:auto;padding:14px 16px">'
+                f'<div class="kpi-label">{label}</div>'
+                f'<div class="kpi-val" style="font-size:18px">&mdash;</div>'
+                f'<div class="kpi-sub">no activity</div></div>'
+            )
+            continue
+        cost = float(w.get("total_cost", 0.0) or 0.0)
+        hit  = float(w.get("cache_hit_pct", 0.0) or 0.0)
+        phit = float(w.get("partial_hit_rate", 0.0) or 0.0)
+        pht  = int(w.get("total_cache_turns", 0) or 0)
+        sess = int(w.get("sessions", 0) or 0)
+        top_model = html_mod.escape(str(w.get("top_model") or ""))
+        if len(top_model) > 24:
+            top_model = top_model[:22] + "&hellip;"
+        partial_frag = f" &middot; partial {phit:.1f}%" if pht > 0 else ""
+        cards.append(
+            f'<div class="kpi cat-tokens" style="min-height:auto;padding:14px 16px">'
+            f'<div class="kpi-label">{label}</div>'
+            f'<div class="kpi-val" style="font-size:20px">${cost:.2f}</div>'
+            f'<div class="kpi-sub">cache {hit:.1f}%{partial_frag} &middot; {turns:,} turn'
+            f'{"s" if turns != 1 else ""} &middot; {sess:,} session'
+            f'{"s" if sess != 1 else ""}'
+            f'{(" &middot; " + top_model) if top_model else ""}</div></div>'
+        )
+    return (
+        '<section class="section" id="window-ribbon-section">\n'
+        '  <div class="section-title"><h2>Window comparison</h2>'
+        '<span class="hint">trailing 7d / 30d / 90d / all-time</span></div>\n'
+        '  <div class="grid kpi-grid" '
+        'style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-bottom:16px">\n'
+        f'    {"".join(cards)}\n'
+        '  </div>\n</section>'
+    )
+
+
+def _build_plan_leverage_card_html(totals: dict, plan_cost: float | None) -> str:
+    """Plan-leverage KPI card: API-equivalent ÷ flat-rate plan paid.
+
+    Auto-hides when ``plan_cost`` is unset or non-positive so the card stays
+    opt-in. Sourced from cognitive-claude's ``cost-audit.py`` framing —
+    single-number answer to "is the subscription paying off?".
+    """
+    if not plan_cost or plan_cost <= 0:
+        return ""
+    api_cost = float(totals.get("cost", 0.0) or 0.0)
+    leverage = api_cost / plan_cost
+    title = (
+        f"API-equivalent cost (${api_cost:.4f}) divided by the flat-rate "
+        f"plan price you paid (${plan_cost:.2f}). >1× means the "
+        f"subscription is paying off versus pay-as-you-go."
+    )
+    return (
+        f'\n  <div class="kpi featured cat-save" title="{html_mod.escape(title)}">'
+        f'<div class="kpi-label">Plan leverage</div>'
+        f'<div class="kpi-val">{leverage:.2f}×</div>'
+        f'<div class="kpi-sub">${api_cost:.2f} API &middot; '
+        f'${plan_cost:.2f} plan</div></div>'
     )
 
 
@@ -2375,6 +2488,12 @@ def render_html(report: dict, variant: str = "single",
     tod_html  = ""
     if include_insights:
         tod_section    = report.get("time_of_day", {})
+        # Multi-window comparison ribbon (project scope only — single-
+        # session reports cover one window by definition; build_report
+        # only stamps ``window_stats`` when mode == 'project'). Renders
+        # ahead of the weekly rollup so the trailing-window framing sets
+        # context before the per-week breakdown.
+        window_html    = _build_window_ribbon_html(report.get("window_stats", []) or [])
         rollup_html    = _build_weekly_rollup_html(report.get("weekly_rollup", {}))
         blocks_html    = _build_session_blocks_html(
             report.get("session_blocks", []),
@@ -2386,7 +2505,7 @@ def render_html(report: dict, variant: str = "single",
                                                   peak=report.get("peak"))
         punchcard_html = _build_punchcard_html(tod_section, tz_label, tz_offset)
         heatmap_html   = _build_tod_heatmap_html(tod_section, tz_label, tz_offset)
-        tod_html       = (rollup_html + blocks_html + duration_html
+        tod_html       = (window_html + rollup_html + blocks_html + duration_html
                           + hod_html + punchcard_html + heatmap_html)
 
     # ---- Table rows --------------------------------------------------------
@@ -2431,6 +2550,23 @@ def render_html(report: dict, variant: str = "single",
         # so users see "session resumed here" inline with the timeline rather
         # than an all-zero row labelled `<synthetic>`. The marker is still
         # counted in the turn index; only the rendering changes.
+        if t.get("is_clear_event"):
+            ts_fmt = html_mod.escape(t.get("timestamp_fmt", ""))
+            clear_divider = (
+                f'<tr class="resume-marker-row" data-session="{session_id[:8]}">'
+                f'<td class="num resume-marker-idx"></td>'
+                f'<td colspan="{_full_cols - 1}" class="resume-marker-cell">'
+                f'<span class="resume-marker-pill terminal" '
+                f'title="A /clear command was issued before this turn, '
+                f'resetting the conversation context. Cache hit rate typically '
+                f'drops here due to cold-start cache rebuild.">'
+                f'<span class="resume-marker-icon">&#8855;</span>'
+                f'<strong>Context cleared</strong>'
+                f'<span class="resume-marker-time">before turn {t["index"]}</span>'
+                f'</span></td></tr>'
+            )
+        else:
+            clear_divider = ""
         if t.get("is_resume_marker"):
             ts_fmt = html_mod.escape(t.get("timestamp_fmt", ""))
             is_terminal = t.get("is_terminal_exit_marker", False)
@@ -2510,6 +2646,7 @@ def render_html(report: dict, variant: str = "single",
             f'</div></td>'
         ) if show_waste else ""
         return (
+            f'{clear_divider}'
             f'<tr id="turn-{turn_key}" class="turn-row" data-session="{session_id[:8]}"'
             f' data-turn-id="{turn_key}" role="button" tabindex="0">'
             f'<td class="num">{t["index"]}</td>'
@@ -2544,6 +2681,16 @@ def render_html(report: dict, variant: str = "single",
                 f'(cost included in total above)">'
                 f'advisor{_adv_label} +${_adv_c:.4f}</span>'
             )
+        # Per-session cache-trend sparkline. Empty string when the session
+        # is too short to plot — the helper auto-skips below the window
+        # threshold so single-edit sessions don't get a misleading flat
+        # line. Surfaces mid-session degradation hidden by the session
+        # subtotal's aggregate cache hit %.
+        _spark = _sm()._build_cache_trend_sparkline_svg(s.get("turns") or [])
+        _spark_cell = (
+            f'&nbsp;·&nbsp; <span class="cache-spark-wrap" title="Rolling cache hit % over the session">{_spark}</span>'
+            if _spark else ""
+        )
         return (
             f'<tr class="session-header" data-toggle="sess-{i}" role="button">'
             f'<td colspan="{_full_cols}">'
@@ -2553,6 +2700,7 @@ def render_html(report: dict, variant: str = "single",
             f'&nbsp;·&nbsp; {len(s["turns"])} turns'
             f'&nbsp;·&nbsp; <strong>${st["cost"]:.4f}</strong>'
             f'{_adv_badge}'
+            f'{_spark_cell}'
             f'</td></tr>'
         )
 
@@ -2893,6 +3041,28 @@ def render_html(report: dict, variant: str = "single",
         # stays visible.
         _sa_stats = _sm()._compute_subagent_share(report)
         subagent_share_card = "\n  " + _build_subagent_share_card_html(_sa_stats)
+        # cognitive-claude-inspired count-basis turn-share card. Empty
+        # when no subagent turns are present so it auto-hides on
+        # subagent-free reports.
+        _turn_share = _build_subagent_turn_share_card_html(_sa_stats)
+        subagent_turn_share_card = ("\n  " + _turn_share) if _turn_share else ""
+        # Partial-hit rate card — shown when any turn touched the cache.
+        _phr = ""
+        if totals.get("total_cache_turns", 0) > 0:
+            _phr = (
+                f'\n  <div class="kpi" title="Turns with simultaneous cache read+write'
+                f' (prefix extension) as % of all cache-active turns">'
+                f'<div class="kpi-label">Partial hit rate</div>'
+                f'<div class="kpi-val">{totals["partial_hit_rate"]:.1f}%</div>'
+                f'<div class="kpi-sub">{totals["partial_hit_turns"]:,} of'
+                f' {totals["total_cache_turns"]:,} cache turns</div></div>'
+            )
+        partial_hit_card = _phr
+        # cognitive-claude-inspired plan-leverage card. Empty when
+        # --plan-cost / SESSION_METRICS_PLAN_COST is unset.
+        plan_leverage_card = _build_plan_leverage_card_html(
+            totals, report.get("plan_cost"),
+        )
         # v1.27.0: self-cost meta-metric KPI card — surfaces session-metrics'
         # own running token cost in this session. Hidden when --no-self-cost
         # stripped the field; also hidden when the session has zero
@@ -2918,9 +3088,9 @@ def render_html(report: dict, variant: str = "single",
             )
         summary_cards_html = f'''\
 <div class="kpi-grid">
-  <div class="kpi featured cat-tokens"><div class="kpi-label">Total cost (USD)</div><div class="kpi-val">${totals['cost']:.4f}</div></div>
+  <div class="kpi featured cat-tokens"><div class="kpi-label">Total cost (USD)</div><div class="kpi-val">${totals['cost']:.4f}</div></div>{plan_leverage_card}
   <div class="kpi cat-save"><div class="kpi-label">Cache savings</div><div class="kpi-val">${totals['cache_savings']:.4f}</div></div>
-  <div class="kpi"><div class="kpi-label">Cache hit ratio</div><div class="kpi-val">{totals['cache_hit_pct']:.1f}%</div></div>{subagent_share_card}
+  <div class="kpi"><div class="kpi-label">Cache hit ratio</div><div class="kpi-val">{totals['cache_hit_pct']:.1f}%</div></div>{partial_hit_card}{subagent_share_card}{subagent_turn_share_card}
   <div class="kpi cat-tokens"><div class="kpi-label">Total input tokens</div><div class="kpi-val">{totals['total_input']:,}</div></div>
   <div class="kpi cat-tokens"><div class="kpi-label">Input tokens (new)</div><div class="kpi-val">{totals['input']:,}</div></div>
   <div class="kpi cat-tokens"><div class="kpi-label">Output tokens</div><div class="kpi-val">{totals['output']:,}</div></div>

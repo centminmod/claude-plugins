@@ -3,6 +3,20 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.42.0 — 2026-05-04
+
+### Partial-hit rate + /clear detection + sparkline event markers
+
+**Added — partial-hit rate surfacing.** New `partial_hit_turns`, `total_cache_turns`, and `partial_hit_rate` fields track turns where `cache_read > 0 AND cache_write > 0` simultaneously (prefix extension). Surfaces in: text footer, HTML KPI card, compare-view row, JSON export, and the multi-window 7d/30d/90d/all-time comparison ribbon.
+
+**Added — `/clear` event detection.** Detects `<command-name>/clear</command-name>` entries in the JSONL and marks the next assistant turn with `is_clear_event: true`. Lets users distinguish cache-hit drops caused by context resets (`/clear`) from those caused by context bloat — different root causes, different fixes.
+
+**Added — sparkline event markers.** The per-session cache-trend sparkline now overlays thin vertical lines at context-reset positions: amber for `/clear` events, purple for session resumes. Correlating these markers with cache-hit-rate drops shows whether degradation is from invalidation or bloat.
+
+**Added — `/clear` timeline dividers.** "Context cleared" divider rows appear in the HTML timeline before the first post-clear turn, styled with an amber pill (paralleling the existing resume-marker dividers).
+
+**Tests**: 81 passed / 16 skipped.
+
 ## v1.41.11 — 2026-05-03
 
 ### Tier 6 close-out — conftest extraction + vendor-charts upgrade docs

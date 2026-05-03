@@ -41,20 +41,28 @@ def _compute_subagent_share(report: dict) -> dict:
     attributed_cost  = 0.0
     attributed_count = 0
     spawn_count      = 0
+    subagent_turn_count = 0
+    main_turn_count     = 0
     for s in sessions:
         for t in s.get("turns", []) or []:
-            # Main turns only — subagent turns have non-empty
-            # ``subagent_agent_id``. Their cost is part of total_cost
-            # already; rolling them into attributed_cost from the parent
-            # is what the headline measures.
-            if t.get("subagent_agent_id"):
-                continue
             if t.get("is_resume_marker"):
                 continue
+            if t.get("subagent_agent_id"):
+                # Subagent turn — count towards the count-basis denominator
+                # plus the numerator. Cost is rolled up onto the parent via
+                # the attribution pass below.
+                subagent_turn_count += 1
+                continue
+            main_turn_count  += 1
             attributed_cost  += float(t.get("attributed_subagent_cost", 0.0))
             attributed_count += int(t.get("attributed_subagent_count", 0))
             spawn_count      += len(t.get("spawned_subagents") or [])
     share_pct = (100.0 * attributed_cost / total_cost) if total_cost > 0 else 0.0
+    total_turn_count = main_turn_count + subagent_turn_count
+    turn_share_pct = (
+        100.0 * subagent_turn_count / total_turn_count
+        if total_turn_count > 0 else 0.0
+    )
     return {
         "include_subagents":  bool(report.get("include_subagents", False)),
         "has_attribution":    attributed_count > 0,
@@ -66,6 +74,13 @@ def _compute_subagent_share(report: dict) -> dict:
         "orphan_turns":       int(summary.get("orphan_subagent_turns", 0)),
         "cycles_detected":    int(summary.get("cycles_detected", 0)),
         "nested_levels_seen": int(summary.get("nested_levels_seen", 0)),
+        # Count-basis turn-share — surfaced alongside the cost-basis share
+        # in the dashboard KPI strip so both framings are visible. cognitive-
+        # claude reports turn-share only; we surface both.
+        "subagent_turn_count": subagent_turn_count,
+        "main_turn_count":     main_turn_count,
+        "total_turn_count":    total_turn_count,
+        "turn_share_pct":      turn_share_pct,
     }
 
 
@@ -153,6 +168,8 @@ def _compute_instance_subagent_share(project_reports: list[dict],
     cycles_detected = 0
     nested_levels_seen = 0
     has_attribution = False
+    subagent_turn_count = 0
+    main_turn_count     = 0
     for pr in project_reports:
         share = _compute_subagent_share(pr)
         attributed_cost  += share["attributed_cost"]
@@ -162,7 +179,14 @@ def _compute_instance_subagent_share(project_reports: list[dict],
         cycles_detected  += share["cycles_detected"]
         nested_levels_seen = max(nested_levels_seen, share["nested_levels_seen"])
         has_attribution = has_attribution or share["has_attribution"]
+        subagent_turn_count += int(share.get("subagent_turn_count", 0))
+        main_turn_count     += int(share.get("main_turn_count", 0))
     share_pct = (100.0 * attributed_cost / total_cost) if total_cost > 0 else 0.0
+    total_turn_count = main_turn_count + subagent_turn_count
+    turn_share_pct = (
+        100.0 * subagent_turn_count / total_turn_count
+        if total_turn_count > 0 else 0.0
+    )
     return {
         "include_subagents":  include_subagents,
         "has_attribution":    has_attribution,
@@ -174,6 +198,84 @@ def _compute_instance_subagent_share(project_reports: list[dict],
         "orphan_turns":       orphan_turns,
         "cycles_detected":    cycles_detected,
         "nested_levels_seen": nested_levels_seen,
+        "subagent_turn_count": subagent_turn_count,
+        "main_turn_count":     main_turn_count,
+        "total_turn_count":    total_turn_count,
+        "turn_share_pct":      turn_share_pct,
+    }
+
+
+def _compute_window_stats(sessions: list[dict],
+                            days_back: int | None,
+                            now_epoch: int | None = None) -> dict:
+    """Aggregate per-turn metrics across the trailing ``days_back`` window.
+
+    Returns a stat dict with ``total_cost``, ``cache_hit_pct``, ``turns``,
+    ``sessions``, ``top_model`` (model id with the highest cost in the
+    window — empty string when the window is empty), and the ``label`` /
+    ``days`` framing fields. ``days_back=None`` collapses the filter so the
+    window covers the entire dataset (the "all time" column).
+
+    Used by the multi-window dashboard ribbon (``_build_window_ribbon_html``)
+    introduced for parity with cognitive-claude's ``--verbose`` 7d / 30d /
+    90d / all-time ribbon. Cheap on warm parse-cache because it iterates
+    already-loaded turn records — no re-parsing.
+    """
+    if now_epoch is None:
+        now_epoch = int(datetime.now(timezone.utc).timestamp())
+    cutoff = (now_epoch - days_back * 86400) if days_back else 0
+    cost = 0.0
+    cache_read = 0
+    cache_write = 0
+    new_input = 0
+    turns = 0
+    partial_hit_turns = 0
+    total_cache_turns = 0
+    session_ids: set[str] = set()
+    model_cost: dict[str, float] = {}
+    for s in sessions or []:
+        sid = s.get("session_id") or ""
+        for t in s.get("turns", []) or []:
+            if t.get("is_resume_marker"):
+                continue
+            if days_back is not None:
+                ts_iso = t.get("timestamp", "") or ""
+                ts_epoch = _sm()._parse_iso_epoch(ts_iso) if ts_iso else 0
+                if not ts_epoch or ts_epoch < cutoff:
+                    continue
+            turns += 1
+            session_ids.add(sid)
+            tc = float(t.get("cost_usd", 0.0))
+            cost += tc
+            cr = int(t.get("cache_read_tokens", 0) or 0)
+            cw = int(t.get("cache_write_tokens", 0) or 0)
+            cache_read  += cr
+            cache_write += cw
+            new_input   += int(t.get("input_tokens", 0) or 0)
+            if cr > 0 or cw > 0:
+                total_cache_turns += 1
+            if cr > 0 and cw > 0:
+                partial_hit_turns += 1
+            mdl = t.get("model") or "unknown"
+            model_cost[mdl] = model_cost.get(mdl, 0.0) + tc
+    total_input = new_input + cache_read + cache_write
+    cache_hit_pct = (100.0 * cache_read / total_input) if total_input > 0 else 0.0
+    partial_hit_rate = round(100.0 * partial_hit_turns / max(1, total_cache_turns), 1)
+    top_model = ""
+    if model_cost:
+        top_model = max(model_cost.items(), key=lambda kv: kv[1])[0]
+    label = f"Last {days_back}d" if days_back else "All time"
+    return {
+        "label":         label,
+        "days":          days_back,
+        "total_cost":    cost,
+        "cache_hit_pct": cache_hit_pct,
+        "partial_hit_rate": partial_hit_rate,
+        "partial_hit_turns": partial_hit_turns,
+        "total_cache_turns": total_cache_turns,
+        "turns":         turns,
+        "sessions":      len(session_ids),
+        "top_model":     top_model,
     }
 
 
@@ -565,6 +667,14 @@ def _build_report(
     # the box without per-renderer wiring.
     report["subagent_share_stats"] = _compute_subagent_share(report)
     report["subagent_within_session_split"] = _compute_within_session_split(sessions_out)
+    # Multi-window comparison ribbon (cognitive-claude inspired). Project-
+    # scope only — single-session reports cover one window by definition,
+    # so a 7/30/90 ribbon would be confusing. Cheap to compute on already-
+    # parsed turn data.
+    if mode == "project":
+        report["window_stats"] = [
+            _compute_window_stats(sessions_out, d) for d in (7, 30, 90, None)
+        ]
     report["usage_insights"] = _sm()._compute_usage_insights(report)
     # v1.8.0: token-waste classification — runs after attribution + cache-break
     # detection (both mutate turn dicts in place); annotates turns with
@@ -987,6 +1097,13 @@ def _build_instance_report(
             include_subagents=any(pr.get("include_subagents") for pr in project_reports),
         ),
         "subagent_within_session_split": _compute_within_session_split(all_sessions_out),
+        # Multi-window comparison ribbon at instance scope. Reads the
+        # flattened ``all_sessions_out`` (preserved above for the
+        # within-session split) so we don't lose access to per-turn
+        # timestamps when ``sessions`` is later set to ``[]``.
+        "window_stats": [
+            _compute_window_stats(all_sessions_out, d) for d in (7, 30, 90, None)
+        ],
         # Placeholders so the existing renderers don't KeyError if they
         # reach into the report looking for these.
         "sessions":         [],

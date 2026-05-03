@@ -35,6 +35,7 @@ def _sm():
 # corpus-scan data; the S34 scan confirmed 3 new disjoint matches across
 # 7,731 JSONLs with zero overlap into unrelated synthetic flows.
 _EXIT_CMD_MARKER = "<command-name>/exit</command-name>"
+_CLEAR_CMD_MARKER = "<command-name>/clear</command-name>"
 _CONTINUE_FROM_RESUME_MARKER = "Continue from where you left off."
 _RESUME_LOOKBACK_USER_ENTRIES = 10
 
@@ -125,6 +126,8 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
     # becomes the immediate predecessor of the assistant turn.
     last_user_slash_cmd: str = ""
     preceding_user_slash_cmd: dict[str, str] = {}
+    clear_event_msg_ids: set[str] = set()
+    _pending_clear_event: bool = False
     # Suppresses slash-command tracking while inside a local-command group.
     # Claude Code splits "/model"/"/clear" invocations into multiple consecutive
     # user entries (caveat, command-name, stdout); only the caveat entry carries
@@ -145,6 +148,8 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
                     if isinstance(_blk, dict) and "local-command-caveat" in (_blk.get("text") or ""):
                         _local_cmd_group_active = True
                         break
+            if _CLEAR_CMD_MARKER in _raw_str:
+                _pending_clear_event = True
             # Compaction summaries start with this sentinel. They contain quoted
             # transcript text (including <command-name> tags) that must not be
             # mistaken for a new slash-command invocation.
@@ -227,6 +232,9 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
             preceding_user_ts[msg_id] = last_user_timestamp
             preceding_user_agent_links[msg_id] = list(last_user_agent_links)
             preceding_user_slash_cmd[msg_id] = last_user_slash_cmd
+            if _pending_clear_event:
+                clear_event_msg_ids.add(msg_id)
+                _pending_clear_event = False
             last_user_slash_cmd = ""
             last_user_agent_links = []
             gap_user_blocks = []
@@ -247,6 +255,7 @@ def _extract_turns(entries: list[dict]) -> list[dict]:
             "_preceding_user_timestamp": preceding_user_ts.get(msg_id, ""),
             "_preceding_user_agent_links": preceding_user_agent_links.get(msg_id, []),
             "_is_resume_marker": msg_id in resume_marker_msg_ids,
+            "_is_clear_event": msg_id in clear_event_msg_ids,
         })
     turns.sort(key=lambda e: e.get("timestamp", ""))
     return turns
@@ -728,6 +737,7 @@ def _build_turn_record(global_index: int, entry: dict,
         "content_blocks":         content_blocks,
         "tool_use_names":         tool_names,
         "is_resume_marker":       bool(entry.get("_is_resume_marker", False)),
+        "is_clear_event":         bool(entry.get("_is_clear_event", False)),
         "prompt_text":            prompt_text,
         "prompt_snippet":         _truncate(prompt_text, 240),
         "slash_command":          slash_cmd,

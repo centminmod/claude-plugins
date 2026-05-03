@@ -432,7 +432,7 @@ def _build_weekly_rollup(
         b = {
             "turns": 0, "user_prompts": 0, "cost": 0.0,
             "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
-            "blocks": 0,
+            "blocks": 0, "partial_hit_turns": 0, "total_cache_turns": 0,
         }
         for u in user_ts_all:
             if start <= u < end:
@@ -442,14 +442,21 @@ def _build_weekly_rollup(
                 b["turns"]       += 1
                 b["input"]       += t["input_tokens"]
                 b["output"]      += t["output_tokens"]
-                b["cache_read"]  += t["cache_read_tokens"]
-                b["cache_write"] += t["cache_write_tokens"]
+                cr = t["cache_read_tokens"]
+                cw = t["cache_write_tokens"]
+                b["cache_read"]  += cr
+                b["cache_write"] += cw
                 b["cost"]        += t["cost_usd"]
+                if cr > 0 or cw > 0:
+                    b["total_cache_turns"] += 1
+                if cr > 0 and cw > 0:
+                    b["partial_hit_turns"] += 1
         for blk in session_blocks:
             if start <= blk["anchor_epoch"] < end:
                 b["blocks"] += 1
         total_in = b["input"] + b["cache_read"] + b["cache_write"]
         b["cache_hit_pct"] = 100 * b["cache_read"] / max(1, total_in)
+        b["partial_hit_rate"] = round(100.0 * b["partial_hit_turns"] / max(1, b["total_cache_turns"]), 1)
         return b
 
     trailing = bucket(cutoff7, now_epoch)
@@ -493,7 +500,8 @@ def _totals_from_turns(turn_records: list[dict]) -> dict:
     t = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
          "cache_write_5m": 0, "cache_write_1h": 0, "extra_1h_cost": 0.0,
          "cost": 0.0, "no_cache_cost": 0.0, "turns": len(turn_records),
-         "advisor_call_count": 0, "advisor_cost_usd": 0.0}
+         "advisor_call_count": 0, "advisor_cost_usd": 0.0,
+         "partial_hit_turns": 0, "total_cache_turns": 0}
     content_block_totals = {"thinking": 0, "tool_use": 0, "text": 0,
                             "tool_result": 0, "image": 0,
                             "server_tool_use": 0, "advisor_tool_result": 0}
@@ -506,6 +514,12 @@ def _totals_from_turns(turn_records: list[dict]) -> dict:
         t["cache_write"]  += r["cache_write_tokens"]
         t["cache_write_5m"] += r.get("cache_write_5m_tokens", 0)
         t["cache_write_1h"] += r.get("cache_write_1h_tokens", 0)
+        cr = r["cache_read_tokens"]
+        cw = r["cache_write_tokens"]
+        if cr > 0 or cw > 0:
+            t["total_cache_turns"] += 1
+        if cr > 0 and cw > 0:
+            t["partial_hit_turns"] += 1
         t["cost"]              += r["cost_usd"]
         t["no_cache_cost"]     += r["no_cache_cost_usd"]
         t["advisor_call_count"] += r.get("advisor_calls", 0)
@@ -528,6 +542,7 @@ def _totals_from_turns(turn_records: list[dict]) -> dict:
     t["total_input"] = t["input"] + t["cache_read"] + t["cache_write"]
     t["cache_savings"] = t["no_cache_cost"] - t["cost"]
     t["cache_hit_pct"] = 100 * t["cache_read"] / max(1, t["total_input"])
+    t["partial_hit_rate"] = round(100.0 * t["partial_hit_turns"] / max(1, t["total_cache_turns"]), 1)
     t["content_blocks"] = content_block_totals
     t["thinking_turn_count"] = thinking_turn_count
     t["thinking_turn_pct"] = (
@@ -573,6 +588,8 @@ def _add_totals(a: dict, b: dict) -> dict:
         "advisor_call_count":  a["advisor_call_count"]  + b["advisor_call_count"],
         "advisor_cost_usd":    a["advisor_cost_usd"]    + b["advisor_cost_usd"],
         "thinking_turn_count": a["thinking_turn_count"] + b["thinking_turn_count"],
+        "partial_hit_turns":   a.get("partial_hit_turns", 0)  + b.get("partial_hit_turns", 0),
+        "total_cache_turns":   a.get("total_cache_turns", 0)  + b.get("total_cache_turns", 0),
     }
     cb_a = a.get("content_blocks") or {}
     cb_b = b.get("content_blocks") or {}
@@ -590,6 +607,7 @@ def _add_totals(a: dict, b: dict) -> dict:
     out["total_input"]   = out["input"] + out["cache_read"] + out["cache_write"]
     out["cache_savings"] = out["no_cache_cost"] - out["cost"]
     out["cache_hit_pct"] = 100 * out["cache_read"] / max(1, out["total_input"])
+    out["partial_hit_rate"] = round(100.0 * out["partial_hit_turns"] / max(1, out["total_cache_turns"]), 1)
     n = out["turns"]
     out["thinking_turn_pct"]      = 100 * out["thinking_turn_count"] / n if n else 0.0
     out["tool_call_total"]        = cb.get("tool_use", 0)
@@ -1466,6 +1484,54 @@ def _build_by_subagent_type(sessions: list[dict], total_cost: float) -> list[dic
 # ``spawned_subagents``, ``subagent_agent_id``) plus ``subagent_attribution_summary``
 # already attached to the report. No new per-turn fields, no parser changes,
 # no ``_sm()._SCRIPT_VERSION`` bump.
+
+# ---------------------------------------------------------------------------
+# Evidence-pack export — sha256-pinned JSON sidecar for reproducibility.
+# ---------------------------------------------------------------------------
+
+def _write_evidence_pack(json_path,
+                          provenance_extra: dict | None = None,
+                          share_safe: bool = False):
+    """Write reproducibility sidecars next to a session-metrics JSON export.
+
+    Two files are emitted:
+      - ``<json>.sha256``      one-line GNU coreutils format
+                                ``<hex64>  <basename>``
+      - ``<json>.provenance.json``  small JSON with skill version, host
+                                     platform, generation timestamp,
+                                     source JSON path + size.
+
+    Returns ``(sha256_path, provenance_path)``. Sourced from cognitive-
+    claude's ``cost-audit.py --evidence`` framing — lets a third party
+    verify a published report wasn't massaged after the fact.
+    """
+    from pathlib import Path
+    import datetime as _dt
+    import platform as _plat
+    json_path = Path(json_path)
+    payload = json_path.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    sha_path = json_path.with_suffix(json_path.suffix + ".sha256")
+    sha_path.write_text(f"{digest}  {json_path.name}\n", encoding="utf-8")
+    prov = {
+        "json_file":      json_path.name,
+        "sha256":         digest,
+        "size_bytes":     len(payload),
+        "generated_at":   _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "skill_version":  sys.modules["session_metrics"]._SKILL_VERSION,
+        "script_version": sys.modules["session_metrics"]._SCRIPT_VERSION,
+        "platform":       _plat.platform(),
+        "python_version": _plat.python_version(),
+    }
+    if provenance_extra:
+        prov.update(provenance_extra)
+    prov_path = json_path.with_suffix(json_path.suffix + ".provenance.json")
+    prov_path.write_text(json.dumps(prov, indent=2) + "\n", encoding="utf-8")
+    if share_safe:
+        sha_path.chmod(0o600)
+        prov_path.chmod(0o600)
+    return sha_path, prov_path
+
 
 # ---------------------------------------------------------------------------
 # Output dispatch

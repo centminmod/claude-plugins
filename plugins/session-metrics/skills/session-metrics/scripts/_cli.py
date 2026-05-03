@@ -356,6 +356,55 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="HTML: insert an idle-gap divider row when consecutive "
                         "turns are separated by more than N wall-clock minutes. "
                         "0 disables. Default: 10.")
+    p.add_argument("--plan-cost", type=float, metavar="USD", default=None,
+                   help="Flat-rate plan price (e.g. Claude Pro / Max "
+                        "subscription) used to compute the plan-leverage KPI "
+                        "card on the HTML dashboard: API-equivalent cost ÷ "
+                        "this number. Card auto-hides when unset. Also "
+                        "honours $SESSION_METRICS_PLAN_COST as a fallback so "
+                        "the value can persist across runs without being "
+                        "retyped.")
+    p.add_argument("--evidence", action="store_true",
+                   help="When emitting JSON (via --output json), also write "
+                        "an sha256 sidecar (<file>.json.sha256) plus a "
+                        "<file>.json.provenance.json with skill version, "
+                        "host platform, generation timestamp, and the JSON "
+                        "size in bytes. Lets a third party verify a "
+                        "published report wasn't massaged after the fact. "
+                        "Implies --output json — the JSON file is added to "
+                        "the export list automatically.")
+    # --- Invariants (CI mode) ----------------------------------------------
+    p.add_argument("--invariants", action="store_true",
+                   help="CI-friendly check mode. After the report is built, "
+                        "evaluate metric-contract predicates (cache hit %, "
+                        "cost per turn, sub-agent turn share, 1h cache "
+                        "share, tool calls per turn) and exit with code 4 "
+                        "if any predicate is violated. Pair with --output to "
+                        "still emit the dashboard alongside the gate. "
+                        "Per-predicate threshold flags below override the "
+                        "hard-coded defaults; set the relevant flag to a "
+                        "sentinel (-1 for *_min, 0 for *_max) to skip an "
+                        "individual predicate.")
+    p.add_argument("--invariants-cache-hit-min", type=float, default=None,
+                   metavar="PCT",
+                   help="Minimum cache_hit_pct allowed (default 90.0). "
+                        "Pass -1 to skip this predicate.")
+    p.add_argument("--invariants-cost-per-turn-max", type=float, default=None,
+                   metavar="USD",
+                   help="Maximum cost (USD) per turn allowed (default 0.50). "
+                        "Pass 0 to skip this predicate.")
+    p.add_argument("--invariants-subagent-turn-share-min", type=float,
+                   default=None, metavar="PCT",
+                   help="Minimum sub-agent turn-share %% (default 0 — disabled. "
+                        "Pass a positive value to enforce, e.g. 50).")
+    p.add_argument("--invariants-cache-1h-share-max", type=float, default=None,
+                   metavar="PCT",
+                   help="Maximum %% of cache_write tokens written at the 1h "
+                        "TTL tier (default 50.0). Pass 0 to skip.")
+    p.add_argument("--invariants-tool-calls-per-turn-max", type=float,
+                   default=None, metavar="N",
+                   help="Maximum average tool calls per turn (default 5.0). "
+                        "Pass 0 to skip.")
     p.add_argument("--strict-tz", action="store_true",
                    help="When --tz / --peak-tz cannot be resolved (e.g. on "
                         "Windows without the 'tzdata' pip package), raise "
@@ -625,9 +674,51 @@ def main() -> None:
     if getattr(args, "export_share_safe", False):
         args.redact_user_prompts = True
         args.no_self_cost = True
+    # Resolve --plan-cost: CLI flag wins, env var is the durable fallback.
+    # Invalid env values fall back silently to None so a typo doesn't kill
+    # the run; the CLI flag's argparse type=float still hard-errors.
+    plan_cost: float | None = args.plan_cost
+    if plan_cost is None:
+        _env_plan = os.environ.get("SESSION_METRICS_PLAN_COST")
+        if _env_plan:
+            try:
+                plan_cost = float(_env_plan)
+            except ValueError:
+                print(
+                    f"[warn] SESSION_METRICS_PLAN_COST='{_env_plan}' is not a "
+                    "number; ignoring.", file=sys.stderr,
+                )
+    if plan_cost is not None and plan_cost <= 0:
+        print(
+            f"[warn] --plan-cost / SESSION_METRICS_PLAN_COST must be > 0 "
+            f"(got {plan_cost}); ignoring.", file=sys.stderr,
+        )
+        plan_cost = None
+    args.plan_cost = plan_cost
+    # Resolve --invariants thresholds. Each per-predicate flag overrides
+    # the hard-coded default; left None it defers to ``_default_thresholds``.
+    invariants_thresholds: dict | None = None
+    if args.invariants:
+        invariants_thresholds = {}
+        for arg_name, key in (
+            ("invariants_cache_hit_min",            "cache_hit_min"),
+            ("invariants_cost_per_turn_max",        "cost_per_turn_max"),
+            ("invariants_subagent_turn_share_min",  "subagent_turn_share_min"),
+            ("invariants_cache_1h_share_max",       "cache_1h_share_max"),
+            ("invariants_tool_calls_per_turn_max",  "tool_calls_per_turn_max"),
+        ):
+            v = getattr(args, arg_name, None)
+            if v is not None:
+                invariants_thresholds[key] = float(v)
+    args.invariants_thresholds = invariants_thresholds
     slug = args.slug or _env_slug() or _cwd_to_slug()
     _validate_slug(slug)
     formats: list[str] = args.output or []
+    # --evidence forces JSON into the export list so the sha256 sidecar
+    # has a target. Done here (before any dispatch branch) so each entry
+    # point sees a consistent ``formats`` list.
+    if getattr(args, "evidence", False) and "json" not in formats:
+        formats = formats + ["json"]
     tz_offset, tz_label = _sm()._resolve_tz(args.tz, args.utc_offset,
                                       strict=bool(args.strict_tz))
     peak = _sm()._build_peak(args.peak_hours, args.peak_tz,
@@ -865,6 +956,9 @@ def main() -> None:
             subagent_attribution=not args.no_subagent_attribution,
             sort_prompts_by=args.sort_prompts_by,
             share_safe=args.export_share_safe,
+            plan_cost=plan_cost,
+            invariants_thresholds=invariants_thresholds,
+            evidence=args.evidence,
         )
         return
 
@@ -884,6 +978,9 @@ def main() -> None:
             no_self_cost=args.no_self_cost,
             redact_user_prompts=args.redact_user_prompts,
             share_safe=args.export_share_safe,
+            plan_cost=plan_cost,
+            invariants_thresholds=invariants_thresholds,
+            evidence=args.evidence,
         )
         return
 
@@ -902,5 +999,7 @@ def main() -> None:
         no_self_cost=args.no_self_cost,
         redact_user_prompts=args.redact_user_prompts,
         share_safe=args.export_share_safe,
+        plan_cost=plan_cost,
+        invariants_thresholds=invariants_thresholds,
     )
 

@@ -28,6 +28,23 @@ def _sm():
     return sys.modules["session_metrics"]
 
 
+def _maybe_run_invariants(report: dict, thresholds: dict | None) -> None:
+    """Evaluate the invariants suite and exit non-zero on violation.
+
+    Called after a normal dispatch so the report artefacts (HTML / JSON /
+    etc.) still land — the invariant check is a CI gate, not a render
+    suppression. Prints results to stderr and ``sys.exit(_INVARIANT_EXIT_CODE)``
+    if any predicate fails.
+    """
+    if thresholds is None:
+        return
+    results = _sm()._run_invariants(report, thresholds)
+    print(_sm()._format_invariant_results(results), file=sys.stderr)
+    code = _sm()._invariants_exit_code(results)
+    if code != 0:
+        sys.exit(code)
+
+
 def _export_dir() -> Path:
     """Return the directory exports are written to.
 
@@ -193,7 +210,10 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
                          sort_prompts_by: str | None = None,
                          no_self_cost: bool = False,
                          redact_user_prompts: bool = False,
-                         share_safe: bool = False) -> None:
+                         share_safe: bool = False,
+                         plan_cost: float | None = None,
+                         invariants_thresholds: dict | None = None,
+                         evidence: bool = False) -> None:
     print(f"Session : {jsonl_path.stem}", file=sys.stderr)
     print(f"File    : {jsonl_path}", file=sys.stderr)
     print(file=sys.stderr)
@@ -217,13 +237,17 @@ def _run_single_session(jsonl_path: Path, slug: str, include_subagents: bool,
         sort_prompts_by=sort_prompts_by,
         include_subagents=include_subagents,
     )
+    if plan_cost is not None:
+        report["plan_cost"] = float(plan_cost)
     self_cost = report.pop("self_cost", None) if no_self_cost else report.get("self_cost")
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib,
               idle_gap_minutes=idle_gap_minutes,
               redact_user_prompts=redact_user_prompts,
-              share_safe=share_safe)
+              share_safe=share_safe,
+              evidence=evidence)
     if not no_self_cost and self_cost:
         _print_self_cost_summary(self_cost)
+    _maybe_run_invariants(report, invariants_thresholds)
 
 
 def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
@@ -239,7 +263,10 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
                       sort_prompts_by: str | None = None,
                       no_self_cost: bool = False,
                       redact_user_prompts: bool = False,
-                      share_safe: bool = False) -> None:
+                      share_safe: bool = False,
+                      plan_cost: float | None = None,
+                      invariants_thresholds: dict | None = None,
+                      evidence: bool = False) -> None:
     files = _sm()._find_jsonl_files(slug)
     if not files:
         print(f"[error] No sessions found for slug: {slug}", file=sys.stderr)
@@ -270,13 +297,17 @@ def _run_project_cost(slug: str, include_subagents: bool, formats: list[str],
         sort_prompts_by=sort_prompts_by,
         include_subagents=include_subagents,
     )
+    if plan_cost is not None:
+        report["plan_cost"] = float(plan_cost)
     self_cost = report.pop("self_cost", None) if no_self_cost else report.get("self_cost")
     _dispatch(report, formats, single_page=single_page, chart_lib=chart_lib,
               idle_gap_minutes=idle_gap_minutes,
               redact_user_prompts=redact_user_prompts,
-              share_safe=share_safe)
+              share_safe=share_safe,
+              evidence=evidence)
     if not no_self_cost and self_cost:
         _print_self_cost_summary(self_cost)
+    _maybe_run_invariants(report, invariants_thresholds)
 
 
 def _run_all_projects(formats: list[str],
@@ -292,7 +323,10 @@ def _run_all_projects(formats: list[str],
                       cache_break_threshold: int = _CACHE_BREAK_DEFAULT_THRESHOLD,
                       subagent_attribution: bool = True,
                       sort_prompts_by: str | None = None,
-                      share_safe: bool = False) -> None:
+                      share_safe: bool = False,
+                      plan_cost: float | None = None,
+                      invariants_thresholds: dict | None = None,
+                      evidence: bool = False) -> None:
     projects_dir = _sm()._projects_dir()
     print(f"Scanning: {projects_dir}", file=sys.stderr)
     discovered = _sm()._list_all_projects()
@@ -392,6 +426,13 @@ def _run_all_projects(formats: list[str],
     )
     instance_report["_suppress_model_compare_insight"] = \
         suppress_model_compare_insight
+    if plan_cost is not None:
+        # Stamp on instance + every per-project report so the plan-leverage
+        # KPI card surfaces consistently in the instance index and in each
+        # drilldown HTML.
+        instance_report["plan_cost"] = float(plan_cost)
+        for pr in project_reports:
+            pr["plan_cost"] = float(plan_cost)
 
     # ``single_page`` is accepted from the CLI but has no effect at instance
     # scope: the instance ``index.html`` is always a single page by design,
@@ -402,7 +443,9 @@ def _run_all_projects(formats: list[str],
                               chart_lib=chart_lib,
                               idle_gap_minutes=idle_gap_minutes,
                               drilldown=drilldown,
-                              share_safe=share_safe)
+                              share_safe=share_safe,
+                              evidence=evidence)
+    _maybe_run_invariants(instance_report, invariants_thresholds)
 
 
 def _instance_export_root(now: datetime | None = None) -> Path:
@@ -418,7 +461,8 @@ def _dispatch_instance(instance_report: dict,
                         chart_lib: str = "highcharts",
                         idle_gap_minutes: int = 10,
                         drilldown: bool = True,
-                        share_safe: bool = False) -> None:
+                        share_safe: bool = False,
+                        evidence: bool = False) -> None:
     """Write all instance exports (and, optionally, per-project drilldown
     HTMLs) into a dated subfolder so successive runs don't overwrite each
     other. The instance ``index.html`` uses relative ``projects/<slug>.html``
@@ -456,6 +500,17 @@ def _dispatch_instance(instance_report: dict,
             out.chmod(0o600)
         written.append((fmt, out))
         print(f"[export] {fmt.upper():4} → {out}", file=sys.stderr)
+        if evidence and fmt == "json":
+            sha_p, prov_p = _sm()._write_evidence_pack(
+                out, share_safe=share_safe,
+                provenance_extra={
+                    "mode": instance_report.get("mode"),
+                    "slug": instance_report.get("slug"),
+                    "project_count": instance_report.get("project_count", 0),
+                },
+            )
+            print(f"[export] EVID → {sha_p}", file=sys.stderr)
+            print(f"[export] EVID → {prov_p}", file=sys.stderr)
 
     if drilldown:
         total = len(project_reports)
@@ -859,17 +914,22 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
         )
     # v1.26.0: subagent share KPI card at instance scope. Read from
     # the precomputed stats stashed by ``_build_instance_report``.
-    inst_share_card = _sm()._build_subagent_share_card_html(
-        report.get("subagent_share_stats")
-        or _sm()._compute_subagent_share(report))
+    _sa_stats = (report.get("subagent_share_stats")
+                 or _sm()._compute_subagent_share(report))
+    inst_share_card = _sm()._build_subagent_share_card_html(_sa_stats)
+    inst_turn_share_card = _sm()._build_subagent_turn_share_card_html(_sa_stats)
+    inst_plan_leverage_card = _sm()._build_plan_leverage_card_html(
+        totals, report.get("plan_cost"))
     summary_cards_html = (
-        f'<div class="kpi-grid">{"".join(cards_html_parts)}{inst_share_card}</div>'
+        f'<div class="kpi-grid">{"".join(cards_html_parts)}'
+        f'{inst_plan_leverage_card}{inst_share_card}{inst_turn_share_card}</div>'
     )
 
     # ---- Reused insights helpers ------------------------------------------
     # Each of these already handles the "empty" case gracefully by returning
     # "" when the underlying data is absent — so we can drop them in without
     # additional conditionals.
+    window_html = _sm()._build_window_ribbon_html(report.get("window_stats", []) or [])
     rollup_html = _sm()._build_weekly_rollup_html(report.get("weekly_rollup", {}))
     blocks_html = _sm()._build_session_blocks_html(
         report.get("session_blocks", []),
@@ -881,7 +941,7 @@ def _render_instance_html(report: dict, chart_lib: str = "highcharts") -> str:
     punchcard_html = _sm()._build_punchcard_html(tod_section, tz_label, tz_offset)
     heatmap_html = _sm()._build_tod_heatmap_html(tod_section, tz_label, tz_offset)
 
-    insights_html = rollup_html + blocks_html + hod_html + punchcard_html + heatmap_html
+    insights_html = window_html + rollup_html + blocks_html + hod_html + punchcard_html + heatmap_html
 
     # Phase-A instance-level sections (v1.6.0).
     inst_by_skill_html = _sm()._build_by_skill_html(report.get("by_skill", []) or [])
@@ -1069,7 +1129,8 @@ def _dispatch(report: dict, formats: list[str],
                chart_lib: str = "highcharts",
                idle_gap_minutes: int = 10,
                redact_user_prompts: bool = False,
-               share_safe: bool = False) -> None:
+               share_safe: bool = False,
+               evidence: bool = False) -> None:
     # Always render text to stdout
     print(_sm().render_text(report))
 
@@ -1126,3 +1187,13 @@ def _dispatch(report: dict, formats: list[str],
             content = _sm()._RENDERERS[fmt](report)
         path = _write_output(fmt, content, report, share_safe=share_safe)
         print(f"[export] {fmt.upper():4} → {path}", file=sys.stderr)
+        if evidence and fmt == "json":
+            sha_p, prov_p = _sm()._write_evidence_pack(
+                path, share_safe=share_safe,
+                provenance_extra={
+                    "mode": report.get("mode"),
+                    "slug": report.get("slug"),
+                },
+            )
+            print(f"[export] EVID → {sha_p}", file=sys.stderr)
+            print(f"[export] EVID → {prov_p}", file=sys.stderr)

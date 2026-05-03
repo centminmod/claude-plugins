@@ -42,7 +42,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # accessed as sm.ZoneInfo 
 # on disk (~9 MB → ~19 MB per typical session); acceptable for a developer-tool
 # cache. Version bump invalidates every existing user blob exactly once.
 _SCRIPT_VERSION = "1.1.0"
-_SKILL_VERSION  = "1.41.11"  # embedded in every export; bump when plugin version bumps
+_SKILL_VERSION  = "1.42.0"  # embedded in every export; bump when plugin version bumps
 
 # ---------------------------------------------------------------------------
 # Pricing table  (USD per million tokens)
@@ -335,6 +335,7 @@ _compute_usage_insights               = _an_m._compute_usage_insights
 del _an_m
 
 _ch_m = _load_leaf("_charts")
+_build_cache_trend_sparkline_svg = _ch_m._build_cache_trend_sparkline_svg
 _CHART_PAGE                   = _ch_m._CHART_PAGE
 _VENDOR_CHARTS_DIR            = Path(_ch_m.__file__ or __file__).resolve().parent / "vendor" / "charts"
 _ALLOW_UNVERIFIED_CHARTS      = False
@@ -475,6 +476,9 @@ _fmt_cost                       = _hs_m._fmt_cost
 _build_by_skill_html            = _hs_m._build_by_skill_html
 _build_by_subagent_type_html    = _hs_m._build_by_subagent_type_html
 _build_subagent_share_card_html = _hs_m._build_subagent_share_card_html
+_build_subagent_turn_share_card_html = _hs_m._build_subagent_turn_share_card_html
+_build_plan_leverage_card_html  = _hs_m._build_plan_leverage_card_html
+_build_window_ribbon_html       = _hs_m._build_window_ribbon_html
 _build_attribution_coverage_html = _hs_m._build_attribution_coverage_html
 _build_within_session_split_html = _hs_m._build_within_session_split_html
 _build_cache_breaks_html        = _hs_m._build_cache_breaks_html
@@ -494,6 +498,7 @@ del _hs_m
 _rp_m = _load_leaf("_report")
 _compute_subagent_share             = _rp_m._compute_subagent_share
 _compute_within_session_split       = _rp_m._compute_within_session_split
+_compute_window_stats               = _rp_m._compute_window_stats
 _compute_instance_subagent_share    = _rp_m._compute_instance_subagent_share
 _median                             = _rp_m._median
 _compute_prompt_anchor_indices      = _rp_m._compute_prompt_anchor_indices
@@ -548,7 +553,15 @@ _summarize_self_cost        = _da_m._summarize_self_cost
 _empty_subagent_row         = _da_m._empty_subagent_row
 _finalise_subagent_rows     = _da_m._finalise_subagent_rows
 _build_by_subagent_type     = _da_m._build_by_subagent_type
+_write_evidence_pack        = _da_m._write_evidence_pack
 del _da_m
+
+_inv_m = _load_leaf("_invariants")
+_run_invariants                 = _inv_m._run_invariants
+_format_invariant_results       = _inv_m._format_invariant_results
+_invariants_exit_code           = _inv_m._invariants_exit_code
+_INVARIANT_EXIT_CODE            = _inv_m._INVARIANT_EXIT_CODE
+del _inv_m
 
 
 # ---------------------------------------------------------------------------

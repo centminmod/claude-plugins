@@ -680,6 +680,87 @@ def _render_chart_none(all_turns: list[dict],
     return ("", "")
 
 
+def _build_cache_trend_sparkline_svg(turns: list[dict],
+                                      width: int = 200,
+                                      height: int = 24,
+                                      window: int = 5) -> str:
+    """Inline SVG sparkline of rolling cache hit %% across a session.
+
+    Surfaces mid-session cache degradation that the per-session aggregate
+    hides (e.g. a clean run followed by a cache-busting CLAUDE.md edit at
+    turn 50). Returns ``""`` when the session has fewer than ``window``
+    cache-bearing turns — drawing a 1-2 point line would be visual noise.
+
+    Cheap on the dashboard: no Highcharts dependency, ~200 bytes per
+    sparkline. ``width`` / ``height`` / ``window`` defaults are tuned for
+    inline display in the timeline session-header row.
+    """
+    pts: list[float] = []
+    event_indices: list[tuple[int, str]] = []
+    pt_idx = 0
+    _pending_resume = False
+    for t in turns or []:
+        if t.get("is_resume_marker"):
+            _pending_resume = True
+            continue
+        cr = int(t.get("cache_read_tokens", 0) or 0)
+        cw = int(t.get("cache_write_tokens", 0) or 0)
+        ip = int(t.get("input_tokens", 0) or 0)
+        denom = ip + cr + cw
+        if denom <= 0:
+            continue
+        if _pending_resume:
+            event_indices.append((pt_idx, "resume"))
+            _pending_resume = False
+        if t.get("is_clear_event"):
+            event_indices.append((pt_idx, "clear"))
+        pts.append(100.0 * cr / denom)
+        pt_idx += 1
+    if len(pts) < window:
+        return ""
+    rolling: list[float] = []
+    s = sum(pts[:window])
+    rolling.append(s / window)
+    for i in range(window, len(pts)):
+        s += pts[i] - pts[i - window]
+        rolling.append(s / window)
+    n = len(rolling)
+    if n == 1:
+        return ""
+    coords: list[str] = []
+    for i, v in enumerate(rolling):
+        x = i * (width - 1) / (n - 1)
+        v_clamped = max(0.0, min(100.0, v))
+        y = (height - 4) * (1.0 - v_clamped / 100.0) + 2
+        coords.append(f"{x:.1f},{y:.1f}")
+    last = rolling[-1]
+    title = (
+        f"Rolling cache hit % over {n} turns "
+        f"(window={window}). Last: {last:.1f}%."
+    )
+    stroke = "#A58BFF" if last >= 80 else ("#FBBF24" if last >= 50 else "#F87171")
+    marker_lines = ""
+    for ei, etype in event_indices:
+        ri = ei - window + 1
+        if 0 <= ri < n:
+            mx = ri * (width - 1) / (n - 1)
+            mc = "#FBBF24" if etype == "clear" else "#A58BFF"
+            marker_lines += (
+                f'<line x1="{mx:.1f}" y1="0" x2="{mx:.1f}" y2="{height}" '
+                f'stroke="{mc}" stroke-width="1" opacity="0.6"/>'
+            )
+    return (
+        f'<svg class="cache-spark" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" '
+        f'role="img" aria-label="{title}" style="vertical-align:middle">'
+        f'<title>{title}</title>'
+        f'{marker_lines}'
+        f'<polyline fill="none" stroke="{stroke}" stroke-width="1.5" '
+        f'stroke-linejoin="round" stroke-linecap="round" '
+        f'points="{" ".join(coords)}"/></svg>'
+    )
+
+
 CHART_RENDERERS = {
     "highcharts": _render_chart_highcharts,
     "uplot":      _render_chart_uplot,
