@@ -3,6 +3,27 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.9 — 2026-05-03
+
+### Test-suite restructure — bundle the remaining 6 split slices
+
+Six new sibling test files extracted from `tests/test_session_metrics.py` in one bundled commit (Tiers 4.2-4.10 of the post-audit improvement plan). The monolith drops from 10,647 → 1,149 lines (-9,498); the test surface area is now spread across 8 topic-focused modules.
+
+**New files**:
+
+- `tests/test_audit.py` (~1900 lines) — audit-extract.py helper-script tests + golden-file waste-analysis + `_classify_turn` waterfall + retry-chain detection.
+- `tests/test_compare.py` (~4720 lines) — all compare-mode phases (1, 2, 3, 4-5, 6, 7, 10, prompt-steering, 8) — the LARGEST single topical block.
+- `tests/test_report.py` (~1250 lines) — Phase A (cache_breaks / by_skill / by_subagent_type), Phase B (subagent attribution), Advisor feature.
+- `tests/test_time.py` (~880 lines) — time-of-day, hour-of-day, weekday × hour matrix, 5-hour session blocks.
+- `tests/test_render.py` (~610 lines) — chart-library dispatch + vendoring, uPlot / Chart.js renderers, Usage Insights section.
+- `tests/test_instance.py` (~510 lines) — `--all-projects` discovery, `_build_instance_report` aggregation, `_run_all_projects` orchestration.
+
+**What stays in `test_session_metrics.py`** (1,149 lines): cost-math, prompt-filter, dedup, fixture totals, cache-TTL drilldown (Proposal A), resume detection (Phase 3), content-block distribution (Proposal B), input validation, `_cwd_to_slug`, parse-jsonl perf-regression guard, T1.3-T1.5 advisory tests, v1.41.0 audit-driven fixes (parse_jsonl, dir overrides).
+
+**Pattern**: each new file uses the cross-file module-aliasing dedup (`sys.modules.get(...) or _load_module(...)`) proven in v1.41.8. Two autouse fixtures (`isolate_projects_dir`, `_clear_pricing_cache`) duplicated into each split file because pytest autouse only fires for tests in the declaring module. `_build_fixture_report` (3-line helper) copied into the four slice files that need it.
+
+**Tests**: 700 passed, 1 skipped — perfect parity with the pre-slice baseline. No behaviour change; pure refactor.
+
 ## v1.41.8 — 2026-05-03
 
 ### Test-suite restructure — pricing tests split into a sibling module
