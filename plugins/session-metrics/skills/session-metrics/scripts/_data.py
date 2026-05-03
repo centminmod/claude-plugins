@@ -812,6 +812,10 @@ def _detect_retry_chains(turns: list[dict], threshold: float = 0.80) -> dict:
 
     prompted = [t for t in turns
                 if not t.get("is_resume_marker") and (t.get("prompt_text") or "").strip()]
+    # Pre-tokenize once: the inner loop would otherwise call _tok on each
+    # b_text twice (SequenceMatcher arg + a_toks reassignment after match),
+    # turning the O(N²) walk into 2N × re.findall on long sessions.
+    pre_toks: list[list[str]] = [_tok(p["prompt_text"]) for p in prompted]
 
     chains: list[dict] = []
     processed: set[int] = set()
@@ -820,21 +824,23 @@ def _detect_retry_chains(turns: list[dict], threshold: float = 0.80) -> dict:
         if i in processed:
             continue
         a_text = prompted[i]["prompt_text"]
-        a_toks = _tok(a_text)
+        a_toks = pre_toks[i]
         chain = [prompted[i]["index"]]
         j = i + 1
         while j < len(prompted):
             b_text = prompted[j]["prompt_text"]
-            if a_text == b_text or SequenceMatcher(None, a_toks, _tok(b_text)).ratio() >= threshold:
+            b_toks = pre_toks[j]
+            if a_text == b_text or SequenceMatcher(None, a_toks, b_toks).ratio() >= threshold:
                 chain.append(prompted[j]["index"])
                 processed.add(j)
-                a_toks = _tok(b_text)
+                a_toks = b_toks
                 a_text = b_text
                 j += 1
             else:
                 break
         if len(chain) >= 2:
-            cost = sum(t.get("cost_usd", 0.0) for t in turns if t.get("index") in set(chain))
+            chain_set = set(chain)
+            cost = sum(t.get("cost_usd", 0.0) for t in turns if t.get("index") in chain_set)
             chains.append({"turn_indices": chain, "length": len(chain), "cost_usd": cost})
 
     total_cost = sum(t.get("cost_usd", 0.0) for t in turns)

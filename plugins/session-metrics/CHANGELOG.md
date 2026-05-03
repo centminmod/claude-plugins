@@ -3,6 +3,16 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.5 — 2026-05-03
+
+### Retry-chain detection perf — pre-tokenize prompts once
+
+Single perf micro-optimisation in `_detect_retry_chains`. The inner loop tokenized each prompt's text twice via `re.findall(r"\w+", text)` (once as the `SequenceMatcher` argument, once when reassigning the carry-over after a match). On a session with `N` consecutive prompts that meant up to `2N(N-1)/2` regex calls — quadratic in the prompt count.
+
+The fix pre-tokenizes all eligible prompts once into a parallel `pre_toks: list[list[str]]` and reads both sides of each comparison by index. Combined with hoisting `set(chain)` above the cost-summing generator (so `if t["index"] in chain_set` builds the set once per chain rather than once per turn iteration), the function is now linear in prompt count for tokenization and constant per chain for the cost lookup.
+
+Behaviour-preserving change. The 700/1 test suite — including the `_detect_retry_chains` direct unit tests and the golden-fixture `test_build_waste_analysis_golden_retry_chains_match_fixture` — passes unchanged.
+
 ## v1.41.4 — 2026-05-03
 
 ### Advisor cost edge cases, atomic-replace cache invalidation, coverage gaps

@@ -3,6 +3,22 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.5 — 2026-05-03
+
+### P7 (partial) from Session 138 audit — `_detect_retry_chains` perf + audit-driven plan close-out
+
+One perf micro-optimisation in `_data.py:_detect_retry_chains`. Existing 700/1 test suite covers the contract; behaviour-preserving change so no new tests added.
+
+**`_detect_retry_chains` perf** — inner loop tokenized each `b_text` twice via `_tok` (once as the `SequenceMatcher` argument, once when reassigning `a_toks` after a match), so a session with `N` consecutive prompts walked `re.findall(r"\w+", text)` `2N(N-1)/2` times in the worst case. Pre-tokenize `prompted` once into a parallel `pre_toks: list[list[str]]` and read both `a_toks` and `b_toks` by index — collapses the repeat-tokenization to exactly `N` calls. Also hoisted `set(chain)` above the cost-summing generator so the inner `if t.get("index") in chain_set` lookup builds the set once per chain rather than once per turn iteration. Pure micro-opt, no behavioural change.
+
+**P7 splits — deferred.** The remaining P7 items (split `render_html` 1310 lines, `_render_instance_html` 276 lines, `_build_report` 207 lines into smaller helpers) are pure cosmetic refactors with no behavioural change and high churn risk on ~1800 lines. Demoted to a separate future refactor release rather than bundled here.
+
+**P8 — already shipped earlier.** The audit's "Sharing-time hygiene" recommendation (`--redact` flag + `chmod 0600`) was already implemented as `--redact-user-prompts` and the umbrella `--export-share-safe` flag (chmods every written export to `0600` and implies `--redact-user-prompts` + `--no-self-cost`). No code change. Documented gap (HTML/MD/CSV/text non-compare exports still embed verbatim prompt text even with `--redact-user-prompts`) is captured for any future expansion ask.
+
+**Audit close-out.** This release closes the Session 138 `/audit-plugin` remediation plan — P1 → P6 shipped across v1.41.2 → v1.41.4, P7 perf shipped here, P7 splits deferred to a dedicated refactor release, P8 already shipped earlier.
+
+**Tests**: 700 passed, 1 skipped (unchanged from v1.41.4 — perf change is behaviour-preserving).
+
 ## v1.41.4 — 2026-05-03
 
 ### P3 + P4 + P5 + P6 from Session 138 audit — advisor cost edge cases, atomic-replace cache invalidation, coverage gaps
