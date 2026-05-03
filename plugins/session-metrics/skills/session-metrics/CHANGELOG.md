@@ -3,6 +3,25 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.2 — 2026-05-03
+
+### P1 from Session 138 audit — wrong-model rate fallback for unknown sub-variants
+
+Latent silent-overcharge bugs in `_pricing_for` for hypothetical future Anthropic releases. Surfaced by all four passes of the Session 138 audit (own + perf-fork + Codex + DeepSeek). Two cases collapsed into one fix:
+
+- **`claude-opus-4-N` for N ≥ 8** prefix-matched the bare `claude-opus-4` entry in `_PRICING` and silently 3×-overcharged at OLD-tier $15/$75 instead of NEW-tier $5/$25 (the rate that has held across 4-5/4-6/4-7).
+- **`claude-haiku-4-6` / `claude-haiku-5+`** had no Haiku prefix entry at all and fell through to `_DEFAULT_PRICING` (Sonnet $3/$15) — also a 3× overcharge over the correct Haiku $1/$5.
+
+**The fix** has three parts:
+
+1. **Anchored regex for Opus 4.0** in `_PRICING_PATTERNS`: `^claude-opus-4(?:-\d{8})?$` matches the bare ID and an 8-digit-date-suffixed form. The bare `claude-opus-4` key was removed from `_PRICING` so the prefix sweep no longer silently catches future minors.
+2. **New `_PRICING_FAMILY_FALLBACKS` list** in `session-metrics.py`, consulted by `_pricing_for` AFTER the prefix sweep miss but BEFORE the `_DEFAULT_PRICING` fallback. Patterns: future Opus 4 minors → NEW tier; future Opus 5+ → NEW tier; future Haiku 4 minors → Haiku tier; future Haiku 5+ → Haiku tier. Each match adds the model to `_UNKNOWN_MODELS_SEEN` so the at-exit advisory tells the user to refresh `references/pricing.md`.
+3. **Advisory wording** updated from "priced at Sonnet rates ($3/$15 per 1M tokens)" to "priced at fallback rates (verify in references/pricing.md)" — the family-fallback path lands on the family's tier, not always Sonnet.
+
+**Sonnet intentionally NOT given a family fallback.** `claude-sonnet-4` is a bare prefix entry and Sonnet 4.x has held one rate tier across all minors, so the silent prefix-sweep behavior is correct for Sonnet. A future `claude-sonnet-5` would need an explicit `_PRICING` row regardless.
+
+**Tests**: `test_pricing_prefix_fallback` deleted (asserted the buggy behaviour). Eight new tests cover the bare ID, date-suffixed Opus 4.0, opus-4-8, opus-4-8 with date, opus-5, haiku-4-6, haiku-9, the silent date-suffixed known model path, and opus-4-1-with-date silent path. **692 passed, 1 skipped.**
+
 ## v1.41.1 — 2026-05-02
 
 ### Internal: ruff hygiene cleanup (no behaviour change)

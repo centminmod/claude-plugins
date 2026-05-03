@@ -42,7 +42,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # accessed as sm.ZoneInfo 
 # on disk (~9 MB → ~19 MB per typical session); acceptable for a developer-tool
 # cache. Version bump invalidates every existing user blob exactly once.
 _SCRIPT_VERSION = "1.1.0"
-_SKILL_VERSION  = "1.41.1"  # embedded in every export; bump when plugin version bumps
+_SKILL_VERSION  = "1.41.2"  # embedded in every export; bump when plugin version bumps
 
 # ---------------------------------------------------------------------------
 # Pricing table  (USD per million tokens)
@@ -65,7 +65,14 @@ _PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-5":           {"input":  5.00, "output": 25.00, "cache_read": 0.50,  "cache_write":  6.25, "cache_write_1h": 10.00},
     # --- Opus 4 / 4.1 (old tier, retained for historical sessions) ---
     "claude-opus-4-1":           {"input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75, "cache_write_1h": 30.00},
-    "claude-opus-4":             {"input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75, "cache_write_1h": 30.00},
+    # NOTE (v1.41.2): the bare "claude-opus-4" key is intentionally NOT in
+    # this dict. It used to live here, but the prefix-sweep in `_pricing_for`
+    # would silently catch any future `claude-opus-4-N` (e.g. `claude-opus-4-8`)
+    # and over-charge by 3x at OLD-tier rates. The Opus 4.0 ID and its
+    # date-suffixed forms are now matched by an anchored regex in
+    # `_PRICING_PATTERNS` below; future Opus 4 minors (4-5+) are routed to
+    # the NEW $5/$25 tier via `_PRICING_FAMILY_FALLBACKS` with an unknown-
+    # model warning. See the bug analysis in the v1.41.2 changelog entry.
     # --- Sonnet 4.x + 3.7 (shared rates) ---
     "claude-sonnet-4-7":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75, "cache_write_1h":  6.00},
     "claude-sonnet-4-6":         {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_write":  3.75, "cache_write_1h":  6.00},
@@ -146,6 +153,55 @@ _PRICING_PATTERNS: list[tuple[re.Pattern[str], dict[str, float]]] = [
     (re.compile(r"minimax[-_/.]m2\.7(?!\d)",         re.I), _PRICING["minimax/minimax-m2.7"]),
     # GLM-5-Turbo before the bare glm-5 prefix entry
     (re.compile(r"glm-5-turbo\b",                    re.I), _PRICING["z-ai/glm-5-turbo"]),
+    # ----- Opus 4.0 (anchored regex; replaces the prefix-fallback `claude-opus-4`
+    # entry that was removed in v1.41.2). Without this anchored form, the bare
+    # `claude-opus-4` prefix in `_PRICING` would silently catch any future
+    # `claude-opus-4-N` (N >= 8 — see _PRICING_FAMILY_FALLBACKS below) and
+    # over-charge by 3x at OLD-tier $15/$75. Match policy: the bare ID
+    # `claude-opus-4` OR a single date-suffixed form `claude-opus-4-YYYYMMDD`
+    # (8 digits). Anything else (e.g. `claude-opus-4-1-...`, `claude-opus-4-8`)
+    # is left to fall through to a more-specific entry or the family fallback.
+    (re.compile(r"^claude-opus-4(?:-\d{8})?$",       re.I),
+        {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write": 18.75, "cache_write_1h": 30.00}),
+]
+
+# Family-aware fallbacks (v1.41.2). Consulted by `_pricing_for` AFTER the exact
+# match, the explicit `_PRICING_PATTERNS`, and the prefix sweep — only when
+# the model truly has no specific entry. Each fallback hit also adds the
+# model to `_UNKNOWN_MODELS_SEEN`, so the at-exit advisory tells the user
+# to refresh `references/pricing.md`. The user gets a correct family-tier
+# rate AND a nudge to add an explicit entry.
+#
+# Without these, two silent 3x overcharges leaked through:
+#   * `claude-opus-4-8` (or any future Opus 4 minor >= 8) used to prefix-match
+#     the bare `claude-opus-4` entry in `_PRICING` and price at OLD-tier
+#     $15/$75 instead of NEW-tier $5/$25. The bare entry has been converted
+#     to an anchored regex above so the prefix sweep no longer catches it.
+#   * `claude-haiku-4-6` / `claude-haiku-5` have no Haiku prefix entry and
+#     used to fall to `_DEFAULT_PRICING` (Sonnet $3/$15) instead of Haiku
+#     $1/$5.
+#
+# Sonnet is intentionally omitted: `claude-sonnet-4` (a bare prefix entry
+# in _PRICING) already correctly catches every `claude-sonnet-4-N` variant
+# at Sonnet rates — Sonnet 4.x has held one rate tier across all minors,
+# so the silent prefix-sweep behavior is correct for Sonnet.
+_PRICING_FAMILY_FALLBACKS: list[tuple[re.Pattern[str], dict[str, float]]] = [
+    # Future Opus 4 minors (4-5+). Anthropic minor versions are single-digit;
+    # `claude-opus-4-5/4-6/4-7` are explicit keys (caught by exact match
+    # before this fires). The trailing `(?:-|$)` lets it match
+    # date-suffixed forms like `claude-opus-4-8-20260601` while rejecting
+    # 2-digit accidents (`claude-opus-4-99` would fall through and warn,
+    # but `claude-opus-4-5x` would not match here).
+    (re.compile(r"^claude-opus-4-[5-9](?:-|$)",            re.I), _PRICING["claude-opus-4-7"]),
+    # Future Opus majors (5+). New tier is the conservative bet — under-
+    # counting by ~10% if Anthropic raises Opus 5 prices is much better
+    # than the previous 3x silent overcharge from the OLD-tier prefix.
+    (re.compile(r"^claude-opus-(?:[5-9]|\d{2,})(?:-|$)",   re.I), _PRICING["claude-opus-4-7"]),
+    # Future Haiku 4 minors (4-6+). `claude-haiku-4-5*` are explicit
+    # exact keys and short-circuit before reaching here.
+    (re.compile(r"^claude-haiku-4-[6-9](?:-|$)",           re.I), _PRICING["claude-haiku-4-5"]),
+    # Future Haiku majors (5+). Same conservative-bet reasoning as Opus.
+    (re.compile(r"^claude-haiku-(?:[5-9]|\d{2,})(?:-|$)",  re.I), _PRICING["claude-haiku-4-5"]),
 ]
 
 # Module-level advisory state — populated during parsing, printed via atexit.
@@ -157,9 +213,13 @@ _FAST_MODE_TURNS: list[int] = [0]  # [0] is the running count
 def _print_run_advisories() -> None:
     if _UNKNOWN_MODELS_SEEN:
         names = ", ".join(sorted(_UNKNOWN_MODELS_SEEN))
+        # v1.41.2: family-fallback hits route to the family's most recent
+        # tier (NEW Opus / Haiku / Sonnet) rather than always landing on
+        # _DEFAULT_PRICING. The phrasing "fallback rates" covers both
+        # paths; users who want the exact rate should check the table.
         print(
-            f"[warn] Unknown model(s) priced at Sonnet rates ($3/$15 per 1M tokens): {names}. "
-            "Add to references/pricing.md to fix.",
+            f"[warn] Unknown model(s) priced at fallback rates "
+            f"(verify in references/pricing.md): {names}.",
             file=sys.stderr,
         )
     if _FAST_MODE_TURNS[0]:

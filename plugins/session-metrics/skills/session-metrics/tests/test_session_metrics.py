@@ -116,12 +116,118 @@ def test_pricing_haiku_4_5_new_tier():
     assert r["cache_write_1h"] == 2.00
 
 
-def test_pricing_prefix_fallback():
-    """Unknown future model falls through to nearest known prefix."""
-    # "claude-opus-4-99-future" doesn't start with 4-5/4-6/4-7/4-1, so it
-    # matches "claude-opus-4" (old-tier). Safer to over- than under-estimate.
-    r = sm._pricing_for("claude-opus-4-99-future")
+def test_pricing_opus_4_bare_id_old_tier(monkeypatch):
+    """Bare 'claude-opus-4' (no minor, no date) maps to OLD $15 tier.
+
+    v1.41.2: the bare key was removed from _PRICING and replaced with an
+    anchored regex in _PRICING_PATTERNS. This guards the regex still
+    matches the bare ID and keeps it silent (no _UNKNOWN_MODELS_SEEN flag).
+    """
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    r = sm._pricing_for("claude-opus-4")
     assert r["input"] == 15.00
+    assert r["output"] == 75.00
+    assert "claude-opus-4" not in sm._UNKNOWN_MODELS_SEEN
+
+
+def test_pricing_opus_4_with_date_suffix_old_tier(monkeypatch):
+    """'claude-opus-4-20250514' (Opus 4.0 with date) → OLD tier silently.
+
+    v1.41.2 anchored regex: `^claude-opus-4(?:-\\d{8})?$` matches both the
+    bare ID and an 8-digit date suffix, but rejects sub-version forms
+    like `claude-opus-4-8` (which now route through the family fallback).
+    """
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    r = sm._pricing_for("claude-opus-4-20250514")
+    assert r["input"] == 15.00
+    assert r["output"] == 75.00
+    assert not sm._UNKNOWN_MODELS_SEEN
+
+
+def test_pricing_unknown_opus_4_minor_routes_to_new_tier(monkeypatch):
+    """v1.41.2 bug-fix: unknown future Opus 4 minor → NEW $5 tier (not OLD $15).
+
+    Before v1.41.2, `claude-opus-4-8` prefix-matched the bare
+    `claude-opus-4` entry and silently 3x-overcharged at $15/$75. The
+    family fallback now routes it to NEW $5/$25 AND flags the model so
+    the at-exit advisory tells the user to add an explicit entry.
+    """
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    r = sm._pricing_for("claude-opus-4-8")
+    assert r["input"] == 5.00
+    assert r["output"] == 25.00
+    assert "claude-opus-4-8" in sm._UNKNOWN_MODELS_SEEN
+
+
+def test_pricing_unknown_opus_4_minor_with_date_routes_to_new_tier(monkeypatch):
+    """`claude-opus-4-8-20260601` → NEW tier flagged (date-suffixed unknown)."""
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    r = sm._pricing_for("claude-opus-4-8-20260601")
+    assert r["input"] == 5.00
+    assert "claude-opus-4-8-20260601" in sm._UNKNOWN_MODELS_SEEN
+
+
+def test_pricing_future_opus_major_routes_to_new_tier(monkeypatch):
+    """`claude-opus-5` / `claude-opus-6` → NEW tier flagged.
+
+    Conservative bet: if Anthropic's Opus 5 raises rates, we under-count
+    by a small margin and warn — preferable to silently 3x over-counting
+    by falling to the OLD-tier prefix or 5x under-counting by falling
+    to _DEFAULT_PRICING.
+    """
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    r = sm._pricing_for("claude-opus-5")
+    assert r["input"] == 5.00
+    assert r["output"] == 25.00
+    assert "claude-opus-5" in sm._UNKNOWN_MODELS_SEEN
+
+
+def test_pricing_unknown_haiku_4_minor_routes_to_haiku_tier(monkeypatch):
+    """v1.41.2 bug-fix: `claude-haiku-4-6` → Haiku $1 tier (not Sonnet $3 default).
+
+    Before v1.41.2, `claude-haiku-4-6` had no Haiku prefix entry and fell
+    through to _DEFAULT_PRICING (Sonnet $3/$15) — a 3x overcharge. The
+    family fallback now routes it to Haiku $1/$5.
+    """
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    r = sm._pricing_for("claude-haiku-4-6")
+    assert r["input"] == 1.00
+    assert r["output"] == 5.00
+    assert "claude-haiku-4-6" in sm._UNKNOWN_MODELS_SEEN
+
+
+def test_pricing_future_haiku_major_routes_to_haiku_tier(monkeypatch):
+    """`claude-haiku-5` / `claude-haiku-9` → Haiku tier flagged."""
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    r = sm._pricing_for("claude-haiku-9")
+    assert r["input"] == 1.00
+    assert r["output"] == 5.00
+    assert "claude-haiku-9" in sm._UNKNOWN_MODELS_SEEN
+
+
+def test_pricing_known_opus_4_7_with_date_silent(monkeypatch):
+    """`claude-opus-4-7-20251214` → NEW tier silently via prefix sweep.
+
+    The family fallback intentionally runs AFTER the prefix sweep so a
+    date-suffixed known model lands on its prefix entry (silent) rather
+    than being unnecessarily flagged as unknown.
+    """
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    r = sm._pricing_for("claude-opus-4-7-20251214")
+    assert r["input"] == 5.00
+    assert not sm._UNKNOWN_MODELS_SEEN
+
+
+def test_pricing_opus_4_1_with_date_still_old_tier(monkeypatch):
+    """`claude-opus-4-1-20250514` → OLD tier silently via prefix sweep.
+
+    The family fallback regex is anchored to N>=5, so 4-1 doesn't match.
+    Prefix sweep handles it via the explicit `claude-opus-4-1` entry.
+    """
+    monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", set())
+    r = sm._pricing_for("claude-opus-4-1-20250514")
+    assert r["input"] == 15.00
+    assert not sm._UNKNOWN_MODELS_SEEN
 
 
 # --- Cost math ---------------------------------------------------------------
@@ -7382,14 +7488,19 @@ def test_pricing_unknown_model_returns_default_rates(monkeypatch):
 
 
 def test_print_advisories_warns_unknown_models(monkeypatch, capsys):
-    """_print_run_advisories emits a [warn] line to stderr listing unknown models."""
+    """_print_run_advisories emits a [warn] line to stderr listing unknown models.
+
+    v1.41.2: phrasing changed from "Sonnet rates" to "fallback rates" because
+    family-fallback hits route to the family's tier (Opus NEW / Haiku /
+    Sonnet) rather than always landing on _DEFAULT_PRICING.
+    """
     monkeypatch.setattr(sm, "_UNKNOWN_MODELS_SEEN", {"claude-fake-model-x"})
     monkeypatch.setattr(sm, "_FAST_MODE_TURNS", [0])
     sm._print_run_advisories()
     err = capsys.readouterr().err
     assert "[warn]" in err
     assert "claude-fake-model-x" in err
-    assert "Sonnet rates" in err
+    assert "fallback rates" in err
 
 
 def test_print_advisories_silent_when_nothing_to_warn(monkeypatch, capsys):

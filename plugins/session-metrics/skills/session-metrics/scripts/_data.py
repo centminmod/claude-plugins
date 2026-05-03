@@ -24,10 +24,22 @@ def _sm():
 def _pricing_for(model: str) -> dict[str, float]:
     """Resolve a model ID to its rate dict.
 
-    Three-tier resolution: exact key match in ``_PRICING`` → regex pattern
-    sweep (``_PRICING_PATTERNS`` — more-specific variants first) → prefix
-    fallback. Unknown models add to ``_UNKNOWN_MODELS_SEEN`` and return
-    ``_DEFAULT_PRICING`` (Sonnet rates).
+    Resolution order (silent → tentative → fallback):
+
+      1. Exact key match in ``_PRICING`` (silent, correct).
+      2. Regex sweep through ``_PRICING_PATTERNS`` (silent — more-specific
+         variants first; non-Anthropic models, plus the Opus 4.0 anchored
+         pattern that replaced the old ``claude-opus-4`` prefix entry).
+      3. Prefix sweep through ``_PRICING`` keys (silent, dict-insertion
+         order — catches date-suffixed variants of known minors, e.g.
+         ``claude-opus-4-7-20251214`` landing on the ``claude-opus-4-7``
+         entry).
+      4. Family fallback regex sweep through ``_PRICING_FAMILY_FALLBACKS``
+         (v1.41.2 — tentative rate **and** flag the model into
+         ``_UNKNOWN_MODELS_SEEN``). Catches future variants like
+         ``claude-opus-4-8`` (→ NEW $5/$25 tier) and ``claude-haiku-4-6``
+         (→ Haiku $1/$5 tier) instead of the previous silent 3x overcharge.
+      5. ``_DEFAULT_PRICING`` (Sonnet rate, flag as unknown).
 
     Cached (v1.41.0): ``functools.lru_cache(maxsize=128)`` removes the
     redundant resolution that ``_cost`` and ``_no_cache_cost`` both
@@ -46,6 +58,14 @@ def _pricing_for(model: str) -> dict[str, float]:
             return rates
     for prefix, rates in _sm()._PRICING.items():
         if model.startswith(prefix):
+            return rates
+    # Family fallback (v1.41.2): catches future Anthropic variants whose
+    # exact / prefix entries don't exist yet. Returns a defensible family
+    # rate (NEW-tier Opus / Haiku tier) AND flags the model so the
+    # at-exit advisory tells the user to add an explicit entry.
+    for pattern, rates in _sm()._PRICING_FAMILY_FALLBACKS:
+        if pattern.search(model):
+            _sm()._UNKNOWN_MODELS_SEEN.add(model)
             return rates
     _sm()._UNKNOWN_MODELS_SEEN.add(model)
     return _sm()._DEFAULT_PRICING
