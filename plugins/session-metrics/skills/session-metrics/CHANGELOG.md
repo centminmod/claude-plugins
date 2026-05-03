@@ -3,6 +3,22 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.10 — 2026-05-03
+
+### Test-suite — ThreadPoolExecutor parallel-branch coverage
+
+Three new tests appended to `tests/test_instance.py` pin the previously-untested parallel-orchestration path in `scripts/_dispatch.py:_run_all_projects` (L371-376). The `len(project_inputs) > 1` branch was indirectly exercised by existing instance tests but nothing asserted that `ThreadPoolExecutor` was actually used or that its output matched the serial fallback.
+
+**Added** (3 tests, 700/1 → 703/1):
+
+- `test_parallel_branch_uses_thread_pool_when_multiple_projects` — asserts exactly one `ThreadPoolExecutor` is constructed when >1 project is dispatched, with `max_workers ≤ min(8, cpu_count)`.
+- `test_single_project_skips_thread_pool` — symmetric assertion: exactly one project takes the `else` branch and never instantiates the pool.
+- `test_parallel_dispatch_matches_sequential_output` — runs `_run_all_projects` twice over 3 synthetic projects (real-pool then fake-serial-pool), spies on `_dispatch_instance`, deep-equals all per-project + instance-level reports except `generated_at`. Pins the load-bearing assumption (documented at L350-358) that `_build_report` is pure over `sessions_raw`.
+
+**Pattern**: a small `_TrackingExec` class (context-manager + `.map()` returning serial list) substitutes via `monkeypatch.setattr(sys.modules["_dispatch"], "ThreadPoolExecutor", _TrackingExec)` so the closure inside `_run_all_projects` (which resolves `ThreadPoolExecutor` from module globals at call-time) picks up the fake.
+
+**Why patch bump for a test-only change.** Same as v1.41.9 — `tests/` is part of the skill payload that rsyncs downstream, so file bytes change in both mirrors. Boring-bump rule applies.
+
 ## v1.41.9 — 2026-05-03
 
 ### Test-suite restructure — bundle the remaining 6 split slices

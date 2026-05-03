@@ -509,3 +509,159 @@ def test_render_html_instance_chart_uses_day_axis_label(instance_env):
     )
 
 
+# ---------------------------------------------------------------------------
+# Tier 5 — ThreadPoolExecutor parallel-branch coverage (_dispatch.py:371-376).
+# The "len(project_inputs) > 1" branch was previously exercised only as a
+# side effect of other instance tests; nothing asserted that the pool was
+# actually used or that its output matches the serial fallback. These three
+# tests pin both behaviours explicitly so a refactor can't silently regress
+# to single-threaded execution or drift parallel/serial output.
+# ---------------------------------------------------------------------------
+
+class _TrackingExec:
+    """Fake ThreadPoolExecutor that records construction and runs jobs serially."""
+    instances: list["_TrackingExec"] = []
+
+    def __init__(self, max_workers=None):
+        self.max_workers = max_workers
+        type(self).instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def map(self, fn, items):
+        return [fn(i) for i in items]
+
+
+def _patch_executor(monkeypatch, fake_cls):
+    _TrackingExec.instances = []
+    dispatch_mod = sys.modules["_dispatch"]
+    monkeypatch.setattr(dispatch_mod, "ThreadPoolExecutor", fake_cls)
+
+
+def test_parallel_branch_uses_thread_pool_when_multiple_projects(
+    instance_env, monkeypatch
+):
+    """With >1 project, ThreadPoolExecutor must be instantiated exactly once
+    with max_workers ≤ min(8, cpu_count)."""
+    tmp_path, projects_dir = instance_env
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "a1", "turns": [
+            {"model": "claude-opus-4-7", "in": 1000, "out": 500}]}],
+        "-home-user-beta":  [{"id": "b1", "turns": [
+            {"model": "claude-sonnet-4-7", "in": 2000, "out": 1000}]}],
+    })
+    _patch_executor(monkeypatch, _TrackingExec)
+
+    sm._run_all_projects(
+        formats=[], tz_offset=0.0, tz_label="UTC",
+        use_cache=False, chart_lib="none",
+        include_subagents=False, drilldown=False,
+    )
+
+    assert len(_TrackingExec.instances) == 1, (
+        f"expected exactly one ThreadPoolExecutor for >1 project, "
+        f"got {len(_TrackingExec.instances)}"
+    )
+    workers = _TrackingExec.instances[0].max_workers
+    assert isinstance(workers, int) and 1 <= workers <= 8, (
+        f"max_workers must be a positive int ≤ 8, got {workers!r}"
+    )
+
+
+def test_single_project_skips_thread_pool(instance_env, monkeypatch):
+    """With exactly one project, the parallel branch is skipped — the
+    `else` clause must be taken and ThreadPoolExecutor never instantiated."""
+    tmp_path, projects_dir = instance_env
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "a1", "turns": [
+            {"model": "claude-opus-4-7", "in": 1000, "out": 500}]}],
+    })
+    _patch_executor(monkeypatch, _TrackingExec)
+
+    sm._run_all_projects(
+        formats=[], tz_offset=0.0, tz_label="UTC",
+        use_cache=False, chart_lib="none",
+        include_subagents=False, drilldown=False,
+    )
+
+    assert _TrackingExec.instances == [], (
+        f"single-project run must not construct ThreadPoolExecutor, "
+        f"got {len(_TrackingExec.instances)}"
+    )
+
+
+def test_parallel_dispatch_matches_sequential_output(instance_env, monkeypatch):
+    """The parallel branch must produce byte-identical instance_report and
+    per-project reports vs. the serial fallback. Drift here would mean
+    `_build_report` is not actually pure over its sessions_raw input."""
+    tmp_path, projects_dir = instance_env
+    _make_instance_fixture(projects_dir, {
+        "-home-user-alpha": [{"id": "a1", "turns": [
+            {"model": "claude-opus-4-7",   "in": 1000, "out": 500}]}],
+        "-home-user-beta":  [{"id": "b1", "turns": [
+            {"model": "claude-sonnet-4-7", "in": 2000, "out": 1000}]}],
+        "-home-user-gamma": [{"id": "c1", "turns": [
+            {"model": "claude-opus-4-7",   "in": 3000, "out": 1500}]}],
+    })
+
+    captured: dict[str, list] = {"runs": []}
+    real_dispatch = sm._dispatch_instance
+
+    def spy(instance_report, project_reports, formats, **kw):
+        captured["runs"].append({
+            "ir": instance_report,
+            "prs": project_reports,
+        })
+        # Skip real dispatch — we only need the in-memory shape.
+        return None
+
+    # Run 1: real ThreadPoolExecutor (parallel path).
+    monkeypatch.setattr(sm, "_dispatch_instance", spy)
+    sm._run_all_projects(
+        formats=[], tz_offset=0.0, tz_label="UTC",
+        use_cache=False, chart_lib="none",
+        include_subagents=False, drilldown=False,
+    )
+
+    # Run 2: forced-serial via _TrackingExec (also routes through ex.map).
+    _patch_executor(monkeypatch, _TrackingExec)
+    sm._run_all_projects(
+        formats=[], tz_offset=0.0, tz_label="UTC",
+        use_cache=False, chart_lib="none",
+        include_subagents=False, drilldown=False,
+    )
+
+    assert len(captured["runs"]) == 2
+    parallel, serial = captured["runs"]
+
+    # Per-project reports (order-preserved by submit-order in both branches).
+    assert len(parallel["prs"]) == len(serial["prs"]) == 3
+    for pp, sp in zip(parallel["prs"], serial["prs"]):
+        assert pp["slug"] == sp["slug"]
+        assert pp["totals"] == sp["totals"], (
+            f"per-project totals diverged for {pp['slug']}"
+        )
+        # Whole-report equality — `_build_report` must be pure over its input.
+        # `generated_at` reflects wall-clock time and is the only known
+        # field that legitimately differs between two consecutive runs.
+        pp_filtered = {k: v for k, v in pp.items() if k != "generated_at"}
+        sp_filtered = {k: v for k, v in sp.items() if k != "generated_at"}
+        assert pp_filtered == sp_filtered, (
+            f"per-project report drift for {pp['slug']}: "
+            f"differing keys = "
+            f"{set(pp_filtered) ^ set(sp_filtered) or 'same keys, different values'}"
+        )
+
+    # Instance-level totals and aggregates must match exactly.
+    assert parallel["ir"]["totals"] == serial["ir"]["totals"]
+    assert parallel["ir"]["models"] == serial["ir"]["models"]
+    assert parallel["ir"]["project_count"] == serial["ir"]["project_count"]
+    assert parallel["ir"]["session_count"] == serial["ir"]["session_count"]
+    # Project ordering inside instance_report must also be deterministic.
+    assert [p["slug"] for p in parallel["ir"]["projects"]] == \
+           [p["slug"] for p in serial["ir"]["projects"]]
+
