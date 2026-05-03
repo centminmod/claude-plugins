@@ -3,6 +3,38 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.4 — 2026-05-03
+
+### P3 + P4 + P5 + P6 from Session 138 audit — advisor cost edge cases, atomic-replace cache invalidation, coverage gaps
+
+Four audit items landed in one bump. P3 and P4 are dormant defensive fixes (no observable change on real-world transcripts). P5 closes coverage gaps that would have made any of the above silent. P6 is verified clean and closes without code change.
+
+**P3 — advisor cost edge cases** (`_turn_parser.py:467-560`):
+
+- **`_cost` line 488** — `it.get("model", model)` returns `""` when the iteration has the key but its value is empty (the default arg of `dict.get` only fires on missing keys, not empty values). Empty model string fell through `_pricing_for("")` → `_DEFAULT_PRICING` ($3/$15) instead of the parent turn's tier. Fixed with `it.get("model") or model` — collapses both missing-key and empty-string to the parent model. On Opus 4.7 parent the divergence was 60%+ on advisor cost.
+- **`_advisor_info`** — same defect path. Function now takes the parent `model` parameter and uses `_pricing_for(adv_model or model)` instead of conditioning on emptiness and falling to `_DEFAULT_PRICING`. The displayed advisor model name (return tuple position 2) still goes `None` when the iteration carries no model — only the rate fallback changed.
+- **`_no_cache_cost`** — previously charged the primary turn's tokens at non-cached rates but skipped the advisor iteration loop entirely. On advisor-using turns the "savings from caching" delta (`cost_usd - no_cache_cost`) was biased downward because the cached side included advisor cost while the no-cache side did not. Mirrored the iterations loop from `_cost` so the comparison is symmetric (advisor has no cache fields, so the cached and no-cache forms are identical for that portion).
+
+**P4 — `_parse_cache_key` includes `st_size`** (`_data.py:113-148`):
+
+The cache key was `path_hash + mtime_ns + _SCRIPT_VERSION`. Atomic-replace tools (`cp -p`, `rsync --inplace`, restore-from-backup) preserve `mtime_ns` while changing content — the cache would silently serve the stale pickled blob. Added `st_size` to the key (already in scope at the `path.stat()` call site, threaded through). All existing on-disk blobs are invalidated by the format change; cold rebuild is automatic on first invocation after upgrade. The prune-on-write logic is unaffected — its prefix glob still catches stranded blobs for the same source path.
+
+**P5 — five new tests** (`tests/test_session_metrics.py`):
+
+1. `test_cached_parse_invalidates_on_size` — same `mtime_ns`, different content size → fresh blob (the P4 invariant).
+2. `test_cached_parse_invalidates_on_script_version` — bumping `_SCRIPT_VERSION` mints a new key; old blob pruned.
+3. `test_weekly_rollup_boundary_inclusivity` — half-open `[start, end)` math at the `now-7d` and `now-14d` cutoffs; an off-by-one swap on either edge would silently double-count or drop a turn at the seam.
+4. `test_advisor_empty_model_falls_back_to_parent_rate` — the P3 invariant: empty `iterations[i].model` charges at the parent turn's rate, not `_DEFAULT_PRICING`.
+5. `test_no_cache_cost_includes_advisor_iterations` — the P3 symmetry invariant: `_no_cache_cost` mirrors the advisor loop in `_cost`.
+
+`test_parse_cache_key_includes_path_hash` was updated to pass the new `size` argument.
+
+**P6 — verified clean, no code change.** The audit's NOVEL-2 claim (`compute_instance_baseline` reads a wrong field name at `audit-extract.py:998`) was refuted against a live instance-mode export: the export emits both `project_count` (scalar, primary read) and `projects` (list, fallback), so the existing `data.get("project_count", len(data.get("projects", [])))` is correct.
+
+**Tests**: 5 added, 1 updated for new signature. **700 passed, 1 skipped** (was 695 in v1.41.3).
+
+Patch bump per repo policy: any skill-payload byte change bumps `_SKILL_VERSION` for export traceability. The advisor and cache-key fixes are dormant under normal transcripts (real `iterations[i].model` is always populated, real upgrade paths bump mtime), so users see no observable behaviour change — only the defensive fallback shifted to the more accurate path.
+
 ## v1.41.3 — 2026-05-03
 
 ### P2 from Session 138 audit — pricing-table parity guard between session-metrics and audit-extract

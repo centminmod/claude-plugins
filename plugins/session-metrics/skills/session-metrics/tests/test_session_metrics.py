@@ -1279,6 +1279,55 @@ def test_weekly_rollup_uses_deduped_cost():
     assert ro["prior_7d"]["cost"] == pytest.approx(0.0, abs=1e-9)
 
 
+def test_weekly_rollup_boundary_inclusivity():
+    """Half-open ``[start, end)`` boundary math at ``now-7d`` and ``now-14d``.
+
+    Trailing window is ``[now-7d, now)``; prior window is
+    ``[now-14d, now-7d)``. A turn timestamped at the cutoff must land in
+    *one* window, not zero or two — and the cutoff is the lower bound,
+    not the upper. Without this regression test an off-by-one swap of
+    inclusive/exclusive on either edge would silently double-count or
+    drop a turn straddling the seam.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    now = _epoch(2026, 4, 17, 12, 0)
+
+    def _iso(epoch: int) -> str:
+        return _dt.fromtimestamp(epoch, tz=_tz.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+    epochs = {
+        "at_now":         now,                 # exclusive upper of trailing
+        "trailing_start": now - 7  * 86400,    # inclusive lower of trailing
+        "seam_minus_1s":  now - 7  * 86400 - 1,  # last second of prior
+        "prior_start":    now - 14 * 86400,    # inclusive lower of prior
+        "before_prior":   now - 14 * 86400 - 1,  # outside both windows
+    }
+
+    def _mk_turn(epoch: int) -> dict:
+        return {
+            "timestamp":          _iso(epoch),
+            "input_tokens":       1,
+            "output_tokens":      1,
+            "cache_read_tokens":  0,
+            "cache_write_tokens": 0,
+            "cost_usd":           0.001,
+        }
+
+    sessions_out = [{
+        "turns": [_mk_turn(e) for e in epochs.values()],
+    }]
+    sessions_raw = [("sid", [], [])]
+    ro = sm._build_weekly_rollup(sessions_out, sessions_raw, [], now_epoch=now)
+    # Trailing catches at_now-exclusive and trailing_start-inclusive — so
+    # one turn (trailing_start). Prior catches seam_minus_1s and
+    # prior_start-inclusive — so two turns. before_prior and at_now fall
+    # outside both windows.
+    assert ro["trailing_7d"]["turns"] == 1
+    assert ro["prior_7d"]["turns"] == 2
+
+
 def test_fmt_delta_pct_prior_zero_returns_new():
     d, _ = sm._fmt_delta_pct(5, 0)
     assert d == "new"
@@ -1345,6 +1394,61 @@ def test_cached_parse_invalidates_on_mtime(tmp_path, monkeypatch):
     assert before.isdisjoint(after)
 
 
+def test_cached_parse_invalidates_on_size(tmp_path, monkeypatch):
+    """Same mtime + different content size must invalidate the cache.
+
+    Regression for the atomic-replace gap: tools that preserve ``mtime_ns``
+    while rewriting content (``cp -p``, ``rsync --inplace``, restore-from-
+    backup) used to silently serve a stale pickle blob keyed only on
+    mtime. Including ``st_size`` in the cache key makes any change in
+    file size mint a fresh blob.
+    """
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    src = tmp_path / "fixed_mtime.jsonl"
+    src.write_text(_FIXTURE.read_text(encoding="utf-8"))
+    sm._cached_parse_jsonl(src, use_cache=True)
+    # Snapshot the original blob set + the original ns timestamps so we can pin them.
+    before = {p.name for p in (tmp_path / "parse").iterdir()}
+    import os
+    stat_before = src.stat()
+    # Truncate the file so size shrinks but mtime is restored to the original.
+    truncated = "\n".join(src.read_text(encoding="utf-8").splitlines()[:1]) + "\n"
+    src.write_text(truncated, encoding="utf-8")
+    # Use ``ns=`` to preserve nanosecond precision — float-second utime
+    # round-trips lose precision on macOS APFS.
+    os.utime(src, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+    # mtime must match (the test premise — atomic-replace preserves mtime).
+    assert src.stat().st_mtime_ns == stat_before.st_mtime_ns
+    sm._cached_parse_jsonl(src, use_cache=True)
+    after = {p.name for p in (tmp_path / "parse").iterdir()}
+    # New key was minted (size component differs); old blob pruned.
+    assert before.isdisjoint(after)
+    assert len(after) == 1
+
+
+def test_cached_parse_invalidates_on_script_version(tmp_path, monkeypatch):
+    """Bumping ``_SCRIPT_VERSION`` must invalidate every existing blob.
+
+    The version embeds in the cache filename so a parser-shape change
+    forces a cold rebuild — without this guard, an upgrade that changes
+    the parsed entry shape would silently feed stale dicts to downstream
+    code.
+    """
+    monkeypatch.setattr(sm, "_parse_cache_dir", lambda: tmp_path / "parse")
+    src = tmp_path / "version_bump.jsonl"
+    src.write_text(_FIXTURE.read_text(encoding="utf-8"))
+    sm._cached_parse_jsonl(src, use_cache=True)
+    before = {p.name for p in (tmp_path / "parse").iterdir()}
+    assert len(before) == 1
+    # Simulate a version bump.
+    monkeypatch.setattr(sm, "_SCRIPT_VERSION", sm._SCRIPT_VERSION + "+test")
+    sm._cached_parse_jsonl(src, use_cache=True)
+    after = {p.name for p in (tmp_path / "parse").iterdir()}
+    # New key was minted (version component differs); old blob pruned.
+    assert before.isdisjoint(after)
+    assert len(after) == 1
+
+
 def test_parse_cache_key_includes_path_hash(tmp_path):
     """Same stem + same mtime in sibling dirs must yield distinct cache keys.
 
@@ -1361,11 +1465,12 @@ def test_parse_cache_key_includes_path_hash(tmp_path):
     p_a.write_text("{}\n", encoding="utf-8")
     p_b.write_text("{}\n", encoding="utf-8")
     mtime_ns = 1_700_000_000_000_000_000
-    key_a = sm._parse_cache_key(p_a, mtime_ns)
-    key_b = sm._parse_cache_key(p_b, mtime_ns)
+    size = 3
+    key_a = sm._parse_cache_key(p_a, mtime_ns, size)
+    key_b = sm._parse_cache_key(p_b, mtime_ns, size)
     assert key_a != key_b
     # Keys must still be deterministic for the same path.
-    assert key_a == sm._parse_cache_key(p_a, mtime_ns)
+    assert key_a == sm._parse_cache_key(p_a, mtime_ns, size)
 
 
 def test_cached_parse_same_stem_sibling_dirs_no_collision(tmp_path, monkeypatch):
@@ -8673,6 +8778,82 @@ def test_no_advisor_session_unchanged():
         assert t["advisor_model"] is None
     # The well-known fixture total is unchanged.
     assert r["totals"]["cost"] == pytest.approx(0.027845, abs=1e-7)
+
+
+def test_advisor_empty_model_falls_back_to_parent_rate():
+    """Empty ``iterations[i].model`` must charge at the parent turn's rate.
+
+    Regression for the silent ``it.get("model", "")`` divergence: the
+    default arg of ``dict.get`` only fires on a missing key, so a key
+    present but empty (``"model": ""``) used to fall through
+    ``_pricing_for("")`` to ``_DEFAULT_PRICING`` instead of the parent
+    model's tier. After the v1.41.4 fix both ``_cost`` and
+    ``_advisor_info`` collapse missing-key and empty-string to the
+    parent model — the more accurate fallback when an iteration record
+    is partial.
+
+    Parent model: ``claude-opus-4-7`` (input/output $5/$25 per 1M).
+    Default tier: ``$3/$15`` per 1M. The two diverge by 60%+ on cost,
+    so a wrong fallback is loud — not just an edge case.
+    """
+    sm._pricing_for.cache_clear()
+    parent_model = "claude-opus-4-7"
+    usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "iterations": [
+            {"type": "advisor_message",
+             "model": "",
+             "input_tokens":  10_000,
+             "output_tokens": 500},
+        ],
+    }
+    expected_advisor = (10_000 * 5 + 500 * 25) / 1_000_000
+    cost = sm._cost(usage, parent_model)
+    assert cost == pytest.approx(expected_advisor, abs=1e-9)
+    calls, adv_cost, adv_model, _, _ = sm._advisor_info(usage, parent_model)
+    assert calls == 1
+    assert adv_cost == pytest.approx(expected_advisor, abs=1e-9)
+    # adv_model stays None because the iteration's model field was empty
+    # — the rate fallback fixed the cost, but the displayed model name
+    # is still unknown for that record.
+    assert adv_model is None
+
+
+def test_no_cache_cost_includes_advisor_iterations():
+    """``_no_cache_cost`` must mirror the advisor loop in ``_cost``.
+
+    Regression for the asymmetry that biased the cache-savings delta:
+    on advisor-using turns ``_cost`` charged the advisor portion but
+    ``_no_cache_cost`` skipped it, so ``cost_usd - no_cache_cost``
+    appeared smaller than the real saving from prompt caching. Advisor
+    iterations have no cache fields, so the no-cache and cached forms
+    are identical for that portion — the no-cache function must add it
+    back to keep the comparison honest.
+    """
+    sm._pricing_for.cache_clear()
+    parent_model = "claude-opus-4-7"
+    usage = {
+        # Primary turn: only cache_read tokens, no fresh input — so the
+        # primary _cost is small and any non-zero result must come from
+        # the advisor block.
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 1000,
+        "cache_creation_input_tokens": 0,
+        "iterations": [
+            {"type": "advisor_message",
+             "model": "claude-opus-4-7",
+             "input_tokens":  10_000,
+             "output_tokens": 500},
+        ],
+    }
+    nc = sm._no_cache_cost(usage, parent_model)
+    expected_primary = 1000 * 5 / 1_000_000      # cache_read recharged at full input rate
+    expected_advisor = (10_000 * 5 + 500 * 25) / 1_000_000
+    assert nc == pytest.approx(expected_primary + expected_advisor, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------

@@ -130,21 +130,28 @@ def _parse_cache_dir() -> Path:
     return Path.home() / ".cache" / "session-metrics" / "parse"
 
 
-def _parse_cache_key(path: Path, mtime_ns: int) -> str:
-    """Build a stable cache-key filename from path hash, stem, mtime, and ver.
+def _parse_cache_key(path: Path, mtime_ns: int, size: int) -> str:
+    """Build a stable cache-key filename from path hash, stem, mtime, size, and ver.
 
     An 8-hex-char SHA1 of the resolved absolute path disambiguates two JSONLs
     that share a UUID stem (e.g. identical filenames in sibling project dirs).
     Using ``mtime_ns`` (nanoseconds since epoch) means a touched JSONL always
-    invalidates the cache. Bumping ``_sm()._SCRIPT_VERSION`` invalidates every
-    existing blob — safe default when the parser shape changes.
+    invalidates the cache. ``size`` (``st_size``) is included so an
+    atomic-replace tool that preserves ``mtime_ns`` while changing content
+    (``cp -p``, ``rsync --inplace``, restore-from-backup) still invalidates
+    the blob — without it a stale pickle would be served silently. Bumping
+    ``_sm()._SCRIPT_VERSION`` invalidates every existing blob — safe default
+    when the parser shape changes.
     """
     try:
         abs_path = str(path.resolve())
     except OSError:
         abs_path = str(path)
     path_hash = hashlib.sha1(abs_path.encode("utf-8")).hexdigest()[:8]
-    return f"{path.stem}__{path_hash}__{mtime_ns}__{_sm()._SCRIPT_VERSION}.pkl"
+    return (
+        f"{path.stem}__{path_hash}__{mtime_ns}__{size}__"
+        f"{_sm()._SCRIPT_VERSION}.pkl"
+    )
 
 
 def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
@@ -164,12 +171,14 @@ def _cached_parse_jsonl(path: Path, use_cache: bool = True) -> list[dict]:
     if not use_cache:
         return _parse_jsonl(path)
     try:
-        mtime_ns = path.stat().st_mtime_ns
+        st = path.stat()
+        mtime_ns = st.st_mtime_ns
+        size = st.st_size
     except OSError:
         return _parse_jsonl(path)
 
     cache_dir = _sm()._parse_cache_dir()
-    cache_path = cache_dir / _sm()._parse_cache_key(path, mtime_ns)
+    cache_path = cache_dir / _sm()._parse_cache_key(path, mtime_ns, size)
     try:
         with open(cache_path, "rb") as fh:
             return pickle.load(fh)

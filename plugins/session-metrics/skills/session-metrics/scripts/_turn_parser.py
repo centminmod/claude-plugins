@@ -485,7 +485,13 @@ def _cost(u: dict, model: str) -> float:
     advisor = 0.0
     for it in u.get("iterations") or []:
         if it.get("type") == "advisor_message":
-            adv_rates = _sm()._pricing_for(it.get("model", model))
+            # ``it.get("model", model)`` would return ``""`` when the key is
+            # present but empty — fall through ``_pricing_for("")`` to the
+            # default-pricing tier silently. ``or model`` collapses both
+            # missing-key and empty-string to the parent turn's model so the
+            # advisor charge tracks the parent's rate (the correct fallback
+            # when the iteration record is partial).
+            adv_rates = _sm()._pricing_for(it.get("model") or model)
             advisor += (
                 it.get("input_tokens", 0)  * adv_rates["input"]  / 1_000_000
               + it.get("output_tokens", 0) * adv_rates["output"] / 1_000_000
@@ -493,32 +499,37 @@ def _cost(u: dict, model: str) -> float:
     return primary + advisor
 
 
-def _advisor_info(u: dict) -> tuple[int, float, str | None, int, int]:
+def _advisor_info(u: dict, model: str) -> tuple[int, float, str | None, int, int]:
     """Extract advisor metadata from usage.iterations.
 
     Returns ``(call_count, advisor_cost_usd, advisor_model, input_tokens,
     output_tokens)`` for all ``advisor_message`` iterations in this turn.
     Returns all-zero/None when no advisor was called.
+
+    ``model`` is the parent turn's model and acts as the rate fallback when
+    an iteration carries no ``model`` field — same fallback path as
+    ``_cost``. Without it the advisor cost would silently apply
+    ``_DEFAULT_PRICING`` and diverge from ``_cost`` on the same record.
     """
     calls = 0
     cost = 0.0
-    model: str | None = None
+    advisor_model: str | None = None
     inp = 0
     out = 0
     for it in u.get("iterations") or []:
         if it.get("type") == "advisor_message":
             calls += 1
             adv_model = it.get("model") or ""
-            if adv_model and model is None:
-                model = adv_model
-            adv_rates = _sm()._pricing_for(adv_model) if adv_model else _sm()._DEFAULT_PRICING
+            if adv_model and advisor_model is None:
+                advisor_model = adv_model
+            adv_rates = _sm()._pricing_for(adv_model or model)
             cost += (
                 it.get("input_tokens", 0) * adv_rates["input"]  / 1_000_000
               + it.get("output_tokens", 0) * adv_rates["output"] / 1_000_000
             )
             inp += it.get("input_tokens", 0)
             out += it.get("output_tokens", 0)
-    return calls, cost, model, inp, out
+    return calls, cost, advisor_model, inp, out
 
 
 def _no_cache_cost(u: dict, model: str) -> float:
@@ -528,7 +539,25 @@ def _no_cache_cost(u: dict, model: str) -> float:
         + u.get("cache_read_input_tokens", 0)
         + u.get("cache_creation_input_tokens", 0)
     )
-    return total_input * r["input"] / 1_000_000 + u.get("output_tokens", 0) * r["output"] / 1_000_000
+    primary = (
+        total_input * r["input"] / 1_000_000
+        + u.get("output_tokens", 0) * r["output"] / 1_000_000
+    )
+    # Mirror the advisor loop in ``_cost``: advisor iterations carry their
+    # own token counts and are NOT reflected in the top-level usage fields,
+    # so they must be added to the no-cache baseline as well — otherwise
+    # the "savings from caching" delta (cost vs no_cache_cost) is biased
+    # downward on every advisor-using turn. Advisor iterations have no
+    # cache fields, so the no-cache and cached forms are identical.
+    advisor = 0.0
+    for it in u.get("iterations") or []:
+        if it.get("type") == "advisor_message":
+            adv_rates = _sm()._pricing_for(it.get("model") or model)
+            advisor += (
+                it.get("input_tokens", 0)  * adv_rates["input"]  / 1_000_000
+              + it.get("output_tokens", 0) * adv_rates["output"] / 1_000_000
+            )
+    return primary + advisor
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +584,7 @@ def _build_turn_record(global_index: int, entry: dict,
         ttl = "mix"
     c = _cost(u, model)
     nc = _no_cache_cost(u, model)
-    adv_calls, adv_cost, adv_model, adv_inp, adv_out = _advisor_info(u)
+    adv_calls, adv_cost, adv_model, adv_inp, adv_out = _advisor_info(u, model)
     # Content-block distribution: assistant blocks come from this turn's own
     # message.content; tool_result / image blocks are attributed from the user
     # entry that immediately preceded this turn in the raw JSONL stream.

@@ -3,6 +3,36 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.41.4 — 2026-05-03
+
+### Advisor cost edge cases, atomic-replace cache invalidation, coverage gaps
+
+Three correctness-adjacent fixes plus regression tests. The advisor and cache-key fixes are dormant under normal transcripts — real-world iteration records always carry a model, and normal upgrade paths bump mtime — so there is no observable behaviour change. Only the defensive fallback paths shifted to the more accurate behaviour.
+
+**Advisor cost edge cases** (`_turn_parser.py:467-560`):
+
+- `_cost`: `it.get("model", model)` returned `""` when the key was present but empty (default arg of `dict.get` only fires on missing keys). Empty model fell through `_pricing_for("")` → `_DEFAULT_PRICING` ($3/$15) instead of the parent turn's tier. Replaced with `it.get("model") or model` — collapses both missing-key and empty-string to the parent rate. On Opus 4.7 the divergence was 60%+ on advisor cost.
+- `_advisor_info`: same defect. Now takes the parent `model` parameter and uses `_pricing_for(adv_model or model)`. The displayed advisor model name still goes `None` when the iteration carries no model — only the rate fallback changed.
+- `_no_cache_cost`: skipped the advisor iteration loop entirely, so the "savings from caching" delta was biased downward on advisor-using turns. Mirrored the iterations loop from `_cost` for a symmetric comparison.
+
+**`_parse_cache_key` includes `st_size`** (`_data.py:113-148`):
+
+The cache key was `path_hash + mtime_ns + _SCRIPT_VERSION`. Atomic-replace tools (`cp -p`, `rsync --inplace`, restore-from-backup) preserve `mtime_ns` while changing content — the cache would silently serve the stale pickled blob. Added `st_size` to the key. Existing on-disk blobs are invalidated by the format change; cold rebuild runs automatically on first invocation. The prune-on-write logic is unaffected.
+
+**Five new tests** in `tests/test_session_metrics.py`:
+
+1. `test_cached_parse_invalidates_on_size` — same mtime, different size → fresh blob.
+2. `test_cached_parse_invalidates_on_script_version` — bumping `_SCRIPT_VERSION` mints a new key.
+3. `test_weekly_rollup_boundary_inclusivity` — half-open `[start, end)` math at the `now-7d` and `now-14d` cutoffs.
+4. `test_advisor_empty_model_falls_back_to_parent_rate` — the empty-model fallback invariant.
+5. `test_no_cache_cost_includes_advisor_iterations` — the symmetry invariant.
+
+`test_parse_cache_key_includes_path_hash` was updated for the new signature.
+
+**Tests**: 5 added, 1 updated. **700 passed, 1 skipped** (was 695).
+
+Patch bump for export traceability — `_SKILL_VERSION` is embedded in every export, so byte-level changes bump the version even when behaviour is unchanged.
+
 ## v1.41.3 — 2026-05-03
 
 ### Pricing-table parity guard between session-metrics and audit-extract
