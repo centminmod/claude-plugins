@@ -1,6 +1,6 @@
 {
   "name": "session-metrics",
-  "version": "1.66.0",
+  "version": "1.66.2",
   "description": "Per-turn token, cost, and cache analytics for Claude Code sessions. Multi-format export (text/JSON/CSV/MD/HTML) with session blocks, weekly roll-up, subagent attribution, dynamic-workflow tracking, and 9-category turn waste classification. HTML reports include cost timeline, hour-of-day punchcard, model-switch dividers, cache-break badges, a per-turn detail drawer, and a per-request breakdown that groups turns by the prompt that drove them. Sibling skills: audit-session-metrics audits exports for waste patterns (summarisation-only — run on /model haiku for ~10× cheaper); task-breakdown groups requests into semantic tasks with worth-it / wasted verdicts and a Tasks companion page. Zero network, stdlib-only Python.",
   "author": {
     "name": "George Liu",

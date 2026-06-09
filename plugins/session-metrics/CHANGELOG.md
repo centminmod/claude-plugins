@@ -3,6 +3,48 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.66.2 — 2026-06-10
+
+### Export-audit Phase 2 — Markdown share-line dedup + render/instance performance (patch)
+
+One user-visible bugfix plus three performance changes from the 2026-06-10
+export audit, all guarded by frozen-input A/B comparisons (instance JSON/MD
+byte-identical outside `generated_at`/`skill_version`/wall-clock `now_epoch`;
+session HTML identical after masking only the intended restructure):
+
+- **Markdown: duplicate "Subagent share of cost" row removed.** Since
+  v1.65.0 the MD Summary table emitted the row twice — the original
+  emission after *Total cost* plus a second one added in v1.65.0 under the
+  belief the row was missing. The row now appears exactly once (original
+  position), and `render_md` consumes the precomputed
+  `subagent_share_stats` instead of recomputing.
+- **Renderers reuse precomputed stats.** `render_html`'s subagent-share /
+  attribution-coverage cards and the within-session split (HTML + MD) now
+  read the values `_build_report` already stamps on the report
+  (`subagent_share_stats`, `subagent_within_session_split`), with the
+  recompute kept only as a fallback — the same guard pattern the instance
+  renderers already used.
+- **Time-of-day epoch array embedded once instead of three times.** The
+  hour-of-day, punchcard, and day-part heatmap sections shared a single
+  `<script type="application/json" id="tod-epoch-secs">` blob and
+  `JSON.parse` it, instead of each inlining its own `var TS=[...]` copy of
+  the largest data payload on the page (−10.5% page bytes on the A/B
+  fixture; more on prompt-heavy instances).
+- **Instance scope: slimmed raw turns + single aggregation walk.**
+  `--all-projects` previously held every project's full raw JSONL entries
+  (including message content) in memory through the entire rendering
+  phase; each turn is now projected down to the `timestamp` +
+  `message.{usage,model}` fields `_build_session_blocks` actually reads,
+  and the originals are dropped once per-project reports are built.
+  `_aggregate_models` and `_aggregate_totals` now share one turn walk
+  (tool-name counts collected during the models walk and injected) instead
+  of walking every turn twice.
+
+Suite 812 passed / 1 skipped (8 new regression tests: MD single-emission +
+stamped-stats preference, shared epoch blob, slim-turn equivalence,
+single-walk equivalence). Ruff: identical pre-existing findings, 0
+introduced. No cost or token math changed.
+
 ## v1.66.0 — 2026-06-10
 
 ### Recognise Claude Fable 5 — new premium model family ($10/$50)
