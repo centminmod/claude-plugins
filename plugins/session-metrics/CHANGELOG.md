@@ -3,6 +3,30 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.70.0 — 2026-06-11
+
+### Compare-suite v2 — fix `tool_heavy_task` hang + agentic-loop bounds (minor)
+
+The `tool_heavy_task` compare-suite prompt referenced repo-relative
+paths that never resolve inside the empty scratch cwd every
+`--compare-run` subprocess runs in; high-effort models could escalate
+the failed Reads into a filesystem-wide `find /` that wedged a cell for
+the full per-call timeout. Suite v1 was silently measuring failed-Read
+recovery, not tool fan-out.
+
+- **Compare-suite v1 → v2.** `tool_heavy_task` now reads three frozen
+  fixture files (`references/model-compare/fixtures/`) staged into the
+  scratch dir before any subprocess fires; sentinels bumped in all 10
+  prompts. v1 and v2 `tool_heavy_task` numbers are not comparable — the
+  suite-version checker refuses mixed comparisons by design.
+- **New flag `--compare-run-max-turns N`** (default 100, `0` = unbounded)
+  threaded as `claude -p --max-turns` to every subprocess.
+- **Bash-tool timeout env caps** (`BASH_DEFAULT_TIMEOUT_MS=300000`,
+  `BASH_MAX_TIMEOUT_MS=600000`; user-set values win) on every
+  compare-run subprocess.
+
+Suite: 830 passed, 1 skipped.
+
 ## v1.69.1 — 2026-06-11
 
 ### Fix crashing `--help` (patch)
