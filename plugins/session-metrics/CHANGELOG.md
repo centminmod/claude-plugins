@@ -3,6 +3,39 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.74.0 — 2026-06-13
+
+### Accuracy & correctness disciplines (minor)
+
+Six correctness hardenings that protect the report's core value — accurate,
+reproducible numbers — without changing the common-case output:
+
+- **Deterministic multi-session fold order.** Instance-scope (`--all-projects`)
+  cost sums now visit projects in a stable slug order before folding, and the
+  merged `content_blocks` / `null_metric_counts` dicts use sorted keys, so the
+  JSON/HTML export bytes are reproducible run-to-run regardless of the OS's
+  directory-scan order. (Fixes a latent nondeterminism in the per-session fold.)
+- **Null-vs-zero discipline.** Totals now carry `null_metric_counts`, recording
+  how many turns had an *unmeasured* metric (currently `latency_seconds`) versus
+  a measured zero, so an aggregate can be read as a lower bound.
+- **Negative cache savings are surfaced, never hidden.** KPI card relabels to
+  "Cache net cost" (amber), the per-turn drawer and text footer reframe the
+  sign instead of showing a misleading $0.0000.
+- **CSV formula-injection hardening.** Every CSV export (session, project,
+  instance, both compare CSVs) routes cells through a writer proxy that prefixes
+  genuinely-textual `= + - @`/tab/CR/LF cells with a single quote; numeric
+  strings are untouched.
+- **Velocity discipline.** A new `velocity` report key reports cost- and
+  token-per-active-minute plus p50/p90/mean turn-cycle seconds over a single
+  filtered sample, each unit's wall-clock capped at 30 minutes.
+- **Pricing provenance + `--refresh-pricing`.** Reports embed the rate-table
+  snapshot date and any models priced at family-tier fallback (HTML "Pricing
+  advisory" when present). `--refresh-pricing <file.json>` supplements rates for
+  unresolved models only — never overwrites a known rate.
+
+New report keys are additive; existing cost totals and common-case export bytes
+are unchanged.
+
 ## v1.73.2 — 2026-06-13
 
 ### Fix: Session Health / Behavior sections now theme-aware (patch)
