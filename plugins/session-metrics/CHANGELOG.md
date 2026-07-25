@@ -3,6 +3,49 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.87.0 — 2026-07-25
+
+### Feature: per-model split on the Subagent types table (minor)
+
+`by_subagent_type` rows gain a `models` map (`{model_id: turn_count}`),
+mirroring the field `by_workflow` rows have carried since v1.48.0. It is
+accumulated from the same subagent transcripts the token/cost columns already
+read, so there is no new parse IO and no `_SCRIPT_VERSION` bump. Ordering is
+deterministic — turn count descending, then model id ascending — because
+renderers read the first entry as the dominant model.
+
+Surfaces in every format:
+
+- **HTML** — a `Model` column showing the sole model, or `<dominant> +N` when
+  more than one served the type. Mixed rows are accent-coloured with a dotted
+  underline (theme-var only; verified across Beacon / Console / Lattice /
+  Pulse) and their `title` spells out the full per-model turn split plus the
+  reason a pinned type can show a mix.
+- **Markdown** — same column; mixed rows print the whole split inline
+  (`` `claude-opus-4-7` 57 · `claude-opus-5` 8 ``) rather than collapsing it,
+  since Markdown has no hover.
+- **CSV** — a `models` column, `model:count|model:count` ordered count-desc.
+- **JSON** — the `models` map itself.
+
+The column is gated on `--include-subagents` (as the warm-up columns already
+were): a spawn-count-only run has no transcript to read a model from, so the
+column is hidden rather than rendered as a row of dashes. Project- and
+instance-scope merges union the maps across projects.
+
+**Why this exists.** An `Agent`-tool call that passes `model` **overrides** the
+subagent definition's frontmatter `model:` pin, and a generic alias (`opus`)
+resolves to the current family member rather than to a specific pinned
+version. A model-pinned subagent can therefore serve turns on a model other
+than its pin, and the type-level turn count alone cannot reveal it — reading
+the divergence previously meant diffing a per-type total against the per-model
+table and inferring the remainder, which is easy to misread as missing data.
+The new column shows it directly on the row. This matters most when
+A/B-benchmarking model-pinned subagent twins, where an unnoticed override
+silently collapses two arms of the experiment onto one model.
+
+No behaviour change to any token, cost, or turn figure — the field is purely
+additive and every existing column is byte-identical.
+
 ## v1.86.0 — 2026-07-18
 
 ### Feature: OpenAI GPT-5.6 family pricing (minor)

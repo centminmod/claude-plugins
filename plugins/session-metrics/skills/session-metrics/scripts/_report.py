@@ -1320,6 +1320,13 @@ def _merge_bucket_rows(project_reports: list[dict], key: str,
                 if field in row:
                     m[field] = m.get(field, 0) + int(row.get(field, 0) or 0)
             m["cost_usd"] = float(m.get("cost_usd", 0.0)) + float(row.get("cost_usd", 0.0))
+            # v1.87.0: model→turn maps union across projects (by_subagent_type
+            # only; by_skill rows carry no models field, hence the `if`).
+            src_models = row.get("models") or {}
+            if src_models:
+                dst = m.setdefault("models", {})
+                for mdl, cnt in src_models.items():
+                    dst[mdl] = dst.get(mdl, 0) + int(cnt or 0)
             # Sessions are recomputed from summed session_count (best-effort
             # — we treat each project's session_count as independent because
             # project slugs partition session IDs).
@@ -1343,6 +1350,9 @@ def _merge_bucket_rows(project_reports: list[dict], key: str,
         if "spawn_count" in m or key == "by_subagent_type":
             calls_for_avg = m.get("spawn_count", 0) or m.get("turns_attributed", 0) or 1
             m["avg_tokens_per_call"] = round(m.get("total_tokens", 0) / calls_for_avg, 1)
+        if "models" in m:
+            m["models"] = dict(sorted(m["models"].items(),
+                                       key=lambda kv: (-kv[1], kv[0])))
         out.append(m)
     out.sort(key=lambda r: -(r.get("cost_usd", 0.0) or r.get("total_tokens", 0) or r.get("spawn_count", 0)))
     return out

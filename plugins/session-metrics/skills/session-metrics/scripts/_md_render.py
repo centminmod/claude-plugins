@@ -429,7 +429,11 @@ def render_csv(report: dict) -> str:
                     "cache_hit_pct", "pct_total_cost",
                     # v1.26.0: per-invocation warm-up signals.
                     "invocation_count", "first_turn_share_pct",
-                    "sp_amortisation_pct"])
+                    "sp_amortisation_pct",
+                    # v1.87.0: model→turn split, "model:count|model:count"
+                    # ordered by count desc. >1 entry = the agent file's
+                    # `model:` pin was overridden on some spawns.
+                    "models"])
         for r in by_subagent:
             w.writerow([
                 r.get("name", ""), r.get("spawn_count", 0),
@@ -443,6 +447,9 @@ def render_csv(report: dict) -> str:
                 int(r.get("invocation_count", 0)),
                 f"{float(r.get('first_turn_share_pct', 0.0)):.1f}",
                 f"{float(r.get('sp_amortisation_pct', 0.0)):.1f}",
+                "|".join(f"{k}:{v}" for k, v in sorted(
+                    (r.get("models") or {}).items(),
+                    key=lambda kv: (-kv[1], kv[0]))),
             ])
 
     by_workflow = report.get("by_workflow") or []
@@ -1051,14 +1058,26 @@ def render_md(report: dict) -> str:
         _show_warm = bool(report.get("include_subagents")) and any(
             int(r.get("invocation_count", 0)) > 0 for r in by_subagent_rows
         )
+        # v1.87.0: Model column, same gate. Markdown has no hover, so a type
+        # served by >1 model spells the whole split out inline — that is the
+        # signal (an Agent-tool `model` argument overriding the agent file's
+        # `model:` pin), and truncating it would hide exactly what matters.
+        _show_mdl = bool(report.get("include_subagents")) and any(
+            r.get("models") for r in by_subagent_rows
+        )
+        _mdl_hdr, _mdl_sep = (" Model |", "-------|") if _show_mdl else ("", "")
         if _show_warm:
             p("| Subagent | Spawns | Turns | Input | Output | % cached "
-              "| Avg/call | Cost $ | % of total | First-turn % | SP amortised % |")
+              f"| Avg/call | Cost $ | % of total |{_mdl_hdr}"
+              " First-turn % | SP amortised % |")
             p("|----------|-------:|------:|------:|------:|--------:|"
-              "--------:|------:|-----------:|-------------:|---------------:|")
+              f"--------:|------:|-----------:|{_mdl_sep}"
+              "-------------:|---------------:|")
         else:
-            p("| Subagent | Spawns | Turns | Input | Output | % cached | Avg/call | Cost $ | % of total |")
-            p("|----------|-------:|------:|------:|------:|--------:|--------:|------:|-----------:|")
+            p("| Subagent | Spawns | Turns | Input | Output | % cached "
+              f"| Avg/call | Cost $ | % of total |{_mdl_hdr}")
+            p("|----------|-------:|------:|------:|------:|--------:|"
+              f"--------:|------:|-----------:|{_mdl_sep}")
         for r in by_subagent_rows:
             base = (
                 f"| `{r.get('name', '')}` | {int(r.get('spawn_count', 0)):,} "
@@ -1070,6 +1089,16 @@ def render_md(report: dict) -> str:
                 f"| ${float(r.get('cost_usd', 0.0)):.4f} "
                 f"| {float(r.get('pct_total_cost', 0.0)):.2f}% "
             )
+            if _show_mdl:
+                _m = r.get("models") or {}
+                if not _m:
+                    base += "| — "
+                elif len(_m) == 1:
+                    base += f"| `{next(iter(_m))}` "
+                else:
+                    base += "| " + " · ".join(
+                        f"`{k}` {v:,}" for k, v in sorted(
+                            _m.items(), key=lambda kv: (-kv[1], kv[0]))) + " "
             if _show_warm:
                 inv_n = int(r.get("invocation_count", 0))
                 if inv_n > 0:

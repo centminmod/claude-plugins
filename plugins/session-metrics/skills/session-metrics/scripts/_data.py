@@ -2629,6 +2629,13 @@ def _empty_subagent_row(name: str) -> dict:
         "invocation_count":         0,    # distinct subagent_agent_id values seen
         "first_turn_share_pct":     0.0,  # median(first_turn.cost / invocation total)
         "sp_amortisation_pct":      0.0,  # % of invocations whose turn ≥2 had cache_read
+        # v1.87.0: model → turn count, from the subagent transcripts. Mirrors
+        # the same field on ``_empty_workflow_row``. A type whose agent file
+        # pins a model can still show >1 entry here: the Agent tool's ``model``
+        # parameter overrides the pin, so a spawn passing ``model: "opus"``
+        # runs on the alias target rather than the pinned twin. Without this
+        # column that divergence is invisible in the type-level table.
+        "models":           {},
         "_sessions":        set(),
     }
 
@@ -2645,6 +2652,11 @@ def _finalise_subagent_rows(rows: dict, total_cost: float) -> list[dict]:
         )
         calls_for_avg = row["spawn_count"] or row["turns_attributed"] or 1
         row["avg_tokens_per_call"] = round(row["total_tokens"] / calls_for_avg, 1)
+        # Deterministic model ordering: turn count desc, then model id asc so
+        # ties don't reorder between runs (renderers read items()[0] as the
+        # dominant model).
+        row["models"] = dict(sorted((row.get("models") or {}).items(),
+                                     key=lambda kv: (-kv[1], kv[0])))
         out.append(row)
     out.sort(key=lambda r: -(r["total_tokens"] or r["spawn_count"]))
     return out
@@ -2704,6 +2716,11 @@ def _build_by_subagent_type(sessions: list[dict], total_cost: float) -> list[dic
                 row = rows.setdefault(stype, _empty_subagent_row(stype))
                 _accumulate_bucket(row, t)
                 row["_sessions"].add(sid)
+                # v1.87.0: which model actually served this turn. Same guard as
+                # _build_by_workflow — synthetic turns carry no real model.
+                mdl = t.get("model") or ""
+                if mdl and mdl != _sm()._SYNTHETIC_MODEL:
+                    row["models"][mdl] = row["models"].get(mdl, 0) + 1
             if agent_id:
                 inv = invocations.setdefault(
                     agent_id, {"type": stype, "turns": []})

@@ -233,7 +233,16 @@ export.
 - **Subagent types** — one row per resolved `subagent_type` (from
   `Agent` / `Task` tool_use `input.subagent_type`). Shows spawn count
   always; token/cost columns populate from subagent JSONLs (default behaviour —
-  pass `--no-include-subagents` to skip).
+  pass `--no-include-subagents` to skip). A **Model** column (v1.87.0) names
+  the model that actually served the type's turns, read from those
+  transcripts; `+N` marks a type served by more than one model, with the full
+  per-model turn split on hover (HTML), inline (Markdown), as
+  `model:count|model:count` (CSV), and as a `models` map (JSON). This is the
+  column that makes a **pin override** visible: an `Agent` call passing
+  `model` overrides the agent file's frontmatter `model:`, and a generic alias
+  (`opus`) resolves to the current family member — so a model-pinned agent can
+  legitimately run on a different model than its pin without the type-level
+  turn count changing.
 
 **UUID-based dedup** runs at project and instance scope to prevent
 resumed-session replays from double-counting. Session scope keeps the

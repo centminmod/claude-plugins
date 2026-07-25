@@ -915,9 +915,20 @@ def _build_by_subagent_type_html(rows: list[dict],
     show_warmup = subagents_included and any(
         int(r.get("invocation_count", 0)) > 0 for r in rows
     )
+    # v1.87.0: same gate for the Model column — it is populated from subagent
+    # transcripts, so it stays hidden on a spawn-count-only run.
+    show_models = subagents_included and any(r.get("models") for r in rows)
     body_rows: list[str] = []
     for r in rows:
         name = html_mod.escape(r.get("name") or "")
+        model_cell = ""
+        if show_models:
+            _mdls = r.get("models") or {}
+            _cls = "" if len(_mdls) == 1 else ' class="mixed-model"'
+            model_cell = (
+                f'<td{_cls} title="{_model_mix_title(_mdls)}">'
+                f'{_model_mix_label(_mdls)}</td>'
+            )
         warmup_cells = ""
         if show_warmup:
             inv_n = int(r.get("invocation_count", 0))
@@ -950,6 +961,7 @@ def _build_by_subagent_type_html(rows: list[dict],
             f'<td class="num">{float(r.get("avg_tokens_per_call", 0.0)):,.0f}</td>'
             f'<td class="cost">{_fmt_cost(r.get("cost_usd", 0.0))}</td>'
             f'<td class="num">{float(r.get("pct_total_cost", 0.0)):.2f}%</td>'
+            f'{model_cell}'
             f'{warmup_cells}'
             f'</tr>'
         )
@@ -962,6 +974,13 @@ def _build_by_subagent_type_html(rows: list[dict],
         '<th class="num" title="Fraction of invocations whose turn ≥2 read '
         'from cache (system-prompt cache write paid back).">SP amortised %</th>'
     ) if show_warmup else ""
+    model_header = (
+        '<th title="Model that actually served this type\'s turns, from the '
+        'subagent transcripts. &quot;+N&quot; means more than one did — hover '
+        'a cell for the per-model turn split. An Agent-tool `model` argument '
+        'overrides the agent file\'s `model:` pin, so a pinned type can still '
+        'show a mix.">Model</th>'
+    ) if show_models else ""
     return (
         f'<section class="section">\n'
         f'<div class="section-title"><h2>{heading}</h2>'
@@ -978,6 +997,7 @@ def _build_by_subagent_type_html(rows: list[dict],
         f'<th class="num">Avg / call</th>'
         f'<th class="num">Cost $</th>'
         f'<th class="num">% of total</th>'
+        f'{model_header}'
         f'{warmup_headers}'
         f'</tr></thead>\n'
         f'<tbody>{"".join(body_rows)}</tbody>\n'
@@ -1001,9 +1021,12 @@ def _fmt_workflow_duration(ms: int) -> str:
     return f"{h}h {m}m"
 
 
-def _workflow_model_label(models: dict) -> str:
+def _model_mix_label(models: dict) -> str:
     """Collapse a ``{model: turn_count}`` map to a single display label:
-    the sole model, or ``"<dominant> +N"`` when more than one ran."""
+    the sole model, or ``"<dominant> +N"`` when more than one ran.
+
+    Used by both the workflow table and (v1.87.0) the subagent-type table.
+    """
     if not models:
         return "&ndash;"
     items = sorted(models.items(), key=lambda kv: -kv[1])
@@ -1011,6 +1034,26 @@ def _workflow_model_label(models: dict) -> str:
     if len(items) == 1:
         return html_mod.escape(top)
     return f'{html_mod.escape(top)} <span class="muted">+{len(items) - 1}</span>'
+
+
+def _model_mix_title(models: dict) -> str:
+    """Escaped ``title=`` text spelling out every model and its turn count.
+
+    The whole point of the subagent-type Model column: a pinned agent type
+    that shows ``+1`` had some spawns served by a different model (an Agent
+    tool ``model`` parameter overriding the agent file's ``model:`` pin), and
+    the hover names exactly which and how many.
+    """
+    if not models:
+        return "No model recorded — spawn seen but no subagent transcript loaded."
+    items = sorted(models.items(), key=lambda kv: (-kv[1], kv[0]))
+    body = ", ".join(f"{m}: {c:,}" for m, c in items)
+    if len(items) == 1:
+        return html_mod.escape(f"All turns on {body}")
+    return html_mod.escape(
+        f"Turns by model — {body}. More than one model served this type: an "
+        f"Agent-tool `model` argument overrides the agent file's `model:` pin."
+    )
 
 
 def _workflow_companion_css() -> str:
@@ -1867,7 +1910,7 @@ def _build_by_workflow_html(rows: list[dict],
             f'<td class="num">{float(r.get("cache_hit_pct", 0.0)):.1f}%</td>'
             f'<td class="cost">{_fmt_cost(r.get("cost_usd", 0.0))}</td>'
             f'<td class="num">{float(r.get("pct_total_cost", 0.0)):.2f}%</td>'
-            f'<td>{_workflow_model_label(r.get("models") or {})}</td>'
+            f'<td>{_model_mix_label(r.get("models") or {})}</td>'
             f'<td class="num">{_fmt_workflow_duration(int(r.get("duration_ms", 0)))}</td>'
             f'</tr>'
         )
@@ -3663,6 +3706,10 @@ tr.subtotal td{font-weight:600}
 .models-table{padding:14px 16px;border-radius:12px}
 .models-table table{font-size:12px;font-family:'JetBrains Mono',monospace}
 .models-table code{font-size:11px}
+/* v1.87.0: a subagent type served by >1 model — dotted underline signals the
+   hover title carries the per-model split. Theme-var only, so it reads in all
+   four themes. */
+.models-table td.mixed-model{color:var(--accent);border-bottom:1px dotted var(--accent-soft);cursor:help}
 .models-table th,.models-table td{padding:7px 12px}
 
 /* Turn character & efficiency signals (v1.8.0) */
