@@ -258,29 +258,37 @@ def _compute_project_concentration(items: list[dict], total_cost: float,
     ``(-cost, name)`` so identical-cost ties resolve deterministically
     (byte-stable). ``{}`` when there are fewer than ``top_n + 1`` items, so the
     card only renders when the top-N share is a non-trivial subset.
+
+    Instance-scope names are the FULL project slug plus the reconstructed
+    ``path`` — project slugs share a long leading prefix (``-Volumes-AMZ3-…``),
+    so the head-truncation this used to apply threw away the only part that
+    distinguishes one row from another. Session-scope names stay at the
+    8-char session-id prefix, which is already unique enough to identify a row.
     """
     if len(items) < top_n + 1:
         return {}
-    enriched: list[tuple[float, str]] = []
+    enriched: list[tuple[float, str, str]] = []
     for it in items:
         if "cost_usd" in it:
             cost = float(it.get("cost_usd", 0.0) or 0.0)
-            name = str(it.get("slug", ""))[:24]
+            name = str(it.get("slug", ""))
+            path = str(it.get("friendly_path", "") or "")
         else:
             cost = float((it.get("subtotal") or {}).get("cost", 0.0) or 0.0)
             name = str(it.get("session_id", ""))[:8]
-        enriched.append((cost, name))
+            path = ""
+        enriched.append((cost, name, path))
     enriched.sort(key=lambda x: (-x[0], x[1]))
     tc = float(total_cost) if total_cost else 0.0
     top = enriched[:top_n]
-    top_cost = sum(c for c, _ in top)
+    top_cost = sum(c for c, _, _ in top)
     return {
         "top_n": top_n,
         "top_n_cost": top_cost,
         "top_n_share": (top_cost / tc if tc else 0.0),
         "top_items": [
-            {"name": n, "cost": c, "share": (c / tc if tc else 0.0)}
-            for c, n in top
+            {"name": n, "path": p, "cost": c, "share": (c / tc if tc else 0.0)}
+            for c, n, p in top
         ],
         "total_cost": tc,
     }

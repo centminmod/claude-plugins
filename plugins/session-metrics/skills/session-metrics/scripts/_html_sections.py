@@ -3,7 +3,7 @@ import html as html_mod
 import json
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 def _sm():
@@ -2993,8 +2993,15 @@ def _build_project_concentration_html(conc: dict) -> str:
     items = conc.get("top_items") or []
     total_cost = float(conc.get("total_cost", 0.0) or 0.0)
     top_cost = float(conc.get("top_n_cost", 0.0) or 0.0)
+    # The slug is the visible label — it is lossless and matches the Project
+    # column of the projects table, so rows cross-reference. ``friendly_path``
+    # is a lossy best-effort reverse of the slug encoding (it cannot tell a
+    # path separator from a literal hyphen), so it rides along in the tooltip
+    # rather than replacing the name.
     rows = "".join(
-        f'<tr><td>{html_mod.escape(str(it.get("name", "")))}</td>'
+        '<tr><td class="conc-name"'
+        + (f' title="{html_mod.escape(str(it.get("path")))}"' if it.get("path") else "")
+        + f'>{html_mod.escape(str(it.get("name", "")))}</td>'
         f'<td style="text-align:right">${float(it.get("cost", 0.0) or 0.0):,.4f}</td>'
         f'<td style="text-align:right">{float(it.get("share", 0.0) or 0.0) * 100:.1f}%</td></tr>'
         for it in items
@@ -3007,8 +3014,18 @@ def _build_project_concentration_html(conc: dict) -> str:
             f'<td style="text-align:right;color:var(--fg-dim)">'
             f'{(remainder / total_cost * 100) if total_cost else 0:.1f}%</td></tr>'
         )
+    # Names are now full slugs / paths, so the Name column needs to wrap on
+    # arbitrary characters instead of forcing the two numeric columns off the
+    # right edge on a narrow viewport.
+    style = (
+        '<style>\n'
+        "#project-concentration-section .conc-name{overflow-wrap:anywhere;"
+        "word-break:break-word;padding-right:24px}\n"
+        '</style>'
+    )
     return (
         '<section class="section" id="project-concentration-section">\n'
+        f'  {style}\n'
         '  <div class="section-title"><h2>Cost concentration</h2>'
         f'<span class="hint">top-{top_n} share of total spend</span></div>\n'
         '  <div class="health-panel">\n'
@@ -3025,21 +3042,57 @@ def _build_project_concentration_html(conc: dict) -> str:
     )
 
 
+# Rolling window the activity calendar renders, in week columns. 52 keeps the
+# grid a familiar year-at-a-glance shape and, at the 20px cell ceiling, wide
+# enough (~1.27k px) to fill a desktop-width panel.
+_HM_WINDOW_WEEKS = 52
+
+
 def _build_activity_heatmap_html(heatmap: dict, tz_label: str = "UTC") -> str:
     """GitHub-style daily session-activity calendar (F.5). Static cells with a
     ``data-bucket`` attribute resolved by inline scoped CSS — no JS. Weeks are
     columns, weekdays rows; the first cell is offset to its weekday so the
-    calendar aligns. Returns "" when there is no date data."""
+    calendar aligns. Returns "" when there is no date data.
+
+    The calendar spans a rolling 52-week window ending on the last active day:
+    a range narrower than that is back-filled with empty leading days so the
+    grid covers the full year rather than compressing a few months of data into
+    a corner of a wide panel. A range wider than 52 weeks is left alone and its
+    cells shrink instead. Cells are fluid (``minmax(10px, 1fr)`` +
+    ``aspect-ratio:1``) with a 20px ceiling enforced by a computed max-width.
+    Month labels above and weekday labels beside the grid are laid out by two
+    sibling grids sharing the calendar's track template, so they stay aligned
+    at every width without JS.
+    """
     if not heatmap or not heatmap.get("dates"):
         return ""
     dates = heatmap["dates"]
     items = list(dates.items())  # already sorted by the compute layer
     first_date = items[0][0]
     try:
-        first_wd = datetime.strptime(first_date, "%Y-%m-%d").weekday()  # Mon=0..Sun=6
+        first_dt = datetime.strptime(first_date, "%Y-%m-%d")
     except ValueError:
-        first_wd = 0
+        first_dt = None
+    # Back-fill leading empty days so the window starts on the Monday that puts
+    # the last active day in column _HM_WINDOW_WEEKS. A range already wider
+    # than the window is left untouched — never hide data to hit a target size.
+    try:
+        last_dt = datetime.strptime(items[-1][0], "%Y-%m-%d")
+    except ValueError:
+        last_dt = None
+    if first_dt is not None and last_dt is not None:
+        start = last_dt - timedelta(
+            days=last_dt.weekday() + (_HM_WINDOW_WEEKS - 1) * 7)
+        pad = (first_dt - start).days
+        if pad > 0:
+            items = [
+                ((start + timedelta(days=i)).strftime("%Y-%m-%d"), 0)
+                for i in range(pad)
+            ] + items
+            first_dt = start
+    first_wd = first_dt.weekday() if first_dt is not None else 0  # Mon=0..Sun=6
     cells = []
+    months: dict[str, list] = {}  # key -> [week of first day, label, day count]
     for i, (d, n) in enumerate(items):
         b = 0 if n == 0 else 1 if n == 1 else 2 if n <= 3 else 3
         offset = f'grid-row-start:{first_wd + 1};' if i == 0 else ""
@@ -3048,15 +3101,41 @@ def _build_activity_heatmap_html(heatmap: dict, tz_label: str = "UTC") -> str:
             f'title="{html_mod.escape(d)}: {n} session{"s" if n != 1 else ""}" '
             f'style="{offset}"></div>'
         )
+        try:
+            dt = datetime.strptime(d, "%Y-%m-%d")
+        except ValueError:
+            continue
+        key = f"{dt.year}-{dt.month:02d}"
+        entry = months.get(key)
+        if entry is None:
+            months[key] = [(first_wd + i) // 7, dt.strftime("%b"), 1]
+        else:
+            entry[2] += 1
+    # One label per month, on the week column holding that month's first day.
+    # A month contributing under a week of cells gets no label (it can only be
+    # the clipped first/last month of the range), and any label landing within
+    # two columns of its predecessor is dropped — labels are wider than a
+    # column, so neighbours would overprint each other.
+    month_labels: list[str] = []
+    last_label_week = -99
+    for week, label, count in months.values():
+        if count < 7 or week - last_label_week < 2:
+            continue
+        last_label_week = week
+        month_labels.append(f'<div style="grid-column-start:{week + 1}">{label}</div>')
+    weeks = (first_wd + len(items) + 6) // 7
     total_days = int(heatmap.get("total_active_days", 0) or 0)
+    weekdays = "".join(
+        f'<div>{lbl}</div>' for lbl in ("Mon", "", "Wed", "", "Fri", "", "")
+    )
     legend = (
-        '<div style="display:flex;align-items:center;gap:6px;margin-top:10px;'
+        '<div style="display:flex;align-items:center;gap:6px;margin-top:12px;'
         "font-size:10px;color:var(--fg-dim);font-family:'JetBrains Mono',monospace\">"
         '<span>Less</span>'
-        '<span class="hm-cell" data-bucket="0"></span>'
-        '<span class="hm-cell" data-bucket="1"></span>'
-        '<span class="hm-cell" data-bucket="2"></span>'
-        '<span class="hm-cell" data-bucket="3"></span>'
+        '<span class="hm-key" data-bucket="0"></span>'
+        '<span class="hm-key" data-bucket="1"></span>'
+        '<span class="hm-key" data-bucket="2"></span>'
+        '<span class="hm-key" data-bucket="3"></span>'
         '<span>More</span></div>'
     )
     # Intensity ramp = one accent colour at rising opacity (bucket 0 = idle =
@@ -3065,14 +3144,32 @@ def _build_activity_heatmap_html(heatmap: dict, tz_label: str = "UTC") -> str:
     # which would read as a separate category mid-scale, not "more").
     style = (
         '<style>\n'
+        # min-width:0 on the grid containers: without it the month labels'
+        # min-content width becomes an automatic minimum that outvotes
+        # max-width, and the calendar stretches past its intended cap.
+        "#activity-heatmap-section .hm-wrap{display:grid;"
+        "grid-template-columns:26px minmax(0,1fr);gap:6px 8px;align-items:start;"
+        "min-width:0;overflow-x:auto;padding-bottom:2px;"
+        f"max-width:min(100%,{weeks * 20 + (weeks - 1) * 3 + 34}px)}}\n"
+        "#activity-heatmap-section .hm-months{grid-column:2;display:grid;"
+        f"grid-template-columns:repeat({weeks},minmax(11px,1fr));gap:3px;min-width:0;"
+        "font-size:10px;color:var(--fg-dim);font-family:'JetBrains Mono',monospace;"
+        "white-space:nowrap}\n"
+        "#activity-heatmap-section .hm-days{display:grid;"
+        "grid-template-rows:repeat(7,1fr);align-self:stretch;gap:3px;"
+        "font-size:10px;line-height:1;color:var(--fg-dim);"
+        "font-family:'JetBrains Mono',monospace}\n"
+        "#activity-heatmap-section .hm-days > div{display:flex;align-items:center}\n"
         "#activity-heatmap-section .hm-grid{display:grid;grid-auto-flow:column;"
-        "grid-template-rows:repeat(7,12px);grid-auto-columns:12px;gap:3px;"
-        "overflow-x:auto}\n"
-        "#activity-heatmap-section .hm-cell{width:12px;height:12px;border-radius:2px;"
+        "grid-template-rows:repeat(7,auto);min-width:0;"
+        f"grid-template-columns:repeat({weeks},minmax(11px,1fr));gap:3px}}\n"
+        "#activity-heatmap-section .hm-cell{width:100%;aspect-ratio:1;"
+        "border-radius:3px;background:var(--border-dim)}\n"
+        "#activity-heatmap-section .hm-key{width:12px;height:12px;border-radius:3px;"
         "background:var(--border-dim);display:inline-block}\n"
-        "#activity-heatmap-section .hm-cell[data-bucket='1']{background:var(--accent);opacity:.4}\n"
-        "#activity-heatmap-section .hm-cell[data-bucket='2']{background:var(--accent);opacity:.7}\n"
-        "#activity-heatmap-section .hm-cell[data-bucket='3']{background:var(--accent);opacity:1}\n"
+        "#activity-heatmap-section [data-bucket='1']{background:var(--accent);opacity:.4}\n"
+        "#activity-heatmap-section [data-bucket='2']{background:var(--accent);opacity:.7}\n"
+        "#activity-heatmap-section [data-bucket='3']{background:var(--accent);opacity:1}\n"
         '</style>'
     )
     return (
@@ -3082,8 +3179,12 @@ def _build_activity_heatmap_html(heatmap: dict, tz_label: str = "UTC") -> str:
         '<span class="hint">distinct sessions per day &middot; '
         f'{html_mod.escape(tz_label)}</span></div>\n'
         '  <div class="health-panel">\n'
-        f'    <div class="hm-grid">{"".join(cells)}</div>\n'
-        f'    <div style="margin-top:10px;font-size:11px;color:var(--fg-dim)">'
+        '    <div class="hm-wrap">\n'
+        f'      <div class="hm-months">{"".join(month_labels)}</div>\n'
+        f'      <div class="hm-days">{weekdays}</div>\n'
+        f'      <div class="hm-grid">{"".join(cells)}</div>\n'
+        '    </div>\n'
+        f'    <div style="margin-top:12px;font-size:11px;color:var(--fg-dim)">'
         f'{total_days} active day{"s" if total_days != 1 else ""}</div>\n'
         f'    {legend}\n'
         '  </div>\n</section>'

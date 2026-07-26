@@ -3,6 +3,43 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.87.1 — 2026-07-27
+
+### Fix: Cost concentration truncated project names, cramped Session activity (patch)
+
+Two HTML-report defects on the Phase F sections, both most visible at
+instance scope:
+
+- **Cost concentration showed identical names.** `_compute_project_concentration`
+  head-truncated each instance-scope name to `slug[:24]`. Project slugs share a
+  long leading prefix (`-Volumes-AMZ3-AI-vibe-co…`), so the window discarded the
+  only part that distinguishes rows and the top-3 table read as three copies of
+  the same project. Names are now the full slug, with the reconstructed
+  filesystem path carried alongside in a new `path` field on each `top_items`
+  entry (empty at session scope, where the 8-char session-id prefix is already
+  unique). The HTML table shows the slug — lossless, and matching the Projects
+  table's `Project` column so rows cross-reference — and puts `path` in the
+  cell's `title`, since `_slug_to_friendly_path` is a best-effort reverse that
+  cannot tell a path separator from a literal hyphen. The name cell wraps on
+  `overflow-wrap:anywhere` so long slugs don't push Cost/Share off a narrow
+  viewport. Markdown / JSON / CSV inherit the fix through the same `name` field.
+
+- **Session activity calendar filled a corner of the panel.** The heatmap sized
+  itself to the weeks containing data and drew fixed 12px cells, so a few months
+  of history occupied roughly a quarter of a desktop-width panel. It now renders
+  a rolling 52-week window, back-filling empty leading days to the Monday that
+  places the last active day in the final column; a range already wider than the
+  window is left untouched rather than trimmed. Cells are fluid
+  (`minmax(11px,1fr)` + `aspect-ratio:1`) between an 11px floor and a 20px
+  ceiling, so the grid spans ~1.23k px on a wide panel and shrinks without a
+  scrollbar down to ~830px. Adds a Mon/Wed/Fri weekday rail and one label per
+  month, laid out by sibling grids sharing the calendar's track template — still
+  no JS. Month labels are suppressed for a month contributing under a week of
+  cells or landing within two columns of its predecessor.
+
+No JSON key removals; `top_items[].path` is additive. No `_SCRIPT_VERSION`
+bump — the parse-cache schema is unchanged.
+
 ## v1.87.0 — 2026-07-25
 
 ### Feature: per-model split on the Subagent types table (minor)
