@@ -3,6 +3,34 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.88.1 — 2026-09-02
+
+### Fix `--all-projects` crash on transcripts with explicit `null` usage fields (patch)
+
+`--all-projects` aborted mid-scan with
+`TypeError: unsupported operand type(s) for +=: 'int' and 'NoneType'` at
+`_data.py:674`. `_build_session_blocks` read its token accumulators with
+`u.get("input_tokens", 0)`, but the second argument to `.get` only defaults a
+**missing** key — a key that is present with a JSON `null` returns `None`,
+which then propagates into the `+=`. Real transcripts under
+`~/.claude/projects` do write `null` for `cache_read_input_tokens` and
+friends, so any instance-wide run that touched one died before writing a
+single export.
+
+- **`_data.py`**: the three reads in `_build_session_blocks` now use
+  `u.get(k) or 0`, matching the idiom already used (and already commented as
+  deliberate) in `_turn_parser._cost`. The `cache_write` path was already
+  safe — `_cache_write_split` coerces with `or 0` on every branch.
+- **`tests/test_instance.py`**: regression test
+  `test_build_session_blocks_tolerates_null_usage_fields` pins the null-usage
+  turn to 0 and asserts the surrounding block still accumulates normally.
+  Verified to reproduce the original `TypeError` when the fix is reverted.
+
+No behaviour change for transcripts without null usage fields: `None or 0`
+and a missing-key default both yield the same 0, so every existing export is
+byte-identical. Scope was instance/project session-block aggregation only —
+per-turn cost math was never affected.
+
 ## v1.88.0 — 2026-09-02
 
 ### Recognise Claude Fable 5.1 — own pricing key ($0.25 cache reads) + 1M default context window (minor)

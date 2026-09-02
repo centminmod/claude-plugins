@@ -669,9 +669,12 @@ def _build_session_blocks(
             u     = msg["usage"]
             model = msg.get("model", "unknown")
             b["turn_count"]  += 1
-            b["input"]       += u.get("input_tokens", 0)
-            b["output"]      += u.get("output_tokens", 0)
-            b["cache_read"]  += u.get("cache_read_input_tokens", 0)
+            # ``or 0``, not ``get(..., 0)``: transcripts can carry an explicit
+            # ``null`` for a usage field, which a bare default would let through
+            # as None and blow up the ``+=``. Matches _turn_parser's idiom.
+            b["input"]       += u.get("input_tokens") or 0
+            b["output"]      += u.get("output_tokens") or 0
+            b["cache_read"]  += u.get("cache_read_input_tokens") or 0
             # Mirror _cache_write_split: the nested ephemeral split is the
             # primary source and the flat field only a legacy fallback —
             # reading the flat field alone would silently zero this column
