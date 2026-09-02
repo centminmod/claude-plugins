@@ -761,12 +761,16 @@ def _advisor_info(u: dict, model: str, ts: str | None = None) -> tuple[int, floa
             if adv_model and advisor_model is None:
                 advisor_model = adv_model
             adv_rates = _sm()._pricing_for_at(adv_model or model, pricing_date)
+            # ``… or 0`` for the same reason as the sibling loops in ``_cost``
+            # and ``_no_cache_cost``: an advisor iteration can carry a
+            # present-but-null token field, which ``.get(k, 0)`` would pass
+            # through as None into ``None * rate`` / ``None +=``.
             cost += (
-                it.get("input_tokens", 0) * adv_rates["input"]  / 1_000_000
-              + it.get("output_tokens", 0) * adv_rates["output"] / 1_000_000
+                (it.get("input_tokens") or 0) * adv_rates["input"]  / 1_000_000
+              + (it.get("output_tokens") or 0) * adv_rates["output"] / 1_000_000
             )
-            inp += it.get("input_tokens", 0)
-            out += it.get("output_tokens", 0)
+            inp += it.get("input_tokens") or 0
+            out += it.get("output_tokens") or 0
     return calls, cost, advisor_model, inp, out
 
 

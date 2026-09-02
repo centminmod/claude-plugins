@@ -3,6 +3,44 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.88.2 — 2026-09-02
+
+### Complete the null-usage sweep — harden `_advisor_info` (patch)
+
+Follow-up to v1.88.1. That fix resolved the reported `--all-projects` crash in
+`_build_session_blocks`, but it was again a fix by symptom. A deliberate sweep
+of every read against a raw JSONL `usage` dict found **one more** instance of
+the same hazard.
+
+`usage["iterations"]` is walked by three sibling functions in `_turn_parser.py`
+— `_cost`, `_advisor_info`, and `_no_cache_cost`. The v1.83.0 audit hardened
+the loops in `_cost` and `_no_cache_cost` with `it.get(k) or 0`, but left
+`_advisor_info`'s copy on `it.get(k, 0)`, whose default only fires for a
+*missing* key. An advisor iteration carrying a present-but-null token field
+therefore raised `TypeError` on `None * rate` at `_turn_parser.py:765`, and
+again on `None +=` at 768–769.
+
+- **`_turn_parser._advisor_info`**: the four reads now use `it.get(k) or 0`,
+  bringing the third loop into line with its two siblings.
+- **`tests/test_report.py`**: regression test
+  `test_advisor_info_tolerates_null_iteration_token_fields` pairs a null
+  iteration with a populated one, so it also proves the null is skipped rather
+  than aborting the loop, and asserts `_cost` / `_no_cache_cost` parity on the
+  same input. Verified to reproduce the original `TypeError` when reverted.
+
+**Sweep result (the audit trail).** Only four sites in the payload touch a raw
+`usage` dict: `_data.py:669` (fixed in v1.88.1), `_turn_parser.py:832`
+(`_build_turn_record`, hardened in v1.83.0), `_turn_parser.py:213` (an
+`isinstance` check), and `_dispatch.py:952` (passes the dict through
+untouched). Every other `.get("…_tokens", 0)` in the codebase — roughly eighty
+of them — reads an *internal* turn record or an aggregated row, not raw
+transcript JSON. Those are safe by construction: `_build_turn_record` coerces
+each token field with `or 0` before storing it, so the internal field names
+(`cache_read_tokens` / `cache_write_tokens`) can never hold a null. They were
+reviewed and deliberately left unchanged rather than churned.
+
+No behaviour change for transcripts without null usage fields.
+
 ## v1.88.1 — 2026-09-02
 
 ### Fix `--all-projects` crash on transcripts with explicit `null` usage fields (patch)
