@@ -30,6 +30,7 @@ of TTL.
 | `claude-sonnet-4-5`         | sonnet-4-5 |  3.00 |  15.00 |       0.30 |           3.75 |           6.00 |
 | `claude-haiku-4-5-20251001` | haiku-4-5  |  1.00 |   5.00 |       0.10 |           1.25 |           2.00 |
 | `claude-haiku-4-5`          | haiku-4-5  |  1.00 |   5.00 |       0.10 |           1.25 |           2.00 |
+| `claude-fable-5-1`          | fable-5-1  | 10.00 |  50.00 |       0.25 |          12.50 |          20.00 |
 | `claude-fable-5`            | fable-5    | 10.00 |  50.00 |       1.00 |          12.50 |          20.00 |
 | `claude-sonnet-5` (intro †) | sonnet-5   |  2.00 |  10.00 |       0.20 |           2.50 |           4.00 |
 | `claude-sonnet-5` (std †)   | sonnet-5   |  3.00 |  15.00 |       0.30 |           3.75 |           6.00 |
@@ -55,6 +56,15 @@ of TTL.
 > standard ratios off the $10 base (read 0.1× = $1, 5m-write 1.25× = $12.50,
 > 1h-write 2× = $20). A future un-keyed `claude-fable-6` routes to a dedicated
 > family fallback at the Fable 5 tier (flagged), not to the Sonnet default.
+>
+> **Fable 5.1** (`claude-fable-5-1`, v1.88.0) keeps the $10/$50 tier and the
+> Fable 5 cache-write rates but **cache reads dropped to $0.25** (0.025× base
+> input — every other Anthropic model reads at 0.1×). It therefore has its own
+> explicit key, listed before the bare-major `claude-fable-5` so the prefix
+> sweep resolves its `[1m]` / date-suffixed forms to the $0.25 read rate.
+> Claude Code stamps `message.model` as bare `claude-fable-5-1`, and the Fable
+> family's **default** context window is 1M (no `[1m]` tag), which the
+> session-health context-pressure signal now honours.
 >
 > **† Sonnet 5 introductory pricing (date-effective, v1.84.0)**: `claude-sonnet-5`
 > shipped at an **introductory** $2/$10 (input/output) rate **through 2026-08-31**,
@@ -86,6 +96,7 @@ there. Verified against the Anthropic effort docs, 2026-06-11
 | `claude-opus-4-5` / `-4-6` | low / medium / high / max       | high        | high                                      |
 | `claude-opus-4-7` / `-4-8` | low / medium / high / xhigh / max | high      | xhigh                                     |
 | `claude-fable-5`        | low / medium / high / xhigh / max  | high        | high (xhigh only for the most capability-sensitive work) |
+| `claude-fable-5-1`      | low / medium / high / xhigh / max  | high        | high (thinking always on; `disabled` is rejected)         |
 | `claude-sonnet-4-6`+    | low / medium / high / max          | high        | medium                                    |
 
 Note: Opus 4.8's default is `high` on all surfaces including Claude

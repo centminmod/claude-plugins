@@ -17,14 +17,18 @@ _CACHE_BREAK_DEFAULT_THRESHOLD = 100_000
 # Per-model context-window sizes (tokens), used by the session-health
 # context-pressure signal (peak per-turn context ÷ window). Matched by
 # LONGEST-PREFIX first so a specific key wins over a generic family prefix.
-# Base family windows are 200K; the 1M long-context beta is detected
-# separately via a ``[1m]`` suffix on the model id (``_context_window_for``),
-# so it overrides regardless of which family key matched.
+# Opus/Sonnet/Haiku base windows are 200K; their 1M long-context tier is
+# detected separately via a ``[1m]`` suffix on the model id
+# (``_context_window_for``), so it overrides regardless of which family key
+# matched. Fable (5 / 5.1) ships with 1M as its DEFAULT window and Claude Code
+# stamps it WITHOUT a ``[1m]`` tag (live transcripts peak at 480K–640K context
+# on bare ``claude-fable-5`` / ``claude-fable-5-1``), so the family key itself
+# carries 1M (v1.88.0) — at 200K the context-pressure signal exceeded 100%.
 _MODEL_CONTEXT_WINDOWS = {
     "claude-opus":   200_000,
     "claude-sonnet": 200_000,
     "claude-haiku":  200_000,
-    "claude-fable":  200_000,
+    "claude-fable":  1_000_000,
 }
 _DEFAULT_CONTEXT_WINDOW = 200_000
 _LONG_CONTEXT_WINDOW = 1_000_000

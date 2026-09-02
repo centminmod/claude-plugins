@@ -81,6 +81,7 @@ _INPUT_RATE_PER_M_BY_MODEL: tuple[tuple[str, float], ...] = (
     ("claude-haiku-4-6", 1.00),
     ("claude-haiku-4-5", 1.00),
     ("claude-3-5-haiku", 0.80),
+    ("claude-fable-5-1", 10.00),
     ("claude-fable-5", 10.00),
     ("claude-3-7-sonnet", 3.00),
     ("claude-3-5-sonnet", 3.00),

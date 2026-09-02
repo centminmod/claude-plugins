@@ -3,6 +3,42 @@
 All notable changes to the session-metrics skill.
 Versions match the `plugin.json` / `marketplace.json` version field.
 
+## v1.88.0 — 2026-09-02
+
+### Recognise Claude Fable 5.1 — own pricing key ($0.25 cache reads) + 1M default context window (minor)
+
+Claude Fable 5.1 (`claude-fable-5-1`, released 2026-09) is the successor to
+Fable 5 in the same $10 / $50 per-MTok tier, with unchanged 5-minute ($12.50)
+and 1-hour ($20) cache-write rates — but **cache reads dropped to $0.25/MTok**
+(0.025× base input; every other Anthropic model reads at 0.1×). Before this
+release `claude-fable-5-1` resolved through the bare-major `claude-fable-5`
+prefix and was billed at the Fable 5 read rate of $1.00 — a 4× over-count on
+the cache-read component, which dominates long agentic sessions (a live
+6-turn Fable 5.1 session read 591K cached tokens against 601 fresh input).
+
+- **`_PRICING`**: new explicit `claude-fable-5-1` key inserted *before* the
+  bare-major `claude-fable-5` so the prefix sweep also lands `[1m]` and
+  date-suffixed 5.1 forms on the $0.25 read rate. Fable 5.0 forms
+  (`claude-fable-5`, `-5-0`, `[1m]`) keep the $1.00 read rate.
+- **Context window**: the `claude-fable` family default in
+  `_MODEL_CONTEXT_WINDOWS` moves from 200K to **1M**. Fable ships with 1M as
+  its default window and Claude Code stamps `message.model` as bare
+  `claude-fable-5` / `claude-fable-5-1` with no `[1m]` tag (live transcripts
+  peak at 480K–640K context). The existing peak-exceeds-window inference
+  already rescued sessions that crossed 200K; sessions whose peak stayed
+  below 200K were reporting context pressure up to 5× too high (and could
+  draw a spurious health penalty). Fixed at the source.
+- **audit-session-metrics**: lockstep `claude-fable-5-1` input-rate row
+  (10.00) for export traceability; parity tests auto-cover it.
+- **`references/pricing.md`**: Fable 5.1 row + note; effort-ladder row.
+- `_PRICING_SNAPSHOT_DATE` → 2026-09-02.
+
+Tests: 1077 passed / 1 skipped (new: explicit/`[1m]`/date-suffix silent
+resolution at $0.25 with a Fable 5.0 non-swallow guard; audit-extract
+parity; Fable family window lookup). Ruff 52 before and after (zero new).
+No `_SCRIPT_VERSION` bump — the parse cache stores raw tokens and re-costs
+on load, so existing cache blobs pick up the new rate automatically.
+
 ## v1.87.1 — 2026-07-27
 
 ### Fix: Cost concentration truncated project names, cramped Session activity (patch)

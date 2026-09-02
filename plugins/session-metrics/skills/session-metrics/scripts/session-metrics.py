@@ -43,19 +43,19 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # accessed as sm.ZoneInfo 
 # on disk (~9 MB → ~19 MB per typical session); acceptable for a developer-tool
 # cache. Version bump invalidates every existing user blob exactly once.
 _SCRIPT_VERSION = "1.1.0"
-_SKILL_VERSION  = "1.87.1"  # embedded in every export; bump when plugin version bumps
+_SKILL_VERSION  = "1.88.0"  # embedded in every export; bump when plugin version bumps
 # C.6: the date the built-in `_PRICING` table was last verified against the
 # published rate card (mirrors the "Snapshot:" comment below). Embedded in
 # every report so a reader can see how fresh the cost math is and decide
 # whether to supply `--refresh-pricing` for any unresolved models.
-_PRICING_SNAPSHOT_DATE = "2026-07-02"
+_PRICING_SNAPSHOT_DATE = "2026-09-02"
 
 # ---------------------------------------------------------------------------
 # Pricing table  (USD per million tokens)
 # See references/pricing.md for notes and source.
 # ---------------------------------------------------------------------------
 # Per-million-token rates (USD). Source: https://platform.claude.com/docs/en/about-claude/pricing
-# Snapshot: 2026-07-02. Two cache-write tiers: `cache_write` = 5-minute TTL
+# Snapshot: 2026-09-02. Two cache-write tiers: `cache_write` = 5-minute TTL
 # (1.25x base input), `cache_write_1h` = 1-hour TTL (2x base input). The
 # per-entry split is read from `usage.cache_creation.ephemeral_{5m,1h}_input_tokens`
 # when present; legacy transcripts without the nested object fall back to the
@@ -122,6 +122,13 @@ _PRICING: dict[str, dict[str, float]] = {
     # Opus/Sonnet/Haiku keys above). Cache columns follow the standard Anthropic
     # ratios off the $10 base input: read 0.1x = $1, 5m-write 1.25x = $12.50,
     # 1h-write 2x = $20. Review if Anthropic re-tiers at a future Fable major.
+    # Fable 5.1 (v1.88.0): same $10/$50 tier and same cache-WRITE rates as
+    # Fable 5, but cache READS dropped to $0.25 (0.025x base input — every
+    # other Anthropic model reads at 0.1x). Needs its own key, listed BEFORE
+    # the bare-major `claude-fable-5` so the prefix sweep lands here for the
+    # `[1m]` / date-suffixed forms instead of on the $1.00 Fable 5 read rate.
+    # Claude Code stamps `message.model` as `claude-fable-5-1` (no `[1m]`).
+    "claude-fable-5-1":          {"input": 10.00, "output": 50.00, "cache_read": 0.25,  "cache_write": 12.50, "cache_write_1h": 20.00},
     "claude-fable-5":            {"input": 10.00, "output": 50.00, "cache_read": 1.00,  "cache_write": 12.50, "cache_write_1h": 20.00},
     # --- Non-Anthropic models (OpenRouter rates, 2026-04-25; no prompt caching
     #     except kimi-k3 (billed cache reads) and the gpt-5.6 family (billed
