@@ -24,6 +24,7 @@ body:
       label: Plugin
       options:
         - session-metrics
+        - desktop-statusline
     validations:
       required: true
 

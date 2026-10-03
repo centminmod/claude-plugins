@@ -35,6 +35,7 @@ body:
       description: Which plugin is affected?
       options:
         - session-metrics
+        - desktop-statusline
     validations:
       required: true
 

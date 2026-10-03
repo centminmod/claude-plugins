@@ -26,6 +26,7 @@ Add this marketplace once, then install any plugin from it:
 | Plugin | Description | Install |
 |--------|-------------|---------|
 | [`session-metrics`](plugins/session-metrics) | Per-turn token, cost, and cache metrics for Claude Code sessions. Multi-format export (text/JSON/CSV/MD/HTML) with 5-hour session blocks, weekly roll-up, hour-of-day punchcard, and pluggable chart libraries. | `/plugin install session-metrics@centminmod` |
+| [`desktop-statusline`](plugins/desktop-statusline) | A mod that draws a status band above the prompt in the Claude Desktop app's Code tab, where the CLI `statusLine` doesn't run. Git state, context meter, session cost, 5-hour and weekly usage limits with reset countdowns, last-turn stats, and running agents. Needs Claude Code v2.1.287+. | `/plugin install desktop-statusline@centminmod` |
 
 More plugins coming.
 
