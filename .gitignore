@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+
+# Written by Claude Code each time it loads a mod; version-specific and regenerated.
+plugins/*/.claude-plugin/types/
+plugins/*/tsconfig.json
