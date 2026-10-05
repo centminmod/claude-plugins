@@ -9,6 +9,8 @@
   "homepage": "https://github.com/centminmod/claude-plugins/tree/master/plugins/session-metrics",
   "repository": "https://github.com/centminmod/claude-plugins",
   "license": "MIT",
+  "icon": "./images/icon.png",
+  "privacyPolicyUrl": "https://github.com/centminmod/claude-plugins/blob/master/plugins/session-metrics/PRIVACY.md",
   "keywords": [
     "metrics",
     "tokens",
@@ -19,6 +21,5 @@
     "analytics",
     "usage-tracking"
   ],
-  "category": "analytics",
   "skills": "./skills/"
 }

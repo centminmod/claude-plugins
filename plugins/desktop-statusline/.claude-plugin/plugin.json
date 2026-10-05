@@ -9,6 +9,7 @@
   "homepage": "https://github.com/centminmod/claude-plugins/tree/master/plugins/desktop-statusline",
   "repository": "https://github.com/centminmod/claude-plugins",
   "license": "MIT",
+  "icon": "./images/icon.png",
   "keywords": [
     "mod",
     "statusline",
