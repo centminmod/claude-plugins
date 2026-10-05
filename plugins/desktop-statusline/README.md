@@ -62,7 +62,8 @@ the session has data to show, usually right away.
 
 One setting, `cache_ttl`, sets how long your session can sit idle before the
 band marks the prompt cache cold. Claude Code asks for it when you enable the
-plugin, and you can change it later in `/plugin` or `/config`.
+plugin, and you can change it later in `/plugin` or `/config`. Enter `1h` or
+`5m`; any other value counts as `1h`.
 
 Claude Code's [prompt caching docs](https://code.claude.com/docs/en/prompt-caching#cache-lifetime)
 give these defaults for the main conversation:
@@ -105,7 +106,43 @@ The band refreshes when the session starts, when the desktop app attaches,
 after every turn, when a plan limit's percentage changes, two seconds after
 Claude starts a subagent, and every 60 seconds.
 
-## What it can reach
+## What it runs, reads and sends
+
+**Programs it runs.** Only `git`, with two fixed read-only commands, in the
+session's folder and with a 5-second timeout:
+
+- `git status --porcelain=v2 --branch`, for the branch, commits ahead or
+  behind upstream, and the uncommitted file count
+- `git rev-parse --git-dir --git-common-dir`, to tell a worktree from the main
+  checkout
+
+Neither command contacts a remote, and the mod runs them only in desktop
+sessions. It starts no other program.
+
+**What it reads.** Through Claude Code's mods API, it reads the session's
+usage (context size, cost, and the 5-hour and weekly plan limits), the
+session's folder, the number of prompts, the start time, and the type and
+short task description of each running subagent. From each finished turn it
+reads the duration, the model, and the token counts used for the cache hit
+rate. After a compaction it reads the token counts before and after. It
+doesn't read prompt or response text, files, environment variables, or
+credentials. The plan limits come from Claude Code, not from your login.
+
+**What it sends.** Nothing. It makes no network calls and writes no files.
+What it reads goes only into the band above the prompt and the usage-limit
+toasts, and into the session's `$.state`, which ends with the session.
+
+The one URL in the code, `http://www.w3.org/2000/svg`, is the standard SVG
+namespace in the meter bars' `xmlns` attribute. It labels the markup as SVG
+and is never fetched. The token counts next to it are the context and
+compaction sizes the band displays, not API keys or login tokens.
+
+**What its hooks change.** Nothing. The `session.compact` hook waits for the
+compaction to finish, records the before and after token counts, and returns
+the result unchanged. The `tool.call` hook for the Agent tool schedules a band
+refresh two seconds later and passes the call through unchanged.
+
+## Check it yourself
 
 Before installing a mod, you can list what it hooks and calls without running
 it. Clone this repo and run:
