@@ -120,7 +120,11 @@ session's folder and with a 5-second timeout:
   checkout
 
 Neither command contacts a remote, and the mod runs them only in desktop
-sessions. It starts no other program.
+sessions. It starts no other program. Both commands are written out in full at
+their `$.process.run` calls in `hooks/register.tsx`. The session's folder
+(`$.session.cwd`) is passed to them only as the working directory; nothing else
+the mod reads, such as the prompt count from `$.session.turns`, is passed to
+them. Their output goes only into the band.
 
 **What it reads.** Through Claude Code's mods API, it reads the session's
 usage (context size, cost, and the 5-hour and weekly plan limits), the
@@ -132,7 +136,8 @@ that estimate, such as memory file paths and tool names. From each finished turn
 reads the duration, the model, and the token counts used for the cache hit
 rate. After a compaction it reads the token counts before and after. It
 doesn't read prompt or response text, files, environment variables, or
-credentials. The plan limits come from Claude Code, not from your login.
+credentials such as API keys or tokens. The plan limits come from Claude Code,
+not from your login.
 
 **What it sends.** Nothing. It makes no network calls and writes no files.
 What it reads goes only into the band above the prompt and the usage-limit

@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ModelUsage, Register } from 'claude-code'
+import type { EngineInterface, ModelUsage, ProcessRunResult, Register } from 'claude-code'
 
 import type { Limit, Snapshot } from '../types'
 
@@ -72,9 +72,10 @@ const cacheHit = (u: ModelUsage) => {
 
 const isOnDesktop = async ($: EngineInterface) => (await $.session.surfaces()).includes('desktop')
 
-const git = async ($: EngineInterface, cwd: string, args: string[]) => {
+// Each git command is written out in full at its call; this only reads the result.
+const output = async (run: Promise<ProcessRunResult>) => {
   try {
-    const ran = await $.process.run(['git', ...args], { cwd, timeoutMs: 5000 })
+    const ran = await run
     return ran.exitCode === 0 ? ran.stdout.trim() : null
   } catch {
     return null
@@ -110,8 +111,8 @@ const refresh = async ($: EngineInterface) => {
     $.session.turns(),
   ])
   const [status, dirs] = await Promise.all([
-    git($, cwd, ['status', '--porcelain=v2', '--branch']),
-    git($, cwd, ['rev-parse', '--git-dir', '--git-common-dir']),
+    output($.process.run(['git', 'status', '--porcelain=v2', '--branch'], { cwd, timeoutMs: 5000 })),
+    output($.process.run(['git', 'rev-parse', '--git-dir', '--git-common-dir'], { cwd, timeoutMs: 5000 })),
   ])
 
   const lines = status?.split('\n') ?? []
@@ -154,7 +155,7 @@ const refresh = async ($: EngineInterface) => {
 
 export const register: Register = (on, options) => {
   // The main conversation's prompt-cache TTL (the `cache_ttl` option): 1 hour on a Claude
-  // subscription within plan usage, 5 minutes with an API key, a cloud provider or usage credits.
+  // subscription within plan usage, 5 minutes with pay-as-you-go API billing, a cloud provider or usage credits.
   const cacheTtlMs = options.cache_ttl === '5m' ? 5 * 60_000 : 60 * 60_000
 
   on('session.start', async ($, e, next) => {
