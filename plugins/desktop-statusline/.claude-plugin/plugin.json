@@ -1,6 +1,6 @@
 {
   "name": "desktop-statusline",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Status band above the prompt in the Claude Desktop app's Code tab: folder, git branch and state, session age, prompt count and cost, a context meter, 5-hour and weekly plan usage limit meters with reset countdowns, last-turn model, duration and cache hit rate, idle time against the prompt-cache TTL, compactions, and running agents. Toasts at 80% and 95% of a usage limit. Draws only on the desktop surface, so a CLI statusLine is left alone.",
   "author": {
     "name": "George Liu",

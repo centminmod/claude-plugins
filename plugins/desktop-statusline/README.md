@@ -28,7 +28,10 @@ which makes five.
    ahead or behind upstream, and the number of uncommitted files. Right-aligned
    on the same line: session age, prompt count, and session cost.
 2. **Context.** A meter for how full the context window is, with tokens used
-   against the window size.
+   against the window size. When an auto-compact window smaller than the
+   model's is set (`/autocompact`, the `autoCompactWindow` setting, or
+   `CLAUDE_CODE_AUTO_COMPACT_WINDOW`), it measures against that window, as
+   `/context` does.
 3. **Plan usage limits.** The 5-hour and weekly limits, each with a meter and
    a reset countdown.
 4. **Last turn.** How long it took, the model that answered, the cache hit
@@ -122,7 +125,10 @@ sessions. It starts no other program.
 **What it reads.** Through Claude Code's mods API, it reads the session's
 usage (context size, cost, and the 5-hour and weekly plan limits), the
 session's folder, the number of prompts, the start time, and the type and
-short task description of each running subagent. From each finished turn it
+short task description of each running subagent. It asks for the usage with
+Claude Code's local `/context` estimate (no API call) and uses only its
+auto-compact window and whether auto-compaction is on; it ignores the rest of
+that estimate, such as memory file paths and tool names. From each finished turn it
 reads the duration, the model, and the token counts used for the cache hit
 rate. After a compaction it reads the token counts before and after. It
 doesn't read prompt or response text, files, environment variables, or

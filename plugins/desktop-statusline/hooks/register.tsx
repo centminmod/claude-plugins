@@ -102,7 +102,8 @@ const refresh = async ($: EngineInterface) => {
   if (!(await isOnDesktop($))) return
 
   const [usage, cwd, now, agents, prompts] = await Promise.all([
-    $.session.usage(),
+    // A local estimate (no API calls), asked for only its compaction window.
+    $.session.usage({ breakdown: 'summary' }),
     $.session.cwd(),
     $.clock.now(),
     $.agent.list(),
@@ -122,6 +123,10 @@ const refresh = async ($: EngineInterface) => {
     percent: r.percentUsed,
     resetsAt: r.resetsAt ?? null,
   }))
+  // Measure against the auto-compact window when one smaller than the model's is set (the
+  // autoCompactWindow setting, /autocompact, CLAUDE_CODE_AUTO_COMPACT_WINDOW), as /context does.
+  const { tokens: contextTokens, window: modelWindow, breakdown } = usage.context
+  const contextWindow = breakdown?.isAutoCompactEnabled ? Math.min(modelWindow, breakdown.rawMaxTokens) : modelWindow
 
   const snap: Snapshot = {
     at: now,
@@ -133,9 +138,9 @@ const refresh = async ($: EngineInterface) => {
     ahead: Number(ab?.[1] ?? 0),
     behind: Number(ab?.[2] ?? 0),
     changed: lines.filter(l => l && !l.startsWith('#')).length,
-    contextPercent: usage.context.percent ?? null,
-    contextTokens: usage.context.tokens ?? null,
-    contextWindow: usage.context.window,
+    contextPercent: contextTokens === undefined ? null : Math.round((contextTokens / contextWindow) * 100),
+    contextTokens: contextTokens ?? null,
+    contextWindow,
     costUsd: usage.cost?.usd ?? null,
     limits,
     agents: agents
