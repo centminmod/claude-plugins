@@ -35,16 +35,26 @@ which makes five.
 3. **Plan usage limits.** The 5-hour and weekly limits, each with a meter and
    a reset countdown.
 4. **Last turn.** How long it took, the model that answered, the cache hit
-   rate, how long the session has been idle, and how many times it has
-   compacted, with the token count before and after the last compaction.
+   rate, any server-side tools the API ran inside the main conversation's
+   requests (such as `🔎 advisor ×2`), how long the session has been idle,
+   and how many times it has compacted, with the token count before and after
+   the last compaction.
 
-Each running subagent gets a row of its own, up to three, followed by a
-`+N more agents running` line.
+Each subagent still out gets a row of its own, up to three, followed by a
+`+N more agents running` line: running (⏳), and dimmed, queued (⋯), held (⏸)
+and teammates idle between turns (💤).
+
+Each workflow run gets one row while any of its agents is still out, such as
+`⚙ workflow wf_… · 2 active` with `1/3 done` on the right. Refused, errored or
+aborted agents show as `· N failed` in amber. An agent that hasn't answered
+after an hour stops counting as active.
 
 Meters turn amber at 80% and red at 95%. A cache hit rate under 50% shows as a
 warning, and so does an idle time past the prompt-cache TTL, marked
-`(cache cold)`. A toast pops up when a usage limit crosses 80% and again at
-95%, once per limit window.
+`(cache cold)`. When a usage limit crosses 80% and again at 95%, once per limit
+window, it sends a notification through your terminal's notification channel
+where one delivers it, and pops up a toast otherwise. In the desktop app expect
+the toast.
 
 ## Install
 
@@ -106,8 +116,9 @@ for which TTL your sessions get.
 ## When it updates
 
 The band refreshes when the session starts, when the desktop app attaches,
-after every turn, when a plan limit's percentage changes, two seconds after
-Claude starts a subagent, and every 60 seconds.
+after every turn and every subagent answer, when a plan limit's percentage
+changes, two seconds after Claude or a workflow starts a subagent, and every
+60 seconds.
 
 ## What it runs, reads and sends
 
@@ -128,8 +139,11 @@ them. Their output goes only into the band.
 
 **What it reads.** Through Claude Code's mods API, it reads the session's
 usage (context size, cost, and the 5-hour and weekly plan limits), the
-session's folder, the number of prompts, the start time, and the type and
-short task description of each running subagent. It asks for the usage with
+session's folder, the number of prompts, the start time, and the type, state
+and short task description of each subagent. For workflow-started subagents it
+reads the run ID and agent ID at spawn, and whether each one's answer ended
+normally; never its prompt or answer text. From each model request of the main
+conversation it reads the names of any server-side tools the API ran. It asks for the usage with
 Claude Code's local `/context` estimate (no API call) and uses only its
 auto-compact window and whether auto-compaction is on; it ignores the rest of
 that estimate, such as memory file paths and tool names. From each finished turn it
@@ -139,9 +153,11 @@ doesn't read prompt or response text, files, environment variables, or
 credentials such as API keys or tokens. The plan limits come from Claude Code,
 not from your login.
 
-**What it sends.** Nothing. It makes no network calls and writes no files.
-What it reads goes only into the band above the prompt and the usage-limit
-toasts, and into the session's `$.state`, which ends with the session.
+**What it sends.** Nothing over the network. It makes no network calls and
+writes no files. What it reads goes only into the band above the prompt, the
+usage-limit notification or toast (its text is the limit name, percentage and
+reset time, handed to Claude Code's local notification channel), and the
+session's `$.state`, which ends with the session.
 
 The one URL in the code, `http://www.w3.org/2000/svg`, is the standard SVG
 namespace in the meter bars' `xmlns` attribute. It labels the markup as SVG
@@ -150,8 +166,13 @@ compaction sizes the band displays, not API keys or login tokens.
 
 **What its hooks change.** Nothing. The `session.compact` hook waits for the
 compaction to finish, records the before and after token counts, and returns
-the result unchanged. The `tool.call` hook for the Agent tool schedules a band
-refresh two seconds later and passes the call through unchanged.
+the result unchanged. The `tool.call` hook for the Agent tool and the
+`agent.spawn` hook schedule a band refresh two seconds later and pass the call
+through unchanged; `agent.spawn` also notes a workflow agent's run ID, and if
+anything in it fails the spawn still goes ahead. The `turn.step` hook forwards
+every model response chunk untouched and only reads the finished step's
+server-tool names. The `turn.complete` hook reads the finished turn and passes
+it through unchanged.
 
 ## Check it yourself
 
@@ -165,13 +186,16 @@ claude plugin validate plugins/desktop-statusline
 For this mod the report lists:
 
 - **Hooks**: `session.start`, `session.attach` for the desktop,
-  `session.measure`, `turn.complete`, `tool.call` for the Agent tool only,
-  `session.compact`, and `ui.render` for the `AbovePrompt` band.
-- **Calls**: session usage, cwd and turn count, the running agent list, the
-  clock, toasts, and `$.process.run` for `git status --porcelain=v2 --branch`
-  and `git rev-parse --git-dir --git-common-dir`.
+  `session.measure`, `turn.complete`, `turn.step`, `agent.spawn`, `tool.call`
+  for the Agent tool only, `session.compact`, and `ui.render` for the
+  `AbovePrompt` band.
+- **Calls**: session usage, cwd and turn count, the agent list, the clock,
+  notifications, toasts, and `$.process.run` for
+  `git status --porcelain=v2 --branch` and
+  `git rev-parse --git-dir --git-common-dir`.
 
-It keeps its values in the session's `$.state` and writes no files.
+It keeps its values in the session's `$.state` and writes no files. To run its
+tests against the engine: `claude plugin test plugins/desktop-statusline`.
 
 ## Limitations
 

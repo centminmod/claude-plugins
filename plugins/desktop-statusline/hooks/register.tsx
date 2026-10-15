@@ -1,12 +1,28 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, ProcessRunResult, Register } from 'claude-code'
 
-import type { Limit, Snapshot } from '../types'
+import type { Limit, Snapshot, WorkflowRun } from '../types'
 
 const snapshot = atom({ plugin: 'desktop-statusline', key: 'snap' } as const, null)
 const warned = atom({ plugin: 'desktop-statusline', key: 'warned' } as const, [])
 const lastTurn = atom({ plugin: 'desktop-statusline', key: 'lastTurn' } as const, null)
 const compactions = atom({ plugin: 'desktop-statusline', key: 'compactions' } as const, null)
+const workflowRuns = atom({ plugin: 'desktop-statusline', key: 'runTally' } as const, {})
+// An agent out this long without an answer stops counting as active: one killed without an
+// answer, or a remote one, whose answer never reaches this session.
+const AGENT_STALE_MS = 60 * 60_000
+const MAX_RUNS = 20
+// Answers from subagent loops that matched no tracked run yet: a fast workflow agent can answer
+// before its spawn hook has recorded it. Newest last, a few kept.
+const early = new Map<string, 'done' | 'failed'>()
+const EARLY_MAX = 50
+
+// Server tools (web search, advisor, ...) the API ran inside the main loop's current turn.
+let serverTurnId: string | null = null
+let serverTools: Record<string, number> = {}
+
+const AGENT_ICON: Record<string, string> = { pending: '⋯', running: '⏳', waiting: '⏸', idle: '💤' }
+const ACTIVE = ['pending', 'running', 'waiting']
 
 const REFRESH_MS = 60_000
 const WARN_AT = [95, 80]
@@ -28,7 +44,6 @@ const MAX_BAR_PX = 180
 
 const label = (kind: string) => LABELS[kind] ?? kind.replace(/_/g, ' ')
 const tone = (percent: number) => (percent >= 95 ? 'error' : percent >= 80 ? 'warning' : undefined)
-
 const tokens = (n: number) =>
   n >= 1_000_000 ? `${+(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`
 
@@ -93,7 +108,9 @@ const warn = async ($: EngineInterface, limits: Limit[], now: number) => {
 
     fresh.push(key)
     const resets = limit.resetsAt ? ` · resets in ${until(limit.resetsAt, now)}` : ''
-    $.ui.toast(`${label(limit.kind)} usage limit at ${limit.percent}%${resets}`, { timeoutMs: 8000 })
+    const text = `${label(limit.kind)} usage limit at ${limit.percent}%${resets}`
+    // A system notification where the person's channel delivers one; the toast otherwise.
+    if (!(await $.ui.notify(text, { title: 'Usage limit' })).isSent) $.ui.toast(text, { timeoutMs: 8000 })
   }
 
   if (fresh.length > 0) await update($, warned, s => [...s, ...fresh].slice(-50))
@@ -102,14 +119,23 @@ const warn = async ($: EngineInterface, limits: Limit[], now: number) => {
 const refresh = async ($: EngineInterface) => {
   if (!(await isOnDesktop($))) return
 
-  const [usage, cwd, now, agents, prompts] = await Promise.all([
+  const [usage, cwd, now, agents, prompts, tracked] = await Promise.all([
     // A local estimate (no API calls), asked for only its compaction window.
     $.session.usage({ breakdown: 'summary' }),
     $.session.cwd(),
     $.clock.now(),
     $.agent.list(),
     $.session.turns(),
+    read($, workflowRuns),
   ])
+  // `$.agent.list()` leaves a workflow's agents out, so runs are counted from their own spawn and
+  // turn.complete events: one line per run while any agent is active and the run is not stale.
+  const runs: WorkflowRun[] = []
+  for (const [runId, run] of Object.entries(tracked)) {
+    const active = Object.values(run.active).filter(at => now - at <= AGENT_STALE_MS).length
+    if (active === 0) continue
+    runs.push({ runId, total: active + run.done + run.failed, active, done: run.done, failed: run.failed })
+  }
   const [status, dirs] = await Promise.all([
     output($.process.run(['git', 'status', '--porcelain=v2', '--branch'], { cwd, timeoutMs: 5000 })),
     output($.process.run(['git', 'rev-parse', '--git-dir', '--git-common-dir'], { cwd, timeoutMs: 5000 })),
@@ -144,9 +170,11 @@ const refresh = async ($: EngineInterface) => {
     contextWindow,
     costUsd: usage.cost?.usd ?? null,
     limits,
+    // Held and queued agents too, and teammates idle between turns; not finished ones.
     agents: agents
-      .filter(a => a.status === 'running')
-      .map(a => ({ type: a.type, description: a.description })),
+      .filter(a => ACTIVE.includes(a.status) || (a.status === 'idle' && a.teammateId))
+      .map(a => ({ type: a.type, description: a.description, status: a.status })),
+    runs,
   }
 
   await update($, snapshot, () => snap)
@@ -157,7 +185,6 @@ export const register: Register = (on, options) => {
   // The main conversation's prompt-cache TTL (the `cache_ttl` option): 1 hour on a Claude
   // subscription within plan usage, 5 minutes with pay-as-you-go API billing, a cloud provider or usage credits.
   const cacheTtlMs = options.cache_ttl === '5m' ? 5 * 60_000 : 60 * 60_000
-
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await refresh($)
@@ -189,12 +216,68 @@ export const register: Register = (on, options) => {
         durationMs: e.durationMs,
         model: e.usage?.model ?? null,
         cacheHit: e.usage ? cacheHit(e.usage) : null,
+        serverTools: serverTurnId === e.turnId ? serverTools : {},
       }))
+    } else {
+      // A workflow agent's answer: mark it in its run, if it is one this mod tracks.
+      const agentId = e.agentId
+      // Aborted, refused or errored all count as failed.
+      const state = e.reason === 'answer' ? 'done' : 'failed'
+      const runId = Object.entries(await read($, workflowRuns)).find(([, r]) => agentId in r.active)?.[0]
+      if (runId === undefined) {
+        early.set(agentId, state)
+        if (early.size > EARLY_MAX) early.delete(early.keys().next().value!)
+      } else {
+        const at = await $.clock.now()
+        await update($, workflowRuns, m => {
+          const run = m[runId]
+          if (!run || !(agentId in run.active)) return m
+          const { [agentId]: _, ...active } = run.active
+          return { ...m, [runId]: { ...run, at, active, [state]: run[state] + 1 } }
+        })
+      }
     }
     await refresh($)
 
     return completed
   })
+
+  // A streaming event: forward the chunks untouched and read the step's result at the end.
+  on('turn.step', async function* (_$, e, next) {
+    const step = yield* next(e)
+    if (e.agentId || !step.serverToolUses?.length) return step
+
+    if (serverTurnId !== e.turnId) {
+      serverTurnId = e.turnId
+      serverTools = {}
+    }
+    for (const use of step.serverToolUses) serverTools[use.name] = (serverTools[use.name] ?? 0) + 1
+
+    return step
+  })
+
+  on('agent.spawn', async ($, e, next) => {
+    const spawned = await next(e)
+    if (e.workflow && spawned.agentId) {
+      const { runId } = e.workflow
+      const agentId = spawned.agentId
+      const at = await $.clock.now()
+      const answered = early.get(agentId)
+      early.delete(agentId)
+      // Newest runs last; keep the last MAX_RUNS. Agents out past AGENT_STALE_MS are let go here.
+      await update($, workflowRuns, m => {
+        const { [runId]: run, ...rest } = m
+        const kept = Object.fromEntries(Object.entries(run?.active ?? {}).filter(([, t]) => at - t <= AGENT_STALE_MS))
+        const base = { at, done: run?.done ?? 0, failed: run?.failed ?? 0, active: kept }
+        const touched = answered ? { ...base, [answered]: base[answered] + 1 } : { ...base, active: { ...kept, [agentId]: at } }
+        return Object.fromEntries([...Object.entries(rest), [runId, touched]].slice(-MAX_RUNS))
+      })
+      // Not an Agent tool call, so the tool.call hook below misses it.
+      $.clock.after(2000, () => void refresh($))
+    }
+
+    return spawned
+  }).catch((_$, e, next) => next(e))
 
   // A spawned agent shows as running only once it has started; look again shortly after.
   on('tool.call', { tool: 'Agent' }, ($, e, next) => {
@@ -288,6 +371,9 @@ export const register: Register = (on, options) => {
       if (turn.cacheHit !== null) {
         activity.push({ text: `cache ${turn.cacheHit}%`, emphasis: turn.cacheHit < 50 ? 'warning' : undefined })
       }
+      // Older snapshots (before serverTools existed) carry none.
+      const used = Object.entries(turn.serverTools ?? {})
+      if (used.length > 0) activity.push({ text: `🔎 ${used.map(([n, k]) => `${n.replace(/_/g, ' ')} ×${k}`).join(', ')}` })
       if (!e.props.isWorking) {
         activity.push({ text: `idle ${ago(idleMs)}${isCold ? ' (cache cold)' : ''}`, emphasis: isCold ? 'warning' : undefined })
       }
@@ -334,13 +420,25 @@ export const register: Register = (on, options) => {
         )}
         {agentRows.map(a => (
           <Box flexDirection="row" justifyContent="space-between" width="100%">
-            <Text wrap="truncate-end">{`⏳ ${a.description || a.type}`}</Text>
+            <Text wrap="truncate-end" dimColor={a.status !== 'running'}>
+              {`${AGENT_ICON[a.status] ?? '⏳'} ${a.description || a.type}`}
+            </Text>
             <Box marginLeft={2} flexShrink={0}>
               <Text dimColor>{a.type.split(':').pop()}</Text>
             </Box>
           </Box>
         ))}
-        {moreAgents > 0 && <Text dimColor>{`   +${moreAgents} more agent${moreAgents > 1 ? 's' : ''} running`}</Text>}
+        {(snap.runs ?? []).map(r => (
+          <Box flexDirection="row" justifyContent="space-between" width="100%">
+            <Text wrap="truncate-end">{`⚙ workflow ${r.runId} · ${r.active} active`}</Text>
+            <Box marginLeft={2} flexShrink={0}>
+              <Text dimColor={r.failed === 0} color={r.failed > 0 ? 'warning' : undefined}>
+                {`${r.done}/${r.total} done${r.failed > 0 ? ` · ${r.failed} failed` : ''}`}
+              </Text>
+            </Box>
+          </Box>
+        ))}
+        {moreAgents > 0 &&<Text dimColor>{`   +${moreAgents} more agent${moreAgents > 1 ? 's' : ''} running`}</Text>}
       </Box>
     )
   })
