@@ -387,6 +387,8 @@ export const register: Register = (on, options) => {
     // long description never runs off the "Last turn" line.
     const agentRows = snap.agents.slice(0, AGENT_ROWS)
     const moreAgents = snap.agents.length - agentRows.length
+    // The band is one site for every plugin: what the plugins beneath draw stays, under this one.
+    const below = await next(e)
 
     return (
       <Box flexDirection="column">
@@ -439,6 +441,7 @@ export const register: Register = (on, options) => {
           </Box>
         ))}
         {moreAgents > 0 &&<Text dimColor>{`   +${moreAgents} more agent${moreAgents > 1 ? 's' : ''} running`}</Text>}
+        {below}
       </Box>
     )
   })

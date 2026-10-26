@@ -2,7 +2,7 @@ import { test, expect, mock } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { AgentInfo, On } from 'claude-code'
 
-type World = { agents: AgentInfo[]; weekly: number; isNotifySent: boolean; toasts: string[]; notes: string[] }
+type World = { beneath?: string; agents: AgentInfo[]; weekly: number; isNotifySent: boolean; toasts: string[]; notes: string[] }
 
 // The engine beneath the plugin: a desktop session in a clean repo, its agents and limits from `w`.
 const world = (on: On, w: World) => {
@@ -36,6 +36,11 @@ const world = (on: On, w: World) => {
     (e.description === 'remote' ? { model: 'claude-sonnet-5-5' } : { model: 'claude-sonnet-5-5', agentId: `w${++n}` }) as never,
   )
   on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  // Stand-in for the engine's drawing beneath the plugins (nothing, unless a test hooks above it).
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    return (w.beneath ? h(Box, { key: 'beneath' }, h(Text, {}, w.beneath)) : h(Box, { key: 'engine' })) as never
+  })
   // Beneath the plugin, a model request that ran two web searches and the advisor.
   on('turn.step', async function* (_$, e) {
     const use = (name: string) => ({ id: name, name, input: {}, startedAt: 0, endedAt: 1 })
@@ -247,4 +252,13 @@ test('the toast stands in when no notification channel sent it', async ($, on) =
   // Warned once per threshold: a later refresh at the same level stays quiet.
   await completeTurn($, 't2')
   expect(w.notes).toHaveLength(1)
+})
+
+test('the band keeps what the plugins beneath draw', async ($, on) => {
+  const w: World = { beneath: 'BENEATH-MARKER', agents: [], weekly: 10, isNotifySent: false, toasts: [], notes: [] }
+  world(on, w)
+  await completeTurn($, 't0')
+  const text = await bandText($)
+  expect(text).toContain('Context')
+  expect(text).toContain('BENEATH-MARKER')
 })
